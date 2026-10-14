@@ -86,7 +86,12 @@ impl std::error::Error for Error {}
 /// `out` past the returned length are untouched. On error the contents of
 /// `out` are unspecified.
 pub fn decompress(src: &[u8], out: &mut [u8]) -> Result<usize, Error> {
-    __decompress_at(fearless_simd::Level::new(), src, out)
+    let level = fearless_simd::Level::new();
+    // bz2-ng measured no gain from AVX-512, and its byte shuffle (`vpermb`)
+    // sits on the MTF dependency chain where AVX2's `pshufb` is cheaper.
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    let level = level.as_avx2().map_or(level, fearless_simd::Level::Avx2);
+    __decompress_at(level, src, out)
 }
 
 /// [`decompress`] with the SIMD level fixed, so tests and fuzz targets can
