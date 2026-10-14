@@ -1,6 +1,7 @@
 //! Shared by the integration tests; each test binary uses a subset.
 #![allow(dead_code)]
 
+pub mod forge;
 pub mod inputs;
 pub mod oracle;
 pub mod props;
@@ -129,6 +130,54 @@ macro_rules! surface_properties {
                 &tc,
                 &$decoders,
                 $crate::common::inputs::hostile_block(),
+            );
+        }
+
+        #[hegel::test(
+                                            test_cases = $crate::common::pinned::cases(2000),
+                                            suppress_health_check = [hegel::HealthCheck::TooSlow]
+                                        )]
+        fn forged_block_agrees_with_reference(tc: hegel::TestCase) {
+            $crate::common::props::forged_agrees(
+                &tc,
+                &$decoders,
+                $crate::common::forge::one_block($crate::common::forge::OrigClass::Any),
+            );
+        }
+
+        #[hegel::test(
+                                            test_cases = $crate::common::pinned::cases(600),
+                                            suppress_health_check = [hegel::HealthCheck::TooSlow]
+                                        )]
+        fn forged_multi_block_stream_agrees_with_reference(tc: hegel::TestCase) {
+            $crate::common::props::forged_agrees(
+                &tc,
+                &$decoders,
+                $crate::common::forge::several_blocks(),
+            );
+        }
+
+        #[hegel::test(
+                                            test_cases = $crate::common::pinned::cases(1500),
+                                            suppress_health_check = [hegel::HealthCheck::TooSlow]
+                                        )]
+        fn forged_origptr_out_of_range_is_corrupt(tc: hegel::TestCase) {
+            $crate::common::props::forged_is_corrupt(
+                &tc,
+                &$decoders,
+                $crate::common::forge::one_block($crate::common::forge::OrigClass::OutOfRange),
+            );
+        }
+
+        #[hegel::test(
+                                            test_cases = $crate::common::pinned::cases(400),
+                                            suppress_health_check = [hegel::HealthCheck::TooSlow]
+                                        )]
+        fn forged_oversize_block_is_corrupt(tc: hegel::TestCase) {
+            $crate::common::props::forged_is_corrupt(
+                &tc,
+                &$decoders,
+                $crate::common::forge::oversize_block(),
             );
         }
 
