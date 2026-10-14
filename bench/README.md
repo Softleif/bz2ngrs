@@ -36,6 +36,8 @@ Flags (all take a value):
 | `--data` | `/Users/pascal/code/tfenne/bz2-ng/data/corpora/1kg` | corpus directory |
 | `--manifest` | `/Users/pascal/Code/softleif/bz2ngrs/corpus/cram-bzip2/manifest.tsv` | real CRAM bzip2 blocks, one set per source directory; skipped if absent |
 | `--tsv` | none | also write a TSV |
+| `--decoders` | `ours,bzip2,C` | decoders to time (one alone, for a profile) |
+| `--stat` | `median` | `max` reports the best round instead (on a loaded machine the slow rounds are interference) |
 
 Chunks are compressed once, in parallel, before timing, with the `bzip2` crate. CRAM
 blocks are used as stored; the expected bytes are the `bzip2` crate's output
@@ -46,7 +48,7 @@ blocks are used as stored; the expected bytes are the `bzip2` crate's output
 - Every decoder's output is compared to the original bytes first. A decoder that
   fails is reported as `FAILED` (`FAILED/stub` for ours, which errors until the real
   decoder exists) and is not timed; a note with the first error goes to stderr.
-- Reported: median over rounds of MB/s of uncompressed data (MB = 10^6 bytes) over a
+- Reported: median (or best, `--stat max`) over rounds of MB/s of uncompressed data (MB = 10^6 bytes) over a
   whole-set pass, plus ratios `ours/C` and `ours/bzip2`.
 - Per-call cost: ns per call on the 16 KiB sets, and the cost of decoding an empty
   stream (14 bytes), which is init plus teardown with nothing to decode (best of
@@ -61,7 +63,8 @@ blocks are used as stored; the expected bytes are the `bzip2` crate's output
 `c/CMakeLists.txt`, `-O2` (`-O3` for the encoder files), and the per-file ISA flags
 (aarch64: `-march=armv8-a+crc`, `+crc+crypto`; x86-64: `-march=x86-64-v2/v3`,
 `-msse4.1 -mpclmul`, `-mavx2 -mpclmul -mvpclmulqdq`; the x86 flags are untested).
-The decoder memory layout is the CMake default (wide).
+The decoder memory layout is the CMake default (wide). `BZ2NG_C_DEBUG=1` adds `-g`
+(for a line-level profile; it changes a few instructions, so not for timing).
 
 Symbol clash: `libbz2-rs-sys` only exports `BZ2_*` when its `export-symbols` feature is
 on, which it is not for `bzip2` 0.6.1's defaults, but any other crate in the graph could

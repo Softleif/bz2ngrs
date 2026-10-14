@@ -266,7 +266,13 @@ fn verify(streams: &[Stream], buf: &mut [u8]) -> [Result<(), String>; 3] {
 /// Median MB/s (10^6 uncompressed bytes per second) per decoder over `rounds`
 /// whole-set passes, the decoder order rotated every round. A pass repeats until
 /// it has run `min_ms` so that small sets are not timer noise.
-fn measure(streams: &[Stream], ok: [bool; 3], rounds: usize, min_ms: u128) -> [Option<f64>; 3] {
+fn measure(
+    streams: &[Stream],
+    ok: [bool; 3],
+    rounds: usize,
+    min_ms: u128,
+    best: bool,
+) -> [Option<f64>; 3] {
     let total: usize = streams.iter().map(|s| s.raw.len()).sum();
     let mut buf = vec![0u8; streams.iter().map(|s| s.raw.len()).max().unwrap_or(0)];
     let mut samples: [Vec<f64>; 3] = Default::default();
@@ -288,7 +294,15 @@ fn measure(streams: &[Stream], ok: [bool; 3], rounds: usize, min_ms: u128) -> [O
             samples[i].push(total as f64 * f64::from(reps) / t.elapsed().as_secs_f64() / 1e6);
         }
     }
-    samples.map(|mut s| (!s.is_empty()).then(|| median(&mut s)))
+    samples.map(|mut s| {
+        (!s.is_empty()).then(|| {
+            if best {
+                s.iter().copied().fold(0.0, f64::max)
+            } else {
+                median(&mut s)
+            }
+        })
+    })
 }
 
 struct Row {
@@ -362,13 +376,15 @@ struct Opts {
     data: PathBuf,
     manifest: PathBuf,
     tsv: Option<PathBuf>,
+    decoders: Vec<String>,
+    best: bool,
 }
 
 fn usage() -> ! {
     eprintln!(
         "usage: bz2ngrs-bench [--sets MC,XA,QUAL,cram] [--chunks 16k,64k,1m,whole,slices,blocks]\n\
          \x20  [--samples NA12878,NA19141] [--rounds 5] [--level 9] [--min-ms 30] [--max-bytes N (0 = all)]\n\
-         \x20  [--data DIR] [--manifest FILE] [--tsv FILE]"
+         \x20  [--data DIR] [--manifest FILE] [--tsv FILE] [--decoders ours,bzip2,C] [--stat median|max]"
     );
     std::process::exit(2)
 }
@@ -386,6 +402,8 @@ fn parse_args() -> Opts {
         data: "/Users/pascal/code/tfenne/bz2-ng/data/corpora/1kg".into(),
         manifest: "/Users/pascal/Code/softleif/bz2ngrs/corpus/cram-bzip2/manifest.tsv".into(),
         tsv: None,
+        decoders: list("ours,bzip2,C"),
+        best: false,
     };
     let mut a = std::env::args().skip(1);
     while let Some(k) = a.next() {
@@ -406,6 +424,8 @@ fn parse_args() -> Opts {
             "--data" => o.data = v.into(),
             "--manifest" => o.manifest = v.into(),
             "--tsv" => o.tsv = Some(v.into()),
+            "--decoders" => o.decoders = list(&v),
+            "--stat" => o.best = v == "max",
             _ => usage(),
         }
     }
@@ -423,8 +443,10 @@ fn main() {
     );
     let mut first_err: [Option<String>; 3] = Default::default();
     println!(
-        "level {}, {} rounds, MB/s of uncompressed data (MB = 10^6 B), median\n",
-        o.level, o.rounds
+        "level {}, {} rounds, MB/s of uncompressed data (MB = 10^6 B), {}\n",
+        o.level,
+        o.rounds,
+        if o.best { "best" } else { "median" }
     );
     println!("| set | chunk | streams | MB | ours | bzip2 | C | ours/C | ours/bzip2 |");
     println!("|---|---|---:|---:|---:|---:|---:|---:|---:|");
@@ -432,7 +454,7 @@ fn main() {
     let mut run = |set: &str, chunk: &str, streams: Vec<Stream>| {
         let mut buf = vec![0u8; streams.iter().map(|s| s.raw.len()).max().unwrap_or(0)];
         let v = verify(&streams, &mut buf);
-        let mut ok = [true; 3];
+        let mut ok = NAMES.map(|n| o.decoders.iter().any(|d| d == n));
         for (i, r) in v.into_iter().enumerate() {
             if let Err(e) = r {
                 ok[i] = false;
@@ -450,7 +472,7 @@ fn main() {
             chunk: chunk.into(),
             n: streams.len(),
             bytes: streams.iter().map(|s| s.raw.len()).sum(),
-            mbps: measure(&streams, ok, o.rounds, o.min_ms),
+            mbps: measure(&streams, ok, o.rounds, o.min_ms, o.best),
         };
         println!("{}", row.md());
         let _ = std::io::stdout().flush();
@@ -496,7 +518,11 @@ fn main() {
             }
         }
     }
-    if want_chunk("blocks") && o.sets.iter().any(|t| "cram".contains(t.as_str())) {
+    if want_chunk("blocks")
+        && o.sets
+            .iter()
+            .any(|t| "cram".contains(t.as_str()) || t.starts_with("cram/"))
+    {
         for (name, streams) in load_manifest(&o.manifest) {
             if want_set(&name) {
                 run(&name, "blocks", streams);
@@ -528,6 +554,7 @@ fn main() {
     let mut cells = Vec::new();
     for (i, r) in v.iter().enumerate() {
         cells.push(match r {
+            _ if !o.decoders.iter().any(|d| d == NAMES[i]) => "-".to_string(),
             Err(_) => (if i == 0 { "FAILED/stub" } else { "FAILED" }).to_string(),
             Ok(()) => {
                 let mut best = f64::MAX;
