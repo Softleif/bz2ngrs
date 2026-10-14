@@ -330,3 +330,33 @@ references 3 and 9 (the old four-part loop: 4), histogram 0. On aarch64 the
 two forms are equal within noise (best pass vs the base: two passes MC 64k
 +8.4%, XA 1m +6.1%, level-3 +4.4%, v31-small +2.6%; one pass +6.7%, +3.3%,
 +5.0%, +5.8%). The two-pass form is kept.
+
+### R2.5 Symbol loop: three ideas, none measurable (all rejected)
+
+After R2.1 (above), two more, best pass vs the then-current head, 6 rounds:
+
+- Bounds-check-free group refill: a 136-byte input window per group
+  (`Bits::window`), refills at `win[(pos - base) & 127..]` (50 codes of at
+  most 20 bits move at most 127 bytes before the last refill), so the two
+  compare/branch pairs per refill go. The checks went, but LLVM then kept
+  the bit buffer on the stack in the duplicated loop. XA 64k +0.1%, XA 1m
+  -0.7%, QUAL 64k -1.4%, level-3 +0.4%, v31-small 0.0%, v30-bz1 +0.2%
+  (load 500+).
+- Run flush: a second unconditional 16-byte store and the loop only past
+  32 (as R1's un-RLE1 fill). QUAL 16k -0.6%, 64k -0.3%, 1m -0.9%, XA 1m
+  +0.4%, MC 64k -0.2%, level-3 +0.4%, v30-bz1 -3.6%.
+
+Three in a row on this stage, so it stops here. The wider MTF head bz2-ng
+deferred was not tried: the tail move does not appear among the hot lines
+even on ultima-v31-archive, the set with the most high MTF indices.
+
+### R2.6 Huffman primary table K = 10 (kept, marginal)
+
+The per-block Huffman build is about 6% of QUAL 64k (9k-row blocks), for
+ours and C alike; the 2^K-entry fill is most of it. K = 10 halves the fill;
+11-bit codes then take `decode_long` (one more length step than 12-bit
+codes did). Best pass, base -> new, 6 rounds then 12 rounds: MC 16k +1.7%,
++2.4% (median +1.9%), QUAL 16k +1.6%, +0.2%, XA 16k +0.9%, +0.9%, v31-small
++2.3%, +0.9%, v31-archive +1.5%, QUAL 64k +1.8%, MC 1m +0.2%, XA 1m -0.1%,
+v30-bz9 -0.6%, level-3 +0.2%. Small but in one direction at 16k and nothing
+lost at 1m.
