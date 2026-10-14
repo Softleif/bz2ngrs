@@ -596,13 +596,16 @@ pub fn to_vec_equals_oracle(tc: &TestCase, decoders: &[Decoder]) {
         below(tc, 70_000)
     };
     let size = v.data.len() + extra;
-    let Reference::Ok(want) = reference(&v.stream, size) else {
-        panic!("premise: libbz2 decodes a valid stream");
-    };
+    assert!(
+        matches!(reference(&v.stream, size), Reference::Ok(ref got) if *got == v.data),
+        "premise: libbz2 decodes a valid stream to its data"
+    );
     for d in decoders {
         let got = d.run_to_vec(&v.stream, size);
-        assert_eq!(got.as_deref(), Ok(&want[..]), "{}: size {size}", d.name());
-        assert_eq!(got.map(|g| g.len()), Ok(v.data.len()), "{}", d.name());
+        assert_eq!(got.as_deref(), Ok(&v.data[..]), "{}: size {size}", d.name());
+        // "The `Vec` keeps capacity `size` even when shorter."
+        let capacity = got.map(|g| g.capacity());
+        assert!(capacity.is_ok_and(|c| c >= size), "{}: {capacity:?}", d.name());
     }
 }
 
@@ -611,7 +614,11 @@ pub fn to_vec_equals_oracle(tc: &TestCase, decoders: &[Decoder]) {
 pub fn to_vec_too_small(tc: &TestCase, decoders: &[Decoder]) {
     let v = tc.draw(inputs::valid_stream());
     tc.assume(!v.data.is_empty());
-    let k = tc.draw(gs::integers::<usize>().min_value(1).max_value(v.data.len()));
+    let k = if tc.draw(gs::booleans()) {
+        1 + below(tc, v.data.len().min(8))
+    } else {
+        tc.draw(gs::integers::<usize>().min_value(1).max_value(v.data.len()))
+    };
     let size = v.data.len() - k;
     for d in decoders {
         assert_eq!(
