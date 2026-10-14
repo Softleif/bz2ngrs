@@ -144,3 +144,26 @@ the best level.
 Best pass, MB/s, base -> new (3 alternating runs each):
 ultima-L7388-v31-archive 261 -> 274 (+5%), ultima-L7386-v30-bz9 581 -> 633
 (+9%), XA 64k 257 -> 259 (=).
+
+### Not done
+
+- SIMD candidate scan in un-RLE1 (16 bytes per step, NEON nibble mask): the
+  goal was met without it; the SWAR 8-byte scan stays.
+- A scalar MTF for the `Sse2` and `Fallback` levels: there fearless_simd
+  emulates `swizzle_dyn` with a 16-step loop (correct, slow). `Level::new()`
+  never picks `Sse2` on an x86-64-v2 or later CPU; `Sse4_2` and `Avx2` use
+  `pshufb`. `Avx512` uses `vpermb` for the same op, which may have more
+  latency on the MTF chain; not measured (no AVX-512 machine here).
+
+## Final (162dc4c), ours/C in one session
+
+| set | L9 16k | L9 64k | L9 1m | L6 16k | L6 64k | L6 1m |
+|---|---|---|---|---|---|---|
+| MC | 1.13 | 1.00 | 0.99 | 1.12 | 0.99 | 0.99 |
+| XA | 1.08 | 1.00 | 0.99 | 1.08 | 1.00 | 0.98 |
+| QUAL | 1.13 | 1.08 | 1.04 | 1.12 | 1.08 | 1.05 |
+
+CRAM: level-3 0.99, level-4 1.00, v30-bz1 1.00, v30-bz9 1.06, v31-archive
+1.08, v31-bzonly 1.02, v31-small 1.00, ultima-bz6 1.01, ultima-bz1 1.01,
+ultima-bz9 1.02, ultima-archive 0.99. A second run of the cram set (9
+rounds) had every set between 0.97 and 1.09.
