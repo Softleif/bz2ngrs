@@ -1,10 +1,48 @@
 //! Fast one-shot bzip2 decompression: a Rust port of the decoder of
 //! bz2-ng, the fast libbz2 replacement in C, for callers that hold a whole
 //! compressed stream in memory and know its uncompressed size (CRAM blocks).
+//!
+//! # Memory
+//!
+//! Each thread that calls [`decompress`] keeps its working memory for later
+//! calls: about 6 MiB of address space, allocated zeroed on first use. Only
+//! the pages a block touches become resident: about 6 bytes per byte of the
+//! largest block (after bzip2's first run-length stage) decoded on that
+//! thread, plus about 40 KiB. That is at most about 5.5 MB for `BZh9` streams
+//! and 3.7 MB for `BZh6`.
 
+// The decoder's casts narrow row indices, symbols and code lengths, which
+// the format bounds far below the target types (rows < 2^20, symbols < 258,
+// lengths <= 20); the hot loops rely on them being plain casts.
+#[allow(
+    clippy::cast_possible_truncation,
+    reason = "values bounded by the format"
+)]
+mod bits;
+#[allow(
+    clippy::cast_possible_truncation,
+    reason = "values bounded by the format"
+)]
+mod bwt;
 mod crc;
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_possible_wrap,
+    reason = "values bounded by the format"
+)]
+mod decode;
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_possible_wrap,
+    reason = "values bounded by the format"
+)]
+mod huffman;
+mod unrle;
 
+use core::cell::Cell;
 use core::fmt;
+
+use decode::Scratch;
 
 /// Why a stream could not be decompressed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -39,11 +77,14 @@ impl std::error::Error for Error {}
 /// returns how many bytes it wrote. Bytes after the end-of-stream marker are
 /// ignored, as `bzip2::read::BzDecoder` and libbz2's `BZ2_bzDecompress` do.
 ///
-/// Never panics, whatever `src` holds. On error the contents of `out` are
+/// Accepts and rejects exactly the streams libbz2 1.0.8 does. Returns
+/// [`Error::OutputTooSmall`] as soon as the output would pass `out.len()`.
+///
+/// Never panics, whatever `src` holds. On success the bytes of `out` past the
+/// returned length are untouched. On error the contents of `out` are
 /// unspecified.
 pub fn decompress(src: &[u8], out: &mut [u8]) -> Result<usize, Error> {
-    let _ = (src, out, crc::update(0, &[]));
-    Err(Error::Corrupt)
+    __decompress_at(fearless_simd::Level::new(), src, out)
 }
 
 /// [`decompress`] with the SIMD level fixed, so tests and fuzz targets can
@@ -55,6 +96,26 @@ pub fn __decompress_at(
     src: &[u8],
     out: &mut [u8],
 ) -> Result<usize, Error> {
-    let _ = level;
-    decompress(src, out)
+    thread_local! {
+        static SCRATCH: Cell<Option<Box<Scratch>>> = const { Cell::new(None) };
+    }
+    // Take the scratch out for the call, so no borrow is held; a fresh one
+    // serves if the thread-local is gone (thread teardown).
+    let mut sc = SCRATCH
+        .try_with(Cell::take)
+        .ok()
+        .flatten()
+        .unwrap_or_else(Scratch::new_boxed);
+    let r = fearless_simd::dispatch!(level, simd => decode::decode_stream(simd, src, out, &mut sc));
+    let _ = SCRATCH.try_with(|c| c.set(Some(sc)));
+    r
 }
+
+#[cfg(test)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::panic,
+    clippy::cast_possible_truncation,
+    reason = "tests"
+)]
+mod tests;
