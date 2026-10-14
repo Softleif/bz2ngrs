@@ -40,12 +40,15 @@ impl Decoder {
     }
 }
 
-/// The kinds of error the tests tell apart. Every comparison goes through
-/// [`Decoder::run_kind`], so a change to the shape of `Error` is made here.
+/// The kinds of error the tests tell apart. Every comparison that ignores the
+/// payload goes through [`Decoder::run_kind`], so a change to the shape of
+/// `Error` is made here.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Kind {
+    NotBzip2,
     Corrupt,
-    CrcMismatch,
+    BlockCrc,
+    StreamCrc,
     UnexpectedEof,
     OutputTooSmall,
     Other,
@@ -53,10 +56,12 @@ pub enum Kind {
 
 pub fn kind(e: &Error) -> Kind {
     match e {
-        Error::Corrupt => Kind::Corrupt,
-        Error::CrcMismatch => Kind::CrcMismatch,
-        Error::UnexpectedEof => Kind::UnexpectedEof,
-        Error::OutputTooSmall => Kind::OutputTooSmall,
+        Error::NotBzip2 => Kind::NotBzip2,
+        Error::Corrupt { .. } => Kind::Corrupt,
+        Error::BlockCrc { .. } => Kind::BlockCrc,
+        Error::StreamCrc { .. } => Kind::StreamCrc,
+        Error::UnexpectedEof { .. } => Kind::UnexpectedEof,
+        Error::OutputTooSmall { .. } => Kind::OutputTooSmall,
         _ => Kind::Other,
     }
 }
@@ -188,10 +193,20 @@ pub fn check_exact(decoder: Decoder, src: &[u8], expected: &[u8]) {
 }
 
 /// `len` bits of `bytes` from bit `start`, most significant bit first.
-fn bits(bytes: &[u8], start: usize, len: usize) -> u64 {
+pub fn read_bits(bytes: &[u8], start: usize, len: usize) -> u64 {
     (start..start + len).fold(0, |acc, i| {
         (acc << 1) | u64::from((bytes[i / 8] >> (7 - i % 8)) & 1)
     })
+}
+
+/// Overwrites the `len` bits from bit `start` with the low `len` bits of
+/// `value`, most significant bit first.
+pub fn write_bits(bytes: &mut [u8], start: usize, len: usize, value: u64) {
+    for i in 0..len {
+        let bit = (value >> (len - 1 - i)) & 1;
+        let at = start + i;
+        bytes[at / 8] = (bytes[at / 8] & !(0x80 >> (at % 8))) | ((bit as u8) << (7 - at % 8));
+    }
 }
 
 /// Flips bit `at` (counted from the most significant bit of byte 0).
@@ -205,7 +220,7 @@ const END_MAGIC: u64 = 0x1772_4538_5090;
 /// Bit offset of the first block's stored CRC (the 32 bits after the block
 /// magic, which is byte aligned in the first block), if there is a block.
 pub fn first_block_crc_bit(stream: &[u8]) -> Option<usize> {
-    (stream.len() >= 14 && bits(stream, 32, 48) == BLOCK_MAGIC).then_some(80)
+    (stream.len() >= 14 && read_bits(stream, 32, 48) == BLOCK_MAGIC).then_some(80)
 }
 
 /// Bit offset of the stream's combined CRC: the 32 bits after the end-of-stream
@@ -214,22 +229,29 @@ pub fn stream_crc_bit(stream: &[u8]) -> Option<usize> {
     (0..8usize).find_map(|pad| {
         let crc = (stream.len() * 8).checked_sub(pad + 32)?;
         let magic = crc.checked_sub(48).filter(|&m| m >= 32)?;
-        (bits(stream, magic, 48) == END_MAGIC).then_some(crc)
+        (read_bits(stream, magic, 48) == END_MAGIC).then_some(crc)
     })
 }
 
-/// How many blocks `stream` holds: block magics at any bit offset. A false
-/// positive needs 48 matching bits inside compressed data.
-pub fn count_blocks(stream: &[u8]) -> usize {
+/// Bit offsets of the block magics of `stream`, found at any bit offset. A
+/// false positive needs 48 matching bits inside compressed data.
+pub fn block_starts(stream: &[u8]) -> Vec<usize> {
     let mut window = 0u64;
-    let mut count = 0;
+    let mut starts = Vec::new();
     for (i, bit) in stream
         .iter()
         .flat_map(|b| (0..8).map(move |k| (b >> (7 - k)) & 1))
         .enumerate()
     {
         window = ((window << 1) | u64::from(bit)) & ((1 << 48) - 1);
-        count += usize::from(i >= 47 + 32 && window == BLOCK_MAGIC);
+        if i >= 47 + 32 && window == BLOCK_MAGIC {
+            starts.push(i - 47);
+        }
     }
-    count
+    starts
+}
+
+/// How many blocks `stream` holds.
+pub fn count_blocks(stream: &[u8]) -> usize {
+    block_starts(stream).len()
 }

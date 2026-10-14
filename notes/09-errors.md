@@ -22,8 +22,9 @@ pub enum Error {
     OutputTooSmall { capacity: usize },
 }
 
-/// Where in the stream: the 0-based block index, and the bit offset into `src`
-/// at which the decoder stopped (for EOF, `src.len() * 8`).
+/// Where in the stream: the 0-based block index, and the bits of `src`
+/// consumed when the decoder noticed (for EOF, `src.len() * 8`). The bit is at
+/// or just after the offending field.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Position { pub block: u32, pub bit: u64 }
 
@@ -38,13 +39,20 @@ pub enum Corruption {
     Selector,          // selector MTF index >= nGroups
     CodeLength,        // a code length left 1..=20
     HuffmanCode,       // a bit pattern with no symbol (incomplete code set)
-    BlockTooLong,      // more symbols than the block size allows
-    RunTooLong,        // RUNA/RUNB run past the block size
+    NoEndOfBlock,      // the last selector's group ends without the EOB symbol
+    BlockTooLong,      // more bytes than the block size allows (literals or a run)
+    RunTooLong,        // a RUNA/RUNB run of 2^21 or more
     RunCount,          // un-RLE1: four equal bytes end the block without a count
 }
 ```
 
-- **Display:** one line with the context, e.g. `corrupt bzip2 stream: selector out of range in block 3 at bit 18203` or `bzip2 block 0 CRC mismatch: stored 0x1234abcd, computed 0x89ab0123`.
+- **Merged and added kinds:** a run that overflows the block is `BlockTooLong`
+  like a literal that does (libbz2 has one check for both); `RunTooLong` is
+  libbz2's separate 2^21 run-length limit. `NoEndOfBlock` is new. A bad block
+  size digit is `NotBzip2`, as in libbz2 (`BZ_DATA_ERROR_MAGIC`).
+- **Block index:** `Position.block` is the block being read; for the header 0,
+  for the end-of-stream marker and combined CRC the number of blocks.
+- **Display:** one line with the context, e.g. `corrupt bzip2 stream: selector out of range (block 3, bit 18203)` or `bzip2 block 0 CRC mismatch: stored 0x1234abcd, computed 0x89ab0123`.
 - **No allocation and `Copy`:** seqair wraps it in `CramError` as `source`.
 - **Hot path:** the error path is cold. Return through `#[cold]` constructors so error construction stays out of the symbol loop's registers. Measure that the bench does not move.
 - **Accept/reject parity is unchanged.** Only the payload is new, and the `OutputTooSmall` precedence stays as tested.

@@ -167,3 +167,33 @@ CRAM: level-3 0.99, level-4 1.00, v30-bz1 1.00, v30-bz9 1.06, v31-archive
 1.08, v31-bzonly 1.02, v31-small 1.00, ultima-bz6 1.01, ultima-bz1 1.01,
 ultima-bz9 1.02, ultima-archive 0.99. A second run of the cram set (9
 rounds) had every set between 0.97 and 1.09.
+
+## Context-carrying `Error` (cold constructors), ours/C
+
+The error type became `Corrupt { kind, at }`, `BlockCrc { .. }` and so on
+(`notes/09-errors.md`). The helpers still return a one-byte `Fail`; only
+`decode_stream` turns it into the public `Error`, in a `#[cold]
+#[inline(never)]` function that takes scalars (block index, bits consumed,
+input bits, `out.len()`), so the reader's address does not escape and the
+symbol loop and walk carry nothing new.
+
+Same command as the final table (`MC,XA,QUAL`, 16k/64k/1m, 5 rounds), 4 runs
+each of e8347e8 and the change, alternated; median of the per-run ours/C:
+
+| set | chunk | before | after | change |
+|---|---|---:|---:|---:|
+| MC | 16k | 1.128 | 1.116 | -1.0% |
+| MC | 64k | 0.996 | 0.984 | -1.2% |
+| MC | 1m | 0.990 | 0.993 | +0.3% |
+| XA | 16k | 1.081 | 1.078 | -0.3% |
+| XA | 64k | 1.003 | 1.004 | +0.1% |
+| XA | 1m | 0.989 | 0.986 | -0.3% |
+| QUAL | 16k | 1.168 | 1.132 | -3.0% |
+| QUAL | 64k | 1.110 | 1.095 | -1.3% |
+| QUAL | 1m | 1.048 | 1.072 | +2.2% |
+
+The machine was loaded (load average 14); C's own MB/s moved by up to 4%
+between runs, and the cells that moved more than 2% moved both ways (QUAL
+16k down, QUAL 1m up), so there is no change beyond noise. Absolute `ours`
+MB/s, median of 4: MC 16k 405.6 -> 400.5, MC 1m 437.4 -> 436.0, QUAL 1m
+1247.8 -> 1273.3. Empty-stream fixed cost 12 ns -> 11 ns.

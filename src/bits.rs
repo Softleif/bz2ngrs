@@ -70,10 +70,16 @@ impl<'a> Bits<'a> {
         (self.pos as u64) * 8 - u64::from(self.cnt)
     }
 
+    /// Bits in the input.
+    #[inline(always)]
+    pub(crate) fn len_bits(&self) -> u64 {
+        (self.src.len() as u64) * 8
+    }
+
     /// Whether the bits taken so far, plus `extra`, run past the input.
     #[inline(always)]
     pub(crate) fn overrun_by(&self, extra: u64) -> bool {
-        self.consumed() + extra > (self.src.len() as u64) * 8
+        self.consumed() + extra > self.len_bits()
     }
 
     /// Whether the bits taken so far run past the input.
