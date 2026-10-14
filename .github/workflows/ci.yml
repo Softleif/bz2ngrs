@@ -1,0 +1,159 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+# `bz2ngrs-bench` is excluded everywhere: its build.rs compiles bz2-ng's C
+# sources from a local checkout (`BZ2NG_C_DIR`) that CI does not have.
+jobs:
+  fmt:
+    name: Format
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f # v2.0.0
+        with:
+          components: rustfmt
+      - run: cargo fmt --all --check
+      - run: cargo fmt --check
+        working-directory: fuzz
+      - run: cargo fmt --check
+        working-directory: tools/cram-extract
+
+  docs:
+    name: Docs
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f # v2.0.0
+      - name: Rustdoc
+        env:
+          RUSTDOCFLAGS: -D warnings
+        run: cargo doc --locked --workspace --exclude bz2ngrs-bench --no-deps --examples
+
+  # The CRC and SIMD code is cfg'd per architecture, so lint on both.
+  clippy:
+    name: clippy (${{ matrix.runner }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-latest, ubuntu-24.04-arm]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f # v2.0.0
+        with:
+          components: clippy
+      - run: cargo clippy --locked --workspace --exclude bz2ngrs-bench --all-targets -- -D warnings
+
+  # The `x86_64-v3` entry enables AVX2 at compile time; the plain one has only
+  # runtime detection, and the two take different code paths.
+  test:
+    name: test (${{ matrix.name }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: x86_64
+            runner: ubuntu-latest
+            rustflags: -D warnings
+          - name: x86_64-v3
+            runner: ubuntu-latest
+            rustflags: -D warnings -C target-cpu=x86-64-v3
+          - name: aarch64
+            runner: ubuntu-24.04-arm
+            rustflags: -D warnings
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f # v2.0.0
+        with:
+          rustflags: ${{ matrix.rustflags }}
+          cache-key: ${{ matrix.name }}
+      - uses: taiki-e/install-action@4cef1412cce204788f482e778a0b9187f9626a29 # v2.87.21
+        with:
+          tool: cargo-nextest
+      - name: Show CPU features
+        run: grep -m1 -E '^(flags|Features)' /proc/cpuinfo
+      # Unoptimised on purpose: keeps debug assertions and overflow checks on.
+      - name: Test
+        env:
+          HEGEL_DEFAULT_PROFILE: ci
+        run: cargo nextest run --locked --workspace --exclude bz2ngrs-bench
+      # nextest does not run doctests.
+      - name: Doctests
+        run: cargo test --locked -p bz2ngrs --doc
+
+  # Inlining and the fat LTO that ships change what the SIMD kernels compile to.
+  test-release:
+    name: test release (${{ matrix.runner }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-latest, ubuntu-24.04-arm]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f # v2.0.0
+        with:
+          cache-key: release
+      - uses: taiki-e/install-action@4cef1412cce204788f482e778a0b9187f9626a29 # v2.87.21
+        with:
+          tool: cargo-nextest
+      - name: Test
+        env:
+          HEGEL_DEFAULT_PROFILE: ci
+        run: cargo nextest run --locked --release --workspace --exclude bz2ngrs-bench
+
+  other-crates:
+    name: Fuzz and cram-extract compile
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f # v2.0.0
+      - run: cargo check --locked --all-targets
+        working-directory: fuzz
+      - run: cargo check --locked --all-targets
+        working-directory: tools/cram-extract
+
+  fuzz:
+    name: Fuzz smoke test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f # v2.0.0
+        with:
+          components: llvm-tools-preview
+      - uses: taiki-e/install-action@4cef1412cce204788f482e778a0b9187f9626a29 # v2.87.21
+        with:
+          tool: cargo-fuzz
+      - name: Run all fuzz targets
+        run: ./fuzz/run_all.sh 60
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: failure()
+        with:
+          name: fuzzing-artifacts--${{ github.sha }}
+          path: fuzz/artifacts

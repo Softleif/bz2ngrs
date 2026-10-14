@@ -22,11 +22,19 @@ fn u8_(r: &mut impl Read) -> io::Result<u8> {
 fn itf8(r: &mut impl Read) -> io::Result<u32> {
     let first = u8_(r)?;
     let extra = first.leading_ones().min(4);
-    let mask = if extra == 4 { 0x0F } else { 0xFF >> (extra + 1) };
+    let mask = if extra == 4 {
+        0x0F
+    } else {
+        0xFF >> (extra + 1)
+    };
     let mut v = u32::from(first) & mask;
     for i in 0..extra {
         let b = u32::from(u8_(r)?);
-        v = if i == 3 { (v << 4) | (b & 0x0F) } else { (v << 8) | b };
+        v = if i == 3 {
+            (v << 4) | (b & 0x0F)
+        } else {
+            (v << 8) | b
+        };
     }
     Ok(v)
 }
@@ -65,7 +73,11 @@ fn arith_ext(data: &[u8]) -> Option<(usize, &[u8])> {
     if flags & 0x04 == 0 || flags & (0x08 | 0x20 | 0x40 | 0x80) != 0 {
         return None;
     }
-    let len = if flags & 0x10 == 0 { uint7(&mut rest)? } else { return None };
+    let len = if flags & 0x10 == 0 {
+        uint7(&mut rest)?
+    } else {
+        return None;
+    };
     rest.starts_with(b"BZh").then_some((len, rest))
 }
 
@@ -94,14 +106,21 @@ fn extract(args: &[String]) -> Res<()> {
     eprintln!("CRAM {}.{}", major, def[5]);
 
     let dir = Path::new(out).join(source);
-    let mut n = if dry { 0 } else { fs::read_dir(&dir).map_or(0, Iterator::count) };
+    let mut n = if dry {
+        0
+    } else {
+        fs::read_dir(&dir).map_or(0, Iterator::count)
+    };
     let mut manifest = None;
     if !dry {
         let mp = Path::new(out).join("manifest.tsv");
         let fresh = !mp.exists();
         let mut m = fs::OpenOptions::new().create(true).append(true).open(mp)?;
         if fresh {
-            writeln!(m, "path\tsource\tcompressed_len\tuncompressed_len\tcodec\tcontent_type\tcontent_id")?;
+            writeln!(
+                m,
+                "path\tsource\tcompressed_len\tuncompressed_len\tcodec\tcontent_type\tcontent_id"
+            )?;
         }
         manifest = Some(m);
     }
@@ -150,9 +169,19 @@ fn extract(args: &[String]) -> Res<()> {
             e.0 += 1;
             e.1 += clen as u64;
             let entry = match method {
-                2 => Some(Entry { codec: "block", content_type, content_id, uncompressed_len: ulen, data: data.to_vec() }),
+                2 => Some(Entry {
+                    codec: "block",
+                    content_type,
+                    content_id,
+                    uncompressed_len: ulen,
+                    data: data.to_vec(),
+                }),
                 6 => arith_ext(data).map(|(len, body)| Entry {
-                    codec: "arith-ext", content_type, content_id, uncompressed_len: len, data: body.to_vec(),
+                    codec: "arith-ext",
+                    content_type,
+                    content_id,
+                    uncompressed_len: len,
+                    data: body.to_vec(),
                 }),
                 _ => None,
             };
@@ -165,7 +194,15 @@ fn extract(args: &[String]) -> Res<()> {
             let rel = format!("{source}/{n:06}.bz2");
             fs::create_dir_all(&dir)?;
             fs::write(Path::new(out).join(&rel), &e.data)?;
-            writeln!(m, "{rel}\t{source}\t{}\t{}\t{}\t{}\t{}", e.data.len(), e.uncompressed_len, e.codec, e.content_type, e.content_id)?;
+            writeln!(
+                m,
+                "{rel}\t{source}\t{}\t{}\t{}\t{}\t{}",
+                e.data.len(),
+                e.uncompressed_len,
+                e.codec,
+                e.content_type,
+                e.content_id
+            )?;
             n += 1;
             written += e.data.len() as u64;
         }
@@ -174,7 +211,10 @@ fn extract(args: &[String]) -> Res<()> {
     for (m, (c, bytes)) in &methods {
         eprintln!("  method {m}: {c} blocks, {bytes} bytes");
     }
-    eprintln!("bzip2 payload {} {written}", if dry { "blocks (dry)" } else { "bytes written" });
+    eprintln!(
+        "bzip2 payload {} {written}",
+        if dry { "blocks (dry)" } else { "bytes written" }
+    );
     Ok(())
 }
 
@@ -191,14 +231,21 @@ fn verify(args: &[String]) -> Res<()> {
     let mut bad = 0;
     for line in manifest.lines().skip(1) {
         let c: Vec<&str> = line.split('\t').collect();
-        let [path, source, clen, ulen, _codec, ctype, _cid] = c[..] else { return Err(format!("bad row {line}").into()) };
+        let [path, source, clen, ulen, _codec, ctype, _cid] = c[..] else {
+            return Err(format!("bad row {line}").into());
+        };
         let data = fs::read(dir.join(path))?;
         let (clen, ulen): (usize, usize) = (clen.parse()?, ulen.parse()?);
         let mut out = Vec::new();
         let r = bzip2::read::BzDecoder::new(&data[..]).read_to_end(&mut out);
         if data.len() != clen || r.is_err() || out.len() > ulen {
             bad += 1;
-            eprintln!("BAD {path}: file {} manifest {clen} decoded {} declared {ulen} {:?}", data.len(), out.len(), r.err());
+            eprintln!(
+                "BAD {path}: file {} manifest {clen} decoded {} declared {ulen} {:?}",
+                data.len(),
+                out.len(),
+                r.err()
+            );
         }
         let e = per.entry(source.to_string()).or_default();
         e.0.push(ulen);
@@ -214,7 +261,10 @@ fn verify(args: &[String]) -> Res<()> {
         total_n += u.len();
         total_b += bytes;
     }
-    println!("total: {total_n} blocks, {} MB compressed, {bad} bad", total_b / 1_000_000);
+    println!(
+        "total: {total_n} blocks, {} MB compressed, {bad} bad",
+        total_b / 1_000_000
+    );
     if bad > 0 {
         return Err("verification failures".into());
     }
