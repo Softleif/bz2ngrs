@@ -605,7 +605,11 @@ pub fn to_vec_equals_oracle(tc: &TestCase, decoders: &[Decoder]) {
         assert_eq!(got.as_deref(), Ok(&v.data[..]), "{}: size {size}", d.name());
         // "The `Vec` keeps capacity `size` even when shorter."
         let capacity = got.map(|g| g.capacity());
-        assert!(capacity.is_ok_and(|c| c >= size), "{}: {capacity:?}", d.name());
+        assert!(
+            capacity.is_ok_and(|c| c >= size),
+            "{}: {capacity:?}",
+            d.name()
+        );
     }
 }
 
