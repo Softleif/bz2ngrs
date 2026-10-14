@@ -81,7 +81,7 @@ macro_rules! surface_properties {
         }
 
         #[hegel::test]
-        fn short_out_is_output_too_small(tc: hegel::TestCase) {
+        fn short_out_is_output_too_small_with_capacity(tc: hegel::TestCase) {
             $crate::common::props::short_out(&tc, &$decoders);
         }
 
@@ -96,18 +96,23 @@ macro_rules! surface_properties {
         }
 
         #[hegel::test]
-        fn truncated_stream_is_unexpected_eof(tc: hegel::TestCase) {
+        fn truncated_stream_is_unexpected_eof_in_its_block(tc: hegel::TestCase) {
             $crate::common::props::truncated(&tc, &$decoders);
         }
 
         #[hegel::test]
-        fn corrupt_block_crc_is_crc_mismatch(tc: hegel::TestCase) {
+        fn corrupt_block_crc_is_block_crc_with_values(tc: hegel::TestCase) {
             $crate::common::props::corrupt_block_crc(&tc, &$decoders);
         }
 
         #[hegel::test]
-        fn corrupt_stream_crc_is_crc_mismatch(tc: hegel::TestCase) {
+        fn corrupt_stream_crc_is_stream_crc_with_values(tc: hegel::TestCase) {
             $crate::common::props::corrupt_stream_crc(&tc, &$decoders);
+        }
+
+        #[hegel::test]
+        fn wrong_header_is_not_bzip2(tc: hegel::TestCase) {
+            $crate::common::props::not_bzip2(&tc, &$decoders);
         }
 
         #[hegel::test]
@@ -161,11 +166,12 @@ macro_rules! surface_properties {
                                             test_cases = $crate::common::pinned::cases(1500),
                                             suppress_health_check = [hegel::HealthCheck::TooSlow]
                                         )]
-        fn forged_origptr_out_of_range_is_corrupt(tc: hegel::TestCase) {
+        fn forged_origptr_out_of_range_is_corrupt_orig_ptr(tc: hegel::TestCase) {
             $crate::common::props::forged_is_corrupt(
                 &tc,
                 &$decoders,
-                $crate::common::forge::one_block($crate::common::forge::OrigClass::OutOfRange),
+                $crate::common::forge::bad_orig_ptr_last(),
+                bz2ngrs::Corruption::OrigPtr,
             );
         }
 
@@ -173,11 +179,12 @@ macro_rules! surface_properties {
                                             test_cases = $crate::common::pinned::cases(400),
                                             suppress_health_check = [hegel::HealthCheck::TooSlow]
                                         )]
-        fn forged_oversize_block_is_corrupt(tc: hegel::TestCase) {
+        fn forged_oversize_block_is_corrupt_block_too_long(tc: hegel::TestCase) {
             $crate::common::props::forged_is_corrupt(
                 &tc,
                 &$decoders,
                 $crate::common::forge::oversize_block(),
+                bz2ngrs::Corruption::BlockTooLong,
             );
         }
 

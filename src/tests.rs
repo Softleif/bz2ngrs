@@ -2,7 +2,7 @@
 
 use std::io::Write;
 
-use crate::{__decompress_at, Error, decompress};
+use crate::{__decompress_at, Error, Position, decompress};
 
 fn levels() -> Vec<fearless_simd::Level> {
     let best = fearless_simd::Level::new();
@@ -52,7 +52,9 @@ fn check(data: &[u8], level: u32) {
             let mut out = vec![0; data.len() - 1];
             assert_eq!(
                 __decompress_at(lv, &c, &mut out),
-                Err(Error::OutputTooSmall)
+                Err(Error::OutputTooSmall {
+                    capacity: data.len() - 1
+                })
             );
         }
     }
@@ -134,9 +136,11 @@ fn truncation_at_every_byte() {
     let c = compress(&data, 9);
     let mut out = vec![0; data.len()];
     for cut in 0..c.len() {
-        assert_eq!(
-            decompress(&c[..cut], &mut out),
-            Err(Error::UnexpectedEof),
+        assert!(
+            matches!(
+                decompress(&c[..cut], &mut out),
+                Err(Error::UnexpectedEof { at }) if at.bit == cut as u64 * 8
+            ),
             "cut {cut}"
         );
     }
@@ -164,15 +168,23 @@ fn corruptions_match_libbz2() {
 #[test]
 fn bad_headers() {
     let mut out = [0u8; 16];
-    assert_eq!(decompress(b"BZh0", &mut out), Err(Error::Corrupt));
-    assert_eq!(decompress(b"BZx9", &mut out), Err(Error::Corrupt));
-    assert_eq!(decompress(b"BZh9", &mut out), Err(Error::UnexpectedEof));
-    assert_eq!(decompress(b"", &mut out), Err(Error::UnexpectedEof));
+    assert_eq!(decompress(b"BZh0", &mut out), Err(Error::NotBzip2));
+    assert_eq!(decompress(b"BZx9", &mut out), Err(Error::NotBzip2));
+    let eof = |bit| {
+        Err(Error::UnexpectedEof {
+            at: Position { block: 0, bit },
+        })
+    };
+    assert_eq!(decompress(b"BZh9", &mut out), eof(32));
+    assert_eq!(decompress(b"", &mut out), eof(0));
     // An empty stream with a wrong combined CRC.
     let mut c = compress(b"", 9);
     let last = c.len() - 1;
     c[last] ^= 1;
-    assert_eq!(decompress(&c, &mut out), Err(Error::CrcMismatch));
+    assert!(matches!(
+        decompress(&c, &mut out),
+        Err(Error::StreamCrc { .. })
+    ));
 }
 
 /// Sets the randomised bit of a single-block stream's block, then fixes up
@@ -212,4 +224,37 @@ fn randomised_block() {
         assert_eq!(__decompress_at(lv, &c, &mut out), Ok(y.len()));
         assert!(out == y);
     }
+}
+
+#[test]
+fn display_carries_the_context() {
+    use crate::Corruption;
+    let at = Position {
+        block: 3,
+        bit: 18203,
+    };
+    let shown = |e: Error| e.to_string();
+    assert_eq!(
+        shown(Error::Corrupt {
+            kind: Corruption::Selector,
+            at
+        }),
+        "corrupt bzip2 stream: selector out of range (block 3, bit 18203)"
+    );
+    assert_eq!(
+        shown(Error::BlockCrc {
+            block: 0,
+            stored: 0x1234_abcd,
+            computed: 0x89ab_0123
+        }),
+        "bzip2 block 0 CRC mismatch: stored 0x1234abcd, computed 0x89ab0123"
+    );
+    assert_eq!(
+        shown(Error::UnexpectedEof { at }),
+        "bzip2 stream ends early (block 3, bit 18203)"
+    );
+    assert_eq!(
+        shown(Error::OutputTooSmall { capacity: 7 }),
+        "bzip2 stream decodes to more than 7 bytes"
+    );
 }
