@@ -1,7 +1,7 @@
 //! un-RLE1 (the first run-length stage) from the block's text into the
 //! caller's buffer, and libbz2's block randomisation.
 
-use fearless_simd::{Simd, SimdBase, u8x16};
+use fearless_simd::{Simd, SimdBase, u8x32};
 
 use crate::Error;
 
@@ -103,21 +103,21 @@ pub(crate) fn unrle<S: Simd>(
     Ok(o)
 }
 
-/// Writes `total` copies of `ch` at `out[o..]`: two 16-byte stores, then a
-/// loop only for runs past 32 bytes (most are shorter, so its exit is
-/// predictable), when there is room for the overshoot.
+/// Writes `total` copies of `ch` at `out[o..]` in 32-byte stores. A run of
+/// up to 32 bytes is one store (most are that short, so no loop exit to
+/// mispredict) that may overshoot; a longer one ends with a store that
+/// overlaps the previous one, so it does not.
 #[inline(always)]
 fn fill<S: Simd>(simd: S, out: &mut [u8], o: usize, ch: u8, total: usize) -> Result<(), Error> {
-    let wide = total.max(32).next_multiple_of(16);
-    let v = u8x16::splat(simd, ch);
-    if let Some(d) = out.get_mut(o..o + wide) {
-        if let [c0, c1, rest @ ..] = d.as_chunks_mut::<16>().0 {
-            v.store_slice(c0);
-            v.store_slice(c1);
-            for c in rest {
-                v.store_slice(c);
-            }
+    let v = u8x32::splat(simd, ch);
+    if let Some(d) = out.get_mut(o..o + total.max(32)) {
+        let last = d.len() - 32;
+        let mut k = 0;
+        while k < last {
+            v.store_slice(&mut d[k..k + 32]);
+            k += 32;
         }
+        v.store_slice(&mut d[last..]);
         Ok(())
     } else {
         out.get_mut(o..o + total)

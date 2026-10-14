@@ -99,3 +99,12 @@ CRAM: level-3 0.89 -> 0.94, level-4 0.89 -> 0.80 (0.11 MB, noisy),
 v30-bz1 0.93 -> 0.96, v30-bz9 0.91 -> 0.99, v31-archive 0.97 -> 1.07,
 v31-bzonly 0.92 -> 0.99, v31-small 0.80 -> 1.06, ultima-bz6 0.94 -> 0.96,
 ultima-bz1 0.91 -> 0.98, ultima-bz9 0.88 -> 0.93, ultima-archive 0.94 -> 0.93.
+
+### 3. Run fill: 32-byte stores, overlapping last store (kept)
+
+Long runs (QUAL 1m has many near the 259-byte maximum) took one 16-byte store
+per loop iteration. Now 32-byte stores (`u8x32`), and a run longer than 32
+ends with a store that overlaps the previous one instead of overshooting.
+
+Best pass, MB/s, base -> new (3 alternating runs each): QUAL 1m 1096 -> 1125
+(+2.7%), QUAL 64k 970 -> 984 (+1.4%).
