@@ -1,0 +1,42 @@
+[package]
+name = "bz2ngrs"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.98.1"
+license = "MIT"
+description = "Fast one-shot bzip2 decompression, a Rust port of bz2-ng's decoder"
+publish = false
+
+[workspace]
+members = [".", "bench"]
+
+[dependencies]
+fearless_simd = "1.1"
+fearless_simd_macros = "0.1"
+
+[dev-dependencies]
+bzip2 = "0.6.1"
+hegeltest = "0.49.2"
+# Compiles fearless_simd's scalar `Fallback` level on SIMD targets too, so
+# tests can run every kernel at every level (as seqair does).
+fearless_simd = { version = "1.1", features = ["force_support_fallback"] }
+
+[lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(fuzzing)'] }
+
+[lints.clippy]
+dbg_macro = "warn"
+panic = "deny"
+undocumented_unsafe_blocks = "deny"
+unwrap_used = "warn"
+cast_possible_truncation = "warn"
+cast_possible_wrap = "warn"
+
+[profile.release]
+codegen-units = 1
+lto = "fat"
+debug = 1
+
+[profile.dev.package."*"]
+opt-level = 3
