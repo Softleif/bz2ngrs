@@ -356,13 +356,14 @@ struct Opts {
     data: PathBuf,
     manifest: PathBuf,
     tsv: Option<PathBuf>,
+    decoders: Vec<String>,
 }
 
 fn usage() -> ! {
     eprintln!(
         "usage: bz2ngrs-bench [--sets MC,XA,QUAL,cram] [--chunks 16k,64k,1m,whole,slices,blocks]\n\
          \x20  [--samples NA12878,NA19141] [--rounds 5] [--level 9] [--min-ms 30] [--max-bytes N (0 = all)]\n\
-         \x20  [--data DIR] [--manifest FILE] [--tsv FILE]"
+         \x20  [--data DIR] [--manifest FILE] [--tsv FILE] [--decoders ours,bzip2,C]"
     );
     std::process::exit(2)
 }
@@ -380,6 +381,7 @@ fn parse_args() -> Opts {
         data: "/Users/pascal/code/tfenne/bz2-ng/data/corpora/1kg".into(),
         manifest: "/Users/pascal/Code/softleif/bz2ngrs/corpus/cram-bzip2/manifest.tsv".into(),
         tsv: None,
+        decoders: list("ours,bzip2,C"),
     };
     let mut a = std::env::args().skip(1);
     while let Some(k) = a.next() {
@@ -400,6 +402,7 @@ fn parse_args() -> Opts {
             "--data" => o.data = v.into(),
             "--manifest" => o.manifest = v.into(),
             "--tsv" => o.tsv = Some(v.into()),
+            "--decoders" => o.decoders = list(&v),
             _ => usage(),
         }
     }
@@ -426,7 +429,7 @@ fn main() {
     let mut run = |set: &str, chunk: &str, streams: Vec<Stream>| {
         let mut buf = vec![0u8; streams.iter().map(|s| s.raw.len()).max().unwrap_or(0)];
         let v = verify(&streams, &mut buf);
-        let mut ok = [true; 3];
+        let mut ok = NAMES.map(|n| o.decoders.iter().any(|d| d == n));
         for (i, r) in v.into_iter().enumerate() {
             if let Err(e) = r {
                 ok[i] = false;
@@ -490,7 +493,11 @@ fn main() {
             }
         }
     }
-    if want_chunk("blocks") && o.sets.iter().any(|t| "cram".contains(t.as_str())) {
+    if want_chunk("blocks")
+        && o.sets
+            .iter()
+            .any(|t| "cram".contains(t.as_str()) || t.starts_with("cram/"))
+    {
         for (name, streams) in load_manifest(&o.manifest) {
             if want_set(&name) {
                 run(&name, "blocks", streams);
@@ -522,6 +529,7 @@ fn main() {
     let mut cells = Vec::new();
     for (i, r) in v.iter().enumerate() {
         cells.push(match r {
+            _ if !o.decoders.iter().any(|d| d == NAMES[i]) => "-".to_string(),
             Err(_) => (if i == 0 { "FAILED/stub" } else { "FAILED" }).to_string(),
             Ok(()) => {
                 let mut best = f64::MAX;
