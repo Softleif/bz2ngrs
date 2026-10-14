@@ -1,0 +1,14 @@
+[package]
+name = "cram-extract"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+# Standalone: not part of the bz2ngrs workspace.
+[workspace]
+
+[dependencies]
+bzip2 = "0.6.1"
+
+[profile.release]
+debug = false
