@@ -508,26 +508,35 @@ fn store16<S: Simd>(ll: &mut [u8; BYTES], at: usize, v: u8x16<S>) {
 
 #[cfg(test)]
 mod tests {
-    use fearless_simd::{Level, SimdBase, SimdFrom, dispatch, u8x16};
+    use fearless_simd::{SimdBase, SimdFrom, dispatch, u8x16};
 
+    /// `PERM[k]` as a shuffle moves lane `k` to the front, for every `k`, at
+    /// every level; `slide::<15>` shifts a byte in at the front.
     #[test]
     fn perm_moves_lane_to_front_and_slide_shifts_in() {
-        dispatch!(Level::new(), simd => {
-            let v = u8x16::simd_from(simd, core::array::from_fn::<u8, 16, _>(|i| 100 + i as u8));
-            let m: [u8; 16] = v.swizzle_dyn(u8x16::simd_from(simd, super::PERM[5])).into();
-            assert_eq!(m[..7], [105, 100, 101, 102, 103, 104, 106]);
-            assert_eq!(m[15], 115);
-            let s: [u8; 16] = u8x16::splat(simd, 7).slide::<15>(v).into();
-            assert_eq!(s[..3], [7, 100, 101]);
-            assert_eq!(s[15], 114);
-        });
+        for level in crate::tests::levels() {
+            dispatch!(level, simd => {
+                let list: [u8; 16] = core::array::from_fn(|i| 100 + i as u8);
+                let v = u8x16::simd_from(simd, list);
+                for k in 0..16 {
+                    let mut want = list.to_vec();
+                    let moved = want.remove(k);
+                    want.insert(0, moved);
+                    let m: [u8; 16] = v.swizzle_dyn(u8x16::simd_from(simd, super::PERM[k])).into();
+                    assert_eq!(m[..], want[..], "{level:?} k={k}");
+                }
+                let s: [u8; 16] = u8x16::splat(simd, 7).slide::<15>(v).into();
+                assert_eq!(s[0], 7, "{level:?}");
+                assert_eq!(s[1..], list[..15], "{level:?}");
+            });
+        }
     }
 
     /// The vector tail move against a plain move-to-front of the whole list,
-    /// for every index past the head, at the fallback and the best level.
+    /// for every index past the head, at every level.
     #[test]
     fn tail_move_is_move_to_front() {
-        for level in [Level::fallback(), Level::new()] {
+        for level in crate::tests::levels() {
             for idx in 16..=255usize {
                 let list: [u8; 256] =
                     core::array::from_fn(|i| (i as u8).wrapping_mul(37).wrapping_add(5));

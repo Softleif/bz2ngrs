@@ -4,7 +4,7 @@ use std::io::Write;
 
 use crate::{__decompress_at, Error, Position, decompress};
 
-fn levels() -> Vec<fearless_simd::Level> {
+pub(crate) fn levels() -> Vec<fearless_simd::Level> {
     let best = fearless_simd::Level::new();
     let v = vec![fearless_simd::Level::fallback(), best];
     #[cfg(target_arch = "x86_64")]
@@ -24,13 +24,31 @@ fn compress(data: &[u8], level: u32) -> Vec<u8> {
     e.finish().unwrap()
 }
 
-/// libbz2's verdict: the output, or whether it rejected the stream.
-fn reference(src: &[u8]) -> Result<Vec<u8>, ()> {
+/// libbz2's verdict: the output, or the kind of its error (`UnexpectedEof`
+/// when the input ended early, `InvalidInput` for anything else).
+fn reference(src: &[u8]) -> Result<Vec<u8>, std::io::ErrorKind> {
     let mut out = Vec::new();
     let mut d = bzip2::read::BzDecoder::new(src);
     std::io::Read::read_to_end(&mut d, &mut out)
         .map(|_| out)
-        .map_err(|_| ())
+        .map_err(|e| e.kind())
+}
+
+/// CRC-32/BZIP2 one bit at a time, so that the expected value of a test does
+/// not come from the crate's own CRC.
+fn bitwise_crc(data: &[u8]) -> u32 {
+    let mut crc = !0u32;
+    for &b in data {
+        crc ^= u32::from(b) << 24;
+        for _ in 0..8 {
+            crc = if crc & 0x8000_0000 != 0 {
+                (crc << 1) ^ 0x04C1_1DB7
+            } else {
+                crc << 1
+            };
+        }
+    }
+    !crc
 }
 
 fn check(data: &[u8], level: u32) {
@@ -128,6 +146,7 @@ fn trailing_bytes_are_ignored() {
     c.extend_from_slice(b"garbage after the stream");
     let mut out = [0u8; 64];
     assert_eq!(decompress(&c, &mut out), Ok(17));
+    assert_eq!(&out[..17], b"hello hello hello");
 }
 
 #[test]
@@ -157,9 +176,21 @@ fn corruptions_match_libbz2() {
             bad[i] ^= 1 << bit;
             let ours = decompress(&bad, &mut out).map(|n| out[..n].to_vec());
             let theirs = reference(&bad);
-            assert_eq!(ours.is_ok(), theirs.is_ok(), "byte {i} bit {bit}: {ours:?}");
-            if let (Ok(a), Ok(b)) = (&ours, &theirs) {
-                assert!(a == b, "byte {i} bit {bit}: different output");
+            match (&ours, &theirs) {
+                (Ok(a), Ok(b)) => assert!(a == b, "byte {i} bit {bit}: different output"),
+                (Err(Error::UnexpectedEof { .. }), Err(std::io::ErrorKind::UnexpectedEof)) => {}
+                (
+                    Err(
+                        Error::NotBzip2
+                        | Error::Corrupt { .. }
+                        | Error::BlockCrc { .. }
+                        | Error::StreamCrc { .. },
+                    ),
+                    Err(std::io::ErrorKind::InvalidInput),
+                ) => {}
+                // A block that grows past `out` before its CRC is checked.
+                (Err(Error::OutputTooSmall { .. }), Err(std::io::ErrorKind::InvalidInput)) => {}
+                _ => panic!("byte {i} bit {bit}: ours {ours:?}, libbz2 {theirs:?}"),
             }
         }
     }
@@ -177,14 +208,17 @@ fn bad_headers() {
     };
     assert_eq!(decompress(b"BZh9", &mut out), eof(32));
     assert_eq!(decompress(b"", &mut out), eof(0));
-    // An empty stream with a wrong combined CRC.
+    // An empty stream (combined CRC 0) with its last bit flipped.
     let mut c = compress(b"", 9);
-    let last = c.len() - 1;
-    c[last] ^= 1;
-    assert!(matches!(
+    assert_eq!(c.len(), 14);
+    c[13] ^= 1;
+    assert_eq!(
         decompress(&c, &mut out),
-        Err(Error::StreamCrc { .. })
-    ));
+        Err(Error::StreamCrc {
+            stored: 1,
+            computed: 0
+        })
+    );
 }
 
 /// Sets the randomised bit of a single-block stream's block, then fixes up
@@ -199,7 +233,7 @@ fn randomised_block() {
     let mut y = Vec::with_capacity(data.len() * 2);
     assert!(d.decompress_vec(&c, &mut y).is_err());
     assert_ne!(y, data);
-    let crc = !crate::crc::update(!0, &y);
+    let crc = bitwise_crc(&y);
     c[10..14].copy_from_slice(&crc.to_be_bytes());
     // The combined CRC is the last 32 bits before the 0..7 padding bits.
     let total = c.len() * 8;
@@ -256,5 +290,16 @@ fn display_carries_the_context() {
     assert_eq!(
         shown(Error::OutputTooSmall { capacity: 7 }),
         "bzip2 stream decodes to more than 7 bytes"
+    );
+    assert_eq!(
+        shown(Error::NotBzip2),
+        "not a bzip2 stream (no BZh1 to BZh9 header)"
+    );
+    assert_eq!(
+        shown(Error::StreamCrc {
+            stored: 1,
+            computed: 0xfc89_1918
+        }),
+        "bzip2 stream CRC mismatch: stored 0x00000001, computed 0xfc891918"
     );
 }

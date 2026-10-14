@@ -201,4 +201,158 @@ mod tests {
         assert_eq!(code(&t, "0"), (0, 1));
         assert_eq!(code(&t, "1"), (1, 1));
     }
+
+    /// libbz2 1.0.8's decode tables and decode loop (`BZ2_hbCreateDecodeTables`
+    /// and `GET_MTF_VAL`), transcribed, as the oracle for [`HTable`]: the
+    /// symbol and code length that the top bits of `bits` decode to, if any.
+    fn libbz2_decode(lens: &[u8], bits: u64) -> Option<(usize, u32)> {
+        let min = usize::from(*lens.iter().min()?);
+        let max = usize::from(*lens.iter().max()?);
+        let mut perm = [0usize; 258];
+        let mut pp = 0;
+        for i in min..=max {
+            for (j, &l) in lens.iter().enumerate() {
+                if usize::from(l) == i {
+                    perm[pp] = j;
+                    pp += 1;
+                }
+            }
+        }
+        let mut base = [0i32; 23];
+        for &l in lens {
+            base[usize::from(l) + 1] += 1;
+        }
+        for i in 1..23 {
+            base[i] += base[i - 1];
+        }
+        let mut limit = [0i32; 23];
+        let mut vec = 0i32;
+        for i in min..=max {
+            vec += base[i + 1] - base[i];
+            limit[i] = vec - 1;
+            vec <<= 1;
+        }
+        for i in min + 1..=max {
+            base[i] = ((limit[i - 1] + 1) << 1) - base[i];
+        }
+        let mut zn = min;
+        let mut zvec = (bits >> (64 - zn)) as i32;
+        loop {
+            if zn > 20 {
+                return None;
+            }
+            if zvec <= limit[zn] {
+                break;
+            }
+            zn += 1;
+            zvec = (zvec << 1) | ((bits >> (64 - zn)) & 1) as i32;
+        }
+        let idx = zvec - base[zn];
+        if !(0..258).contains(&idx) {
+            return None;
+        }
+        assert!(
+            (idx as usize) < pp,
+            "libbz2 would read a stale entry of perm"
+        );
+        Some((perm[idx as usize], zn as u32))
+    }
+
+    /// The canonical code of each symbol (`BZ2_hbAssignCodes`); a code is
+    /// valid where it is below 2^length.
+    fn assign_codes(lens: &[u8]) -> Vec<u32> {
+        let mut codes = vec![0; lens.len()];
+        let mut vec = 0u32;
+        for n in 1..=20 {
+            for (i, &l) in lens.iter().enumerate() {
+                if u32::from(l) == n {
+                    codes[i] = vec;
+                    vec += 1;
+                }
+            }
+            vec <<= 1;
+        }
+        codes
+    }
+
+    fn splitmix(state: &mut u64) -> u64 {
+        *state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        let mut z = *state;
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        z ^ (z >> 31)
+    }
+
+    /// Code lengths for `alpha` symbols: independent ones (mode 0), those of a
+    /// random binary tree, which make a complete code (mode 1), or a tree's
+    /// with some lengths lengthened (mode 2, incomplete) or also shortened
+    /// (mode 3, oversubscribed).
+    fn some_lengths(mode: u8, alpha: usize, seed: u64) -> Vec<u8> {
+        let mut s = seed;
+        if mode == 0 {
+            let top = 1 + splitmix(&mut s) % 20;
+            return (0..alpha)
+                .map(|_| 1 + (splitmix(&mut s) % top) as u8)
+                .collect();
+        }
+        let mut lens = vec![1u8, 1];
+        while lens.len() < alpha {
+            let i = splitmix(&mut s) as usize % lens.len();
+            if lens[i] < 20 {
+                lens[i] += 1;
+                lens.push(lens[i]);
+            }
+        }
+        for i in (1..lens.len()).rev() {
+            lens.swap(i, splitmix(&mut s) as usize % (i + 1));
+        }
+        if mode >= 2 {
+            for l in &mut lens {
+                match splitmix(&mut s) % 16 {
+                    0 if *l < 20 => *l += 1,
+                    1 if *l > 1 && mode == 3 => *l -= 1,
+                    _ => {}
+                }
+            }
+        }
+        lens
+    }
+
+    /// For any code lengths libbz2 accepts (1 to 20 each, 3 to 258 symbols):
+    /// complete, incomplete or oversubscribed, the table decodes every bit
+    /// pattern to the symbol and length libbz2's tables do, or to no code.
+    /// Patterns are random, or begin with the canonical code of a symbol.
+    #[hegel::test]
+    fn decodes_like_libbz2(tc: hegel::TestCase) {
+        use hegel::generators as gs;
+        let alpha = tc.draw(gs::integers::<usize>().min_value(3).max_value(258));
+        let mode = tc.draw(gs::integers::<u8>().max_value(3));
+        let lens = some_lengths(mode, alpha, tc.draw(gs::integers::<u64>()));
+        let codes = assign_codes(&lens);
+        let kraft: u64 = lens.iter().map(|&l| 1u64 << (20 - l)).sum();
+        for level in crate::tests::levels() {
+            let mut t = HTable::default();
+            fearless_simd::dispatch!(level, simd => t.build(simd, &lens));
+            for _ in 0..16 {
+                let mut bits = tc.draw(gs::integers::<u64>());
+                if tc.draw(gs::booleans()) {
+                    let s = tc.draw(gs::integers::<usize>().max_value(alpha - 1));
+                    let l = u32::from(lens[s]);
+                    if u64::from(codes[s]) < 1 << l {
+                        bits = u64::from(codes[s]) << (64 - l) | bits >> l;
+                        if kraft <= 1 << 20 {
+                            assert_eq!(libbz2_decode(&lens, bits), Some((s, l)), "model");
+                        }
+                    }
+                }
+                let e = t.decode(bits);
+                let got = (e & 31 != 0).then_some(((e >> 5) as usize, e & 31));
+                assert_eq!(
+                    got,
+                    libbz2_decode(&lens, bits),
+                    "{level:?} {lens:?} {bits:064b}"
+                );
+            }
+        }
+    }
 }

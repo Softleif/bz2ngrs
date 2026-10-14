@@ -347,6 +347,37 @@ mod tests {
     use hegel::TestCase;
     use hegel::generators as gs;
 
+    /// CRC-32/BZIP2 one bit at a time, straight from the definition, so that
+    /// it shares nothing with the lookup table the kernels are built on.
+    fn bitwise(mut crc: u32, data: &[u8]) -> u32 {
+        for &b in data {
+            crc ^= u32::from(b) << 24;
+            for _ in 0..8 {
+                crc = if crc & 0x8000_0000 != 0 {
+                    (crc << 1) ^ 0x04C1_1DB7
+                } else {
+                    crc << 1
+                };
+            }
+        }
+        crc
+    }
+
+    /// A megabyte at an odd offset: the long-buffer loops of the folding
+    /// kernels, which the 3000-byte properties stop short of.
+    #[test]
+    fn a_megabyte_at_an_odd_offset() {
+        let buf: Vec<u8> = (0..(1u32 << 20) + 32)
+            .map(|i| (i.wrapping_mul(2654435761) >> 11).to_le_bytes()[0])
+            .collect();
+        let d = &buf[5..5 + (1 << 20) + 13];
+        let want = bitwise(!0, d);
+        for (name, f) in paths() {
+            assert_eq!(f(!0, d), want, "{name}");
+        }
+        assert_eq!(update(!0, d), want);
+    }
+
     #[test]
     fn check_value() {
         // CRC-32/BZIP2 check value from the CRC catalogue.
@@ -356,7 +387,7 @@ mod tests {
         }
     }
 
-    /// Every path on every length 0..=300 at every alignment, against the bytewise table.
+    /// Every path on every length 0..=300 at every alignment, against the bit-by-bit definition.
     #[test]
     fn all_lengths_and_alignments() {
         let buf: Vec<u8> = (0..316u32)
@@ -367,7 +398,7 @@ mod tests {
                 for len in 0..=300 {
                     let d = &buf[off..off + len];
                     for init in [0, !0, 0x1234_5678] {
-                        assert_eq!(f(init, d), bytewise(init, d), "{name} off={off} len={len}");
+                        assert_eq!(f(init, d), bitwise(init, d), "{name} off={off} len={len}");
                     }
                 }
             }
@@ -382,7 +413,7 @@ mod tests {
     fn matches_reference(tc: TestCase) {
         let data = tc.draw(any_bytes());
         let init = tc.draw(gs::integers::<u32>());
-        let want = bytewise(init, &data);
+        let want = bitwise(init, &data);
         for (name, f) in paths() {
             assert_eq!(f(init, &data), want, "{name}");
         }

@@ -138,10 +138,61 @@ pub fn reference(src: &[u8], cap: usize) -> Reference {
     }
 }
 
+/// How libbz2 ends `src` when it may write as much as it likes (up to 256 MiB,
+/// beyond which the stream is taken to be fine): `Ok` for a stream it
+/// accepts, else the kind of its error.
+fn reference_outcome(src: &[u8]) -> Result<(), io::ErrorKind> {
+    const LIMIT: usize = 256 << 20;
+    let mut dec = BzDecoder::new(src);
+    let mut buf = vec![0u8; 1 << 16];
+    let mut total = 0;
+    while total < LIMIT {
+        match dec.read(&mut buf) {
+            Ok(0) => return Ok(()),
+            Ok(n) => total += n,
+            Err(e) => return Err(e.kind()),
+        }
+    }
+    Ok(())
+}
+
+/// The class of an error: what libbz2 can tell apart (the input ended early,
+/// the input is bad), and the caller's buffer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Class {
+    EarlyEnd,
+    BadInput,
+    OutputFull,
+}
+
+fn class(e: &Error) -> Class {
+    match e {
+        Error::UnexpectedEof { .. } => Class::EarlyEnd,
+        Error::OutputTooSmall { .. } => Class::OutputFull,
+        _ => Class::BadInput,
+    }
+}
+
+fn io_class(kind: io::ErrorKind) -> Class {
+    if kind == io::ErrorKind::UnexpectedEof {
+        Class::EarlyEnd
+    } else {
+        Class::BadInput
+    }
+}
+
 /// The differential rule: decode `src` into `cap` bytes and compare with the
-/// oracle's verdict. Oracle `Ok` means ours is `Ok` with the same bytes;
-/// oracle error or overflow means ours is an `Err`. Returns what the oracle
-/// said, for coverage statistics.
+/// oracle's verdict. Oracle `Ok` means ours is `Ok` with the same bytes. An
+/// oracle error or overflow means ours is an `Err` of the same class:
+/// - input that ends early is `UnexpectedEof`, with `bit` the input's length;
+/// - input libbz2 rejects is `NotBzip2`, `Corrupt`, `BlockCrc` or `StreamCrc`,
+///   or `OutputTooSmall` if the output passed `cap` first (libbz2 checks the
+///   last byte of a block against the CRC in the call that writes it);
+/// - a stream that passes `cap` is `OutputTooSmall { capacity: cap }` if
+///   libbz2 accepts it, and otherwise may be that or its own error (a corrupt
+///   stream may report its corruption first).
+///
+/// Returns what the oracle said, for coverage statistics.
 #[allow(clippy::panic, reason = "a failed property is a panic")]
 pub fn check_against_reference(decoder: Decoder, src: &[u8], cap: usize) -> &'static str {
     let want = reference(src, cap);
@@ -169,7 +220,50 @@ pub fn check_against_reference(decoder: Decoder, src: &[u8], cap: usize) -> &'st
         (Reference::Exceeds | Reference::Err(_), Ok(n)) => {
             panic!("{who}: reference gives {want:?}, we return Ok({n}) (cap {cap})")
         }
-        (Reference::Exceeds | Reference::Err(_), Err(_)) => {}
+        (Reference::Exceeds, Err(e)) => match (reference_outcome(src), class(e)) {
+            (_, Class::OutputFull) => assert_eq!(
+                *e,
+                Error::OutputTooSmall { capacity: cap },
+                "{who}: reference exceeds cap {cap}"
+            ),
+            (Err(kind), c) => {
+                assert_eq!(
+                    io_class(kind),
+                    c,
+                    "{who}: reference exceeds cap, we say {e:?}"
+                )
+            }
+            (Ok(()), _) => {
+                panic!("{who}: reference accepts a stream longer than cap {cap}, we say {e:?}")
+            }
+        },
+        (Reference::Err(kind), Err(e)) => {
+            let c = class(e);
+            if c == Class::OutputFull {
+                assert!(
+                    reference_outcome(src).is_err(),
+                    "{who}: reference accepts the stream, we say {e:?}"
+                );
+            } else {
+                assert_eq!(
+                    io_class(*kind),
+                    c,
+                    "{who}: reference gives {kind:?}, we say {e:?}"
+                );
+            }
+            match e {
+                Error::UnexpectedEof { at } => assert_eq!(
+                    at.bit,
+                    src.len() as u64 * 8,
+                    "{who}: an early end is at the end of the input"
+                ),
+                Error::Corrupt { at, .. } => assert!(
+                    at.bit <= src.len() as u64 * 8,
+                    "{who}: position {at} is past the input"
+                ),
+                _ => {}
+            }
+        }
     }
     match want {
         Reference::Ok(_) => "reference ok",
