@@ -18,16 +18,24 @@ pub(crate) fn update(crc: u32, data: &[u8]) -> u32 {
     BEST.get_or_init(|| paths().last().map_or(slice16 as Kernel, |p| p.1))(crc, data)
 }
 
-/// Every kernel this CPU can run, slowest first, each as a safe function.
+/// Every kernel this CPU can run, slowest first. The accelerated ones are
+/// unsafe to call on a CPU without their features, so each safe closure here
+/// is built only inside the branch that detected them.
 #[allow(dead_code, reason = "also used by tests and examples/crc_speed.rs")]
 pub(crate) fn paths() -> Vec<(&'static str, Kernel)> {
     let mut v: Vec<(&'static str, Kernel)> = vec![("bytewise", bytewise), ("slice16", slice16)];
     #[cfg(target_arch = "aarch64")]
     {
         if std::arch::is_aarch64_feature_detected!("crc") {
-            v.push(("armv8-crc", arm::crc_checked));
+            v.push(("armv8-crc", |c, d| {
+                // SAFETY: this closure exists only where `crc` was detected.
+                unsafe { arm::crc_checked(c, d) }
+            }));
             if std::arch::is_aarch64_feature_detected!("aes") {
-                v.push(("pmull", arm::pmull_checked));
+                v.push(("pmull", |c, d| {
+                    // SAFETY: this closure exists only where `crc` and `aes` were detected.
+                    unsafe { arm::pmull_checked(c, d) }
+                }));
             }
         }
     }
@@ -36,7 +44,10 @@ pub(crate) fn paths() -> Vec<(&'static str, Kernel)> {
         if std::arch::is_x86_feature_detected!("pclmulqdq")
             && std::arch::is_x86_feature_detected!("sse4.1")
         {
-            v.push(("pclmul", x86::pclmul_checked));
+            v.push(("pclmul", |c, d| {
+                // SAFETY: this closure exists only where pclmulqdq and sse4.1 were detected.
+                unsafe { x86::pclmul_checked(c, d) }
+            }));
         }
     }
     v
@@ -126,16 +137,19 @@ mod arm {
     use super::k::*;
     use core::arch::aarch64::*;
 
-    // The wrappers are listed by `paths()` only after
-    // `is_aarch64_feature_detected!` confirmed the features their kernels
-    // enable, and they are private to this module.
-    pub(super) fn crc_checked(crc: u32, data: &[u8]) -> u32 {
-        // SAFETY: `paths()` lists this wrapper only when `crc` is detected.
+    /// # Safety
+    ///
+    /// The CPU must support the `crc` feature.
+    pub(super) unsafe fn crc_checked(crc: u32, data: &[u8]) -> u32 {
+        // SAFETY: the caller guarantees `crc`.
         unsafe { crc_kernel(crc, data) }
     }
 
-    pub(super) fn pmull_checked(crc: u32, data: &[u8]) -> u32 {
-        // SAFETY: `paths()` lists this wrapper only when `aes` (PMULL) and `crc` are detected.
+    /// # Safety
+    ///
+    /// The CPU must support the `crc` and `aes` (PMULL) features.
+    pub(super) unsafe fn pmull_checked(crc: u32, data: &[u8]) -> u32 {
+        // SAFETY: the caller guarantees `crc` and `aes`; NEON is baseline.
         unsafe { pmull_kernel(crc, data) }
     }
 
@@ -255,11 +269,11 @@ mod x86 {
     use super::slice16;
     use core::arch::x86_64::*;
 
-    // The wrappers are listed by `paths()` only after
-    // `is_x86_feature_detected!` confirmed the features their kernels enable,
-    // and they are private to this module.
-    pub(super) fn pclmul_checked(crc: u32, data: &[u8]) -> u32 {
-        // SAFETY: `paths()` lists this wrapper only when pclmulqdq and sse4.1 are detected.
+    /// # Safety
+    ///
+    /// The CPU must support `pclmulqdq` and `sse4.1`.
+    pub(super) unsafe fn pclmul_checked(crc: u32, data: &[u8]) -> u32 {
+        // SAFETY: the caller guarantees `pclmulqdq` and `sse4.1`.
         unsafe { pclmul_kernel(crc, data) }
     }
 

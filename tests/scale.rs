@@ -5,8 +5,8 @@ mod common;
 
 use std::sync::OnceLock;
 
-use bz2ngrs::Error;
 use common::inputs::mixed;
+use common::oracle::Kind;
 use common::oracle::{all_decoders, check_exact, compress, compress_pieces, count_blocks};
 
 /// About 30 MB in 1 MB regions of different statistics: noise, small
@@ -49,8 +49,8 @@ fn fifty_megabytes_of_zeros_into_an_out_one_byte_short() {
     for d in all_decoders() {
         let mut out = vec![0xA5; ZEROS - 1];
         assert_eq!(
-            d.run(stream, &mut out),
-            Err(Error::OutputTooSmall),
+            d.run_kind(stream, &mut out),
+            Err(Kind::OutputTooSmall),
             "{}",
             d.name()
         );

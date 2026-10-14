@@ -27,11 +27,37 @@ impl Decoder {
         }
     }
 
+    /// [`Decoder::run`] with the error reduced to its [`Kind`].
+    pub fn run_kind(self, src: &[u8], out: &mut [u8]) -> Result<usize, Kind> {
+        self.run(src, out).map_err(|e| kind(&e))
+    }
+
     pub fn name(self) -> String {
         match self {
             Decoder::Default => "decompress".into(),
             Decoder::At(level) => format!("__decompress_at({level:?})"),
         }
+    }
+}
+
+/// The kinds of error the tests tell apart. Every comparison goes through
+/// [`Decoder::run_kind`], so a change to the shape of `Error` is made here.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Kind {
+    Corrupt,
+    CrcMismatch,
+    UnexpectedEof,
+    OutputTooSmall,
+    Other,
+}
+
+pub fn kind(e: &Error) -> Kind {
+    match e {
+        Error::Corrupt => Kind::Corrupt,
+        Error::CrcMismatch => Kind::CrcMismatch,
+        Error::UnexpectedEof => Kind::UnexpectedEof,
+        Error::OutputTooSmall => Kind::OutputTooSmall,
+        _ => Kind::Other,
     }
 }
 
@@ -123,6 +149,10 @@ pub fn check_against_reference(decoder: Decoder, src: &[u8], cap: usize) -> &'st
             assert!(
                 out[..*n] == bytes[..],
                 "{who}: bytes differ from the reference"
+            );
+            assert!(
+                out[*n..].iter().all(|&b| b == 0xA5),
+                "{who}: wrote past the returned length"
             );
         }
         (Reference::Ok(bytes), Err(e)) => {
