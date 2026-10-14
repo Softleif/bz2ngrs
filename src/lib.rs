@@ -10,6 +10,11 @@
     reason = "values bounded by the format"
 )]
 mod bits;
+#[allow(
+    clippy::cast_possible_truncation,
+    reason = "values bounded by the format"
+)]
+mod bwt;
 mod crc;
 #[allow(
     clippy::cast_possible_truncation,
