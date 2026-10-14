@@ -1,4 +1,4 @@
-//! Decode throughput against the `bzip2` crate, as in notes/05-baseline-bench.md.
+//! Decode throughput against the `bzip2` crate.
 //!
 //! `cargo run --release --example decode_bench -- [ROUNDS] FILE...`: each file
 //! is cut into 64 KiB and 1 MiB chunks, each compressed at level 9 as its own

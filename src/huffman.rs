@@ -10,7 +10,7 @@ use fearless_simd::{Simd, SimdBase, u16x8};
 
 /// Primary table width in bits. bz2-ng's 11 fills twice the entries per
 /// table, a fixed cost per block that small blocks feel more than the rarer
-/// fallback to `decode_long` for 11-bit codes (notes/06-perf-log.md).
+/// fallback to `decode_long` for 11-bit codes.
 const K: u32 = 10;
 /// Longest code bzip2 allows.
 pub(crate) const MAX_CODE: u32 = 20;

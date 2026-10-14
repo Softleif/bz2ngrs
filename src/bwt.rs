@@ -27,7 +27,7 @@ const CHUNKS: usize = 1024;
 /// others finish theirs with less overlap, so shorter segments shorten that
 /// tail; bz2-ng's 2048 left a third of the walk there at 64 Ki rows. Above
 /// `SEGS * 512` rows the cap below lengthens them again, which is what the
-/// larger blocks prefer (notes/06-perf-log.md).
+/// larger blocks prefer.
 const SEG_ROWS: u32 = 512;
 /// Segments, at most this many minus one (with `orig_ptr`) are used.
 const SEGS: usize = 512;
@@ -140,7 +140,7 @@ fn build_t(tt: &mut [u32; ROWS], ll: &[u8; BYTES], n: u32) {
 ///
 /// The lane counts differ from bz2-ng's (24 from 64 Ki rows, 8 from 16 Ki):
 /// measured on the M4 Pro, 24 lanes pay off from 4 Ki rows and 8 from 1 Ki
-/// (notes/06-perf-log.md), given at least three segments per lane.
+/// given at least three segments per lane.
 fn mark_splitters(b: &mut Bwt, n: u32, op: u32) -> u32 {
     let (lanes, min_segs) = match n {
         4096.. => (24, 72),

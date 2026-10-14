@@ -1,6 +1,6 @@
 # Agent guide
 
-bz2ngrs is a one-shot bzip2 decoder, ported from the C decoder of bz2-ng. Its only consumer is seqair's CRAM reader. `notes/` holds the design notes and measurements.
+bz2ngrs is a one-shot bzip2 decoder, ported from the C decoder of bz2-ng. Its only consumer is seqair's CRAM reader.
 
 ## Rules
 
@@ -19,7 +19,7 @@ bz2ngrs is a one-shot bzip2 decoder, ported from the C decoder of bz2-ng. Its on
   - `core::arch` is allowed only where fearless_simd lacks the operation (the CRC's carry-less multiply). It must be feature-detected and tested against the portable path.
 - **`unsafe`.** Only with a measured win, and every block needs a `// SAFETY:` comment.
 - **Speed.**
-  - Every optimisation carries before and after numbers from `bench/`, compared against bz2-ng C in the same run, and logged in `notes/06-perf-log.md`.
+  - Every optimisation carries before and after numbers from `bench/`, compared against bz2-ng C in the same run, in its commit message.
   - Revert what doesn't help.
 - **Sources.**
   - bz2-ng (MIT) and libbz2 or libbz2-rs-sys (BSD-style) may be read and ported.
