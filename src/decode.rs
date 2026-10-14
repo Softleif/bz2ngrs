@@ -41,9 +41,9 @@ impl Scratch {
 }
 
 /// The error for a failure at the reader's current position: a stream that
-/// has run out of input is truncated rather than corrupt.
-#[inline(never)]
-#[cold]
+/// has run out of input is truncated rather than corrupt. Inlined, so the
+/// reader's address does not escape.
+#[inline(always)]
 fn fail(br: &Bits) -> Error {
     if br.overrun() {
         Error::UnexpectedEof
@@ -102,7 +102,7 @@ pub(crate) fn decode_stream<S: Simd>(
         if orig_ptr > 10 + nmax {
             return Err(fail(&br));
         }
-        let (eob, n_selectors) = block_tables(&mut br, sc)?;
+        let (eob, n_selectors) = block_tables(simd, &mut br, sc)?;
         let n = symbols(simd, &mut br, sc, eob, n_selectors, nmax)?;
         if orig_ptr >= n {
             return Err(Error::Corrupt);
@@ -113,7 +113,7 @@ pub(crate) fn decode_stream<S: Simd>(
         if randomised {
             unrle::derandomise(text);
         }
-        let o2 = unrle::unrle(text, out, o)?;
+        let o2 = unrle::unrle(simd, text, out, o)?;
         let crc = !crate::crc::update(!0, out.get(o..o2).unwrap_or_default());
         if crc != stored_crc {
             return Err(Error::CrcMismatch);
@@ -127,7 +127,7 @@ pub(crate) fn decode_stream<S: Simd>(
 /// Huffman tables and the MTF list. Returns the EOB symbol and the number of
 /// selectors kept.
 #[inline(always)]
-fn block_tables(br: &mut Bits, sc: &mut Scratch) -> Result<(u32, usize), Error> {
+fn block_tables<S: Simd>(simd: S, br: &mut Bits, sc: &mut Scratch) -> Result<(u32, usize), Error> {
     let in_use16 = br.get(16);
     let mut n_in_use = 0usize;
     for i in 0..16 {
@@ -200,7 +200,7 @@ fn block_tables(br: &mut Bits, sc: &mut Scratch) -> Result<(u32, usize), Error> 
         }
     }
     for t in 0..n_groups {
-        sc.tables[t % 8].build(&sc.lens[t % 6][..alpha_size.min(MAX_ALPHA)]);
+        sc.tables[t % 8].build(simd, &sc.lens[t % 6][..alpha_size.min(MAX_ALPHA)]);
     }
     Ok((n_in_use as u32 + 1, n_selectors))
 }

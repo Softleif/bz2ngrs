@@ -1,6 +1,8 @@
 //! un-RLE1 (the first run-length stage) from the block's text into the
 //! caller's buffer, and libbz2's block randomisation.
 
+use fearless_simd::{Simd, SimdBase, u8x16};
+
 use crate::Error;
 
 /// Text bytes that must remain for a bulk step. A step consumes at most 12
@@ -16,18 +18,24 @@ fn zero_bytes(x: u64) -> u64 {
     !(((x & L) + L) | x | L)
 }
 
+/// Bytes `i..i + 8` of `w` (constant `i`, so no bounds check survives).
 #[inline(always)]
-fn load8(text: &[u8], j: usize) -> u64 {
-    match text.get(j..).and_then(|s| s.first_chunk::<8>()) {
-        Some(b) => u64::from_le_bytes(*b),
-        None => 0,
-    }
+fn le8(w: &[u8; 16], i: usize) -> u64 {
+    let mut b = [0u8; 8];
+    b.copy_from_slice(&w[i..i + 8]);
+    u64::from_le_bytes(b)
 }
 
 /// Decodes `text` (one block's text) into `out[o..]` and returns the new
 /// output position. Four equal bytes are followed by a count byte (0..=255)
 /// of further copies.
-pub(crate) fn unrle(text: &[u8], out: &mut [u8], mut o: usize) -> Result<usize, Error> {
+#[inline(always)]
+pub(crate) fn unrle<S: Simd>(
+    simd: S,
+    text: &[u8],
+    out: &mut [u8],
+    mut o: usize,
+) -> Result<usize, Error> {
     let n = text.len();
     let mut j = 0;
     // Start of the current stretch of literals (just after the last run).
@@ -36,10 +44,11 @@ pub(crate) fn unrle(text: &[u8], out: &mut [u8], mut o: usize) -> Result<usize, 
     // text[j+k..j+k+4] are equal; the first one after a clean state is a true
     // run start (an earlier equal byte would have set an earlier candidate).
     while j + MARGIN <= n && o + 8 <= out.len() {
-        let a = load8(text, j);
-        let m = zero_bytes(a ^ load8(text, j + 1))
-            & zero_bytes(a ^ load8(text, j + 2))
-            & zero_bytes(a ^ load8(text, j + 3));
+        let Some(w) = text.get(j..j + 16).and_then(|s| s.first_chunk::<16>()) else {
+            break;
+        };
+        let a = le8(w, 0);
+        let m = zero_bytes(a ^ le8(w, 1)) & zero_bytes(a ^ le8(w, 2)) & zero_bytes(a ^ le8(w, 3));
         if let Some(d) = out.get_mut(o..o + 8) {
             d.copy_from_slice(&a.to_le_bytes());
         }
@@ -48,14 +57,13 @@ pub(crate) fn unrle(text: &[u8], out: &mut [u8], mut o: usize) -> Result<usize, 
             o += 8;
             continue;
         }
-        let k = (m.trailing_zeros() / 8) as usize;
-        j += k;
+        let k = (m.trailing_zeros() / 8) as usize & 7;
+        let ch = w[k];
+        let total = 4 + usize::from(w[k + 4]);
+        j += k + 5;
         o += k;
-        let ch = text.get(j).copied().unwrap_or(0);
-        let total = 4 + usize::from(text.get(j + 4).copied().unwrap_or(0));
-        j += 5;
         lit = j;
-        fill(out, o, ch, total)?;
+        fill(simd, out, o, ch, total)?;
         o += total;
     }
 
@@ -97,11 +105,12 @@ pub(crate) fn unrle(text: &[u8], out: &mut [u8], mut o: usize) -> Result<usize, 
 /// Writes `total` copies of `ch` at `out[o..]`, in 16-byte stores when there
 /// is room for the overshoot.
 #[inline(always)]
-fn fill(out: &mut [u8], o: usize, ch: u8, total: usize) -> Result<(), Error> {
+fn fill<S: Simd>(simd: S, out: &mut [u8], o: usize, ch: u8, total: usize) -> Result<(), Error> {
     let wide = total.next_multiple_of(16);
+    let v = u8x16::splat(simd, ch);
     if let Some(d) = out.get_mut(o..o + wide) {
         for c in d.as_chunks_mut::<16>().0 {
-            c.copy_from_slice(&[ch; 16]);
+            v.store_slice(c);
         }
         Ok(())
     } else {
