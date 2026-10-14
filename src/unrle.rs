@@ -245,3 +245,117 @@ static RAND_NUMS: [u16; 512] = [
     210, 389, 550, 919, 135, 780, 773, 635, 389, 707, 100, 626, 958, 165, 504, 920, 176, 193, 713,
     857, 265, 203, 50, 668, 108, 645, 990, 626, 197, 510, 357, 358, 850, 858, 364, 936, 638,
 ];
+
+#[cfg(test)]
+#[allow(clippy::panic, reason = "a failed property is a panic")]
+mod tests {
+    use hegel::TestCase;
+    use hegel::generators as gs;
+
+    use super::{Corruption, Fail, unrle};
+
+    /// libbz2's un-RLE1 of one block's text, one byte at a time: the bytes it
+    /// gives and whether the text ends cleanly (four equal bytes at its very
+    /// end have no count byte; libbz2 has written them by then).
+    fn naive(text: &[u8]) -> (Vec<u8>, bool) {
+        let mut out = Vec::new();
+        let (mut run, mut last) = (0, None);
+        let mut i = 0;
+        while i < text.len() {
+            let b = text[i];
+            i += 1;
+            out.push(b);
+            run = if last == Some(b) { run + 1 } else { 1 };
+            last = Some(b);
+            if run == 4 {
+                let Some(&count) = text.get(i) else {
+                    return (out, false);
+                };
+                out.resize(out.len() + usize::from(count), b);
+                i += 1;
+                (run, last) = (0, None);
+            }
+        }
+        (out, true)
+    }
+
+    /// A block's text: stretches of a few distinct bytes, complete runs of
+    /// four with a count byte, short runs, noise, and four equal bytes that
+    /// may or may not get a count byte before the text ends.
+    #[hegel::composite]
+    fn texts(tc: &TestCase) -> Vec<u8> {
+        let mut t = Vec::new();
+        for _ in 0..tc.draw(gs::integers::<usize>().max_value(60)) {
+            match tc.draw(gs::integers::<u8>().max_value(4)) {
+                0 => {
+                    let alpha = tc.draw(gs::integers::<u8>().min_value(1).max_value(4));
+                    let picks = tc.draw(gs::binary().max_size(200));
+                    t.extend(picks.iter().map(|b| b % alpha));
+                }
+                1 => {
+                    let b = tc.draw(gs::integers::<u8>());
+                    t.extend([b; 4]);
+                    t.push(tc.draw(gs::integers::<u8>()));
+                }
+                2 => {
+                    let b = tc.draw(gs::integers::<u8>());
+                    let n = tc.draw(gs::integers::<usize>().max_value(3));
+                    t.extend(std::iter::repeat_n(b, n));
+                }
+                3 => t.extend(tc.draw(gs::binary().max_size(64))),
+                _ => {
+                    let b = tc.draw(gs::integers::<u8>());
+                    let n = 4 + tc.draw(gs::integers::<usize>().max_value(3));
+                    t.extend(std::iter::repeat_n(b, n));
+                }
+            }
+        }
+        t
+    }
+
+    /// At every level, into a buffer that starts at any offset and is exactly
+    /// big enough, roomier, or too small: `unrle` writes what libbz2's
+    /// un-RLE1 does, and nothing outside `out[o..o + len]` on success; the run
+    /// count error is reported when the bytes fit, and a full buffer when
+    /// they do not.
+    #[hegel::test]
+    fn unrle_matches_the_byte_by_byte_decoder(tc: TestCase) {
+        let text = tc.draw(texts());
+        let (want, clean) = naive(&text);
+        let o = tc.draw(gs::integers::<usize>().max_value(300));
+        let upto = |tc: &TestCase, n: usize| tc.draw(gs::integers::<usize>().max_value(n));
+        let room = match tc.draw(gs::integers::<u8>().max_value(3)) {
+            0 => want.len(),
+            1 => want.len() + upto(&tc, 600),
+            2 => want.len().saturating_sub(1 + upto(&tc, 40)),
+            _ => upto(&tc, want.len()),
+        };
+        for level in crate::tests::levels() {
+            let mut out = vec![0xA5; o + room];
+            out[..o].fill(0x5A);
+            let got = fearless_simd::dispatch!(level, simd => unrle(simd, &text, &mut out, o));
+            let fits = room >= want.len();
+            match got {
+                Ok(end) if clean && fits => {
+                    assert_eq!(end, o + want.len(), "{level:?}: length");
+                    assert!(out[o..end] == want[..], "{level:?}: bytes");
+                    assert!(
+                        out[..o].iter().all(|&b| b == 0x5A),
+                        "{level:?}: wrote before o"
+                    );
+                    assert!(
+                        out[end..].iter().all(|&b| b == 0xA5),
+                        "{level:?}: wrote past the end"
+                    );
+                }
+                Err(Fail::Corrupt(Corruption::RunCount)) if !clean && fits => {}
+                Err(Fail::OutputFull) if !fits => {}
+                Ok(end) => panic!("{level:?}: Ok({end}) for clean {clean}, fits {fits}"),
+                Err(Fail::Corrupt(k)) => {
+                    panic!("{level:?}: Corrupt({k:?}) for clean {clean}, fits {fits}")
+                }
+                Err(_) => panic!("{level:?}: failed for clean {clean}, fits {fits}"),
+            }
+        }
+    }
+}

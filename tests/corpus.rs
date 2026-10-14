@@ -4,7 +4,8 @@
 //!
 //! The corpus is found as `$BZ2NGRS_CORPUS`, or `corpus/cram-bzip2` in the
 //! crate directory or any directory above it (so a git worktree finds the
-//! main checkout's). Without it the test says so and passes.
+//! main checkout's). Without it the test says so and passes, unless
+//! `BZ2NGRS_CORPUS_REQUIRED` is set (for a CI that has the corpus).
 //!
 //! `manifest.tsv` has a header row and tab-separated columns; used here are
 //! `path` (relative to the corpus directory) and `uncompressed_len`.
@@ -49,6 +50,10 @@ fn manifest(dir: &Path) -> Vec<(PathBuf, usize)> {
 #[test]
 fn real_cram_blocks_decode_like_the_reference() {
     let Some(dir) = corpus_dir() else {
+        assert!(
+            std::env::var_os("BZ2NGRS_CORPUS_REQUIRED").is_none_or(|v| v.is_empty()),
+            "BZ2NGRS_CORPUS_REQUIRED is set but corpus/cram-bzip2 was not found"
+        );
         eprintln!("note: corpus/cram-bzip2 not found, nothing to check (set BZ2NGRS_CORPUS)");
         return;
     };
