@@ -1,0 +1,6 @@
+# libFuzzer dictionary: pass with -dict=fuzz/bzip2.dict
+header1="BZh1"
+header5="BZh5"
+header9="BZh9"
+block_magic="\x31\x41\x59\x26\x53\x59"
+end_magic="\x17\x72\x45\x38\x50\x90"
