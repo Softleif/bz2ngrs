@@ -3,7 +3,8 @@
 //!
 //! A port of bz2-ng's `crc32.c` and its instruction-set kernels (MIT): slice-by-16
 //! everywhere, ARMv8 `crc32` instructions and PMULL folding on aarch64, PCLMULQDQ
-//! and VPCLMULQDQ folding on x86-64. This module is the documented exception to
+//! folding on x86-64 (bz2-ng's VPCLMULQDQ kernel is left out: no machine here
+//! can run it, and bz2-ng measures its SSE4 tier within 1–3% of AVX2). This module is the documented exception to
 //! "SIMD only via fearless_simd", which has no carry-less multiply. The kernel is
 //! picked once at run time and cached.
 
@@ -36,11 +37,6 @@ pub(crate) fn paths() -> Vec<(&'static str, Kernel)> {
             && std::arch::is_x86_feature_detected!("sse4.1")
         {
             v.push(("pclmul", x86::pclmul_checked));
-            if std::arch::is_x86_feature_detected!("vpclmulqdq")
-                && std::arch::is_x86_feature_detected!("avx2")
-            {
-                v.push(("vpclmul", x86::vpclmul_checked));
-            }
         }
     }
     v
@@ -111,7 +107,9 @@ static TABLE: [[u32; 256]; 16] = {
 // A * x^D = A_hi * (x^(D+64) mod P) + A_lo * (x^D mod P).
 #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
 mod k {
+    #[cfg(target_arch = "aarch64")]
     pub(super) const K_1088: u64 = 0x10bd_4d7c;
+    #[cfg(target_arch = "aarch64")]
     pub(super) const K_1024: u64 = 0x567f_ddeb;
     pub(super) const K_576: u64 = 0x8833_794c;
     pub(super) const K_512: u64 = 0xe622_8b11;
@@ -265,12 +263,6 @@ mod x86 {
         unsafe { pclmul_kernel(crc, data) }
     }
 
-    pub(super) fn vpclmul_checked(crc: u32, data: &[u8]) -> u32 {
-        // SAFETY: `paths()` lists this wrapper only when vpclmulqdq, avx2, pclmulqdq and
-        // sse4.1 are detected.
-        unsafe { vpclmul_kernel(crc, data) }
-    }
-
     #[inline]
     #[target_feature(enable = "sse2")]
     fn kc(hi: u64, lo: u64) -> __m128i {
@@ -335,70 +327,6 @@ mod x86 {
         }
         let mut r = _mm_xor_si128(fold(a[0], kc(K_448, K_384)), fold(a[1], kc(K_320, K_256)));
         r = _mm_xor_si128(r, _mm_xor_si128(fold(a[2], k128), a[3]));
-        let (words, tail) = tail.as_chunks::<16>();
-        for w in words {
-            r = _mm_xor_si128(fold(r, k128), load_rev(w));
-        }
-        finish(r, tail)
-    }
-
-    #[inline]
-    #[target_feature(enable = "avx2")]
-    fn load_rev256(b: &[u8; 32], rev: __m256i) -> __m256i {
-        // SAFETY: `b` is 32 readable bytes and `loadu` has no alignment need.
-        _mm256_shuffle_epi8(unsafe { _mm256_loadu_si256(b.as_ptr().cast()) }, rev)
-    }
-
-    #[inline]
-    #[target_feature(enable = "vpclmulqdq,avx2")]
-    fn fold256(a: __m256i, k: __m256i) -> __m256i {
-        _mm256_xor_si256(
-            _mm256_clmulepi64_epi128::<0x11>(a, k),
-            _mm256_clmulepi64_epi128::<0x00>(a, k),
-        )
-    }
-
-    /// Four 256-bit accumulators folded by 1024 bits per step.
-    #[target_feature(enable = "vpclmulqdq,avx2,pclmulqdq,sse4.1")]
-    fn vpclmul_kernel(crc: u32, data: &[u8]) -> u32 {
-        if data.len() < 256 {
-            return pclmul_kernel(crc, data);
-        }
-        let rev = _mm256_set_epi8(
-            0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10,
-            11, 12, 13, 14, 15,
-        );
-        let k1024 = _mm256_set_epi64x(
-            K_1088.cast_signed(),
-            K_1024.cast_signed(),
-            K_1088.cast_signed(),
-            K_1024.cast_signed(),
-        );
-        let (blocks, tail) = data.as_chunks::<128>();
-        let ld = |b: &[u8; 128]| -> [__m256i; 4] {
-            let (s, _) = b.as_chunks::<32>();
-            core::array::from_fn(|i| load_rev256(&s[i], rev))
-        };
-        let mut a = ld(&blocks[0]);
-        // The register goes into the top 32 bits of the first block (low lane).
-        a[0] = _mm256_xor_si256(
-            a[0],
-            _mm256_set_epi32(0, 0, 0, 0, crc.cast_signed(), 0, 0, 0),
-        );
-        for b in &blocks[1..] {
-            let d = ld(b);
-            for i in 0..4 {
-                a[i] = _mm256_xor_si256(fold256(a[i], k1024), d[i]);
-            }
-        }
-        // Eight 128-bit blocks in stream order: a0.lo a0.hi a1.lo ... a3.hi.
-        let k128 = kc(K_192, K_128);
-        let mut r = _mm256_castsi256_si128(a[0]);
-        r = _mm_xor_si128(fold(r, k128), _mm256_extracti128_si256::<1>(a[0]));
-        for x in &a[1..] {
-            r = _mm_xor_si128(fold(r, k128), _mm256_castsi256_si128(*x));
-            r = _mm_xor_si128(fold(r, k128), _mm256_extracti128_si256::<1>(*x));
-        }
         let (words, tail) = tail.as_chunks::<16>();
         for w in words {
             r = _mm_xor_si128(fold(r, k128), load_rev(w));
