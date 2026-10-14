@@ -1,0 +1,49 @@
+[package]
+name = "bz2ngrs-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[lib]
+name = "bz2ngrs_fuzz"
+path = "src/lib.rs"
+
+[dependencies]
+libfuzzer-sys = "0.4"
+arbitrary = { version = "1", features = ["derive"] }
+bz2ngrs = { path = ".." }
+bzip2 = "0.6.1"
+# Lets the targets run `Level::fallback()` on SIMD targets too.
+fearless_simd = { version = "1.1", features = ["force_support_fallback"] }
+
+# Keep this out of the parent workspace.
+[workspace]
+members = ["."]
+
+[profile.release]
+debug = 1
+
+[[example]]
+name = "gen_seeds"
+path = "examples/gen_seeds.rs"
+
+[[bin]]
+name = "decompress_differential"
+path = "fuzz_targets/decompress_differential.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "roundtrip"
+path = "fuzz_targets/roundtrip.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "decompress_mutated"
+path = "fuzz_targets/decompress_mutated.rs"
+test = false
+doc = false
