@@ -11,6 +11,12 @@
 )]
 mod bits;
 mod crc;
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_possible_wrap,
+    reason = "values bounded by the format"
+)]
+mod huffman;
 
 use core::fmt;
 
