@@ -1,5 +1,18 @@
 # bz2-ng → Rust: summary and plan
 
+## Outcome (2026-10-14)
+
+Done: a decode-only `bz2ngrs::Decoder` (`decompress`, `decompress_to_vec`), in use on seqair's `bz2ngrs` branch through a reader-owned `CodecScratch`.
+
+- **Speed (M4 Pro).** 1.08 to 1.27 times bz2-ng C, and 2.9 to 5.0 times the `bzip2` crate, on the 1000 Genomes MC/XA/QUAL data at 16k to 1m (README). On real CRAM blocks: 1.07 to 1.19 times C. Reading the re-encoded Ultima CRAMs through seqair is 2.1 to 3.3 times faster than seqair `main`.
+- **Safety.** The only `unsafe` is three CRC kernel dispatch blocks. Hegel suite and fuzzing are in notes 07, 08 and 10.
+- **Not done.**
+  - x86 speed has not been measured.
+  - CI has not run, since there is no remote yet.
+  - The encoder is out of scope.
+
+The plan below is the original one, kept for context.
+
 Written 2026-10-14. Source: `/Users/pascal/code/tfenne/bz2-ng` (C, read-only). Consumer: `/Users/pascal/Code/bsblabludwig/seqair`. Detail is in the other notes:
 
 - `01-seqair-usage.md`: what seqair needs from bzip2.
