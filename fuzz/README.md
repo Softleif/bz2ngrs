@@ -8,7 +8,7 @@ The oracle is the `bzip2` crate (libbz2 1.0.8 via `libbz2-rs-sys`). The differen
 of the hegel properties (`tests/common/oracle.rs` is shared with the fuzz crate): for an output
 capacity `cap`, if the oracle decodes the first stream within `cap` bytes then we return `Ok` with
 the same bytes; if it errors or would exceed `cap` we return an `Err`. Every target runs
-`decompress` and `__decompress_at` at every SIMD level, `Level::fallback()` included.
+a long-lived `Decoder` (one per process and SIMD level, so state left by earlier inputs reaches later ones) at every level, `Level::fallback()` included. `decompress_differential` also compares each result with that of a decoder made for the input.
 
 | Target | Input | Checks |
 | --- | --- | --- |
