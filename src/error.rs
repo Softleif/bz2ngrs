@@ -14,20 +14,21 @@ use core::fmt;
 ///
 /// ```
 /// use std::io::Write;
-/// use bz2ngrs::{Error, decompress};
+/// use bz2ngrs::{Decoder, Error};
 ///
 /// let mut enc = bzip2::write::BzEncoder::new(Vec::new(), bzip2::Compression::best());
 /// enc.write_all(b"hello hello hello hello").unwrap();
 /// let stream = enc.finish().unwrap();
 ///
+/// let mut decoder = Decoder::new();
 /// let mut small = [0u8; 4];
-/// match decompress(&stream, &mut small) {
+/// match decoder.decompress(&stream, &mut small) {
 ///     Err(Error::OutputTooSmall { capacity }) => assert_eq!(capacity, 4),
 ///     other => panic!("expected OutputTooSmall, got {other:?}"),
 /// }
 ///
 /// let mut out = [0u8; 64];
-/// match decompress(b"this is not bzip2", &mut out) {
+/// match decoder.decompress(b"this is not bzip2", &mut out) {
 ///     Err(Error::OutputTooSmall { .. }) => unreachable!(),
 ///     Err(bad_input) => println!("bad input: {bad_input}"),
 ///     Ok(n) => println!("{n} bytes"),

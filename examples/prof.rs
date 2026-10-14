@@ -34,6 +34,7 @@ fn main() {
             })
             .collect()
     };
+    let mut decoder = bz2ngrs::Decoder::new();
     let mut out = vec![0u8; 64 << 20];
     // The best pass over the data: on a shared machine, slower passes are
     // other load or a stint on an efficiency core, not the decoder.
@@ -43,7 +44,7 @@ fn main() {
         let p = Instant::now();
         let mut bytes = 0usize;
         for c in &comps {
-            bytes += bz2ngrs::decompress(c, &mut out).expect("decode");
+            bytes += decoder.decompress(c, &mut out).expect("decode");
         }
         best = best.max(bytes as f64 / p.elapsed().as_secs_f64() / 1e6);
     }

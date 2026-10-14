@@ -3,6 +3,7 @@
 //! with `#[path]`.
 #![allow(dead_code)]
 
+use std::cell::RefCell;
 use std::io::{self, Read, Write};
 
 use bz2ngrs::Error;
@@ -11,20 +12,52 @@ use bzip2::read::BzDecoder;
 use bzip2::write::BzEncoder;
 use fearless_simd::Level;
 
-/// One way of calling the decoder: the public entry point, or the hidden one
-/// with a fixed SIMD level.
+/// One way of making a `bz2ngrs::Decoder`: `Decoder::new()`, or a fixed SIMD
+/// level. Each thread keeps one long-lived decoder per variant for
+/// [`Decoder::run`], so every call after the first is a reuse, as in a reader.
 #[derive(Clone, Copy)]
 pub enum Decoder {
-    Default,
+    New,
     At(Level),
 }
 
+thread_local! {
+    static REUSED: RefCell<Vec<(String, bz2ngrs::Decoder)>> = const { RefCell::new(Vec::new()) };
+}
+
 impl Decoder {
-    pub fn run(self, src: &[u8], out: &mut [u8]) -> Result<usize, Error> {
+    fn make(self) -> bz2ngrs::Decoder {
         match self {
-            Decoder::Default => bz2ngrs::decompress(src, out),
-            Decoder::At(level) => bz2ngrs::__decompress_at(level, src, out),
+            Decoder::New => bz2ngrs::Decoder::new(),
+            Decoder::At(level) => bz2ngrs::Decoder::__with_level(level),
         }
+    }
+
+    fn with_reused<T>(self, f: impl FnOnce(&mut bz2ngrs::Decoder) -> T) -> T {
+        let key = self.name();
+        REUSED.with(|cell| {
+            let mut all = cell.borrow_mut();
+            let i = all.iter().position(|(k, _)| *k == key).unwrap_or_else(|| {
+                all.push((key, self.make()));
+                all.len() - 1
+            });
+            f(&mut all[i].1)
+        })
+    }
+
+    /// Decodes with this thread's long-lived decoder.
+    pub fn run(self, src: &[u8], out: &mut [u8]) -> Result<usize, Error> {
+        self.with_reused(|d| d.decompress(src, out))
+    }
+
+    /// Decodes with a decoder made for this one call.
+    pub fn run_fresh(self, src: &[u8], out: &mut [u8]) -> Result<usize, Error> {
+        self.make().decompress(src, out)
+    }
+
+    /// `Decoder::decompress_to_vec`, on the long-lived decoder.
+    pub fn run_to_vec(self, src: &[u8], size: usize) -> Result<Vec<u8>, Error> {
+        self.with_reused(|d| d.decompress_to_vec(src, size))
     }
 
     /// [`Decoder::run`] with the error reduced to its [`Kind`].
@@ -34,8 +67,8 @@ impl Decoder {
 
     pub fn name(self) -> String {
         match self {
-            Decoder::Default => "decompress".into(),
-            Decoder::At(level) => format!("__decompress_at({level:?})"),
+            Decoder::New => "Decoder::new()".into(),
+            Decoder::At(level) => format!("Decoder::__with_level({level:?})"),
         }
     }
 }
@@ -66,14 +99,10 @@ pub fn kind(e: &Error) -> Kind {
     }
 }
 
-/// The `decompress` surface.
-pub fn default_decoder() -> Vec<Decoder> {
-    vec![Decoder::Default]
-}
-
-/// The `__decompress_at` surface: every level this CPU can run, the scalar
-/// `Fallback` included (the dev-dependency compiles it in on every target).
-pub fn level_decoders() -> Vec<Decoder> {
+/// The `Decoder` surface: `Decoder::new()` and every level this CPU can run,
+/// the scalar `Fallback` included (the dev-dependency compiles it in on every
+/// target).
+pub fn all_decoders() -> Vec<Decoder> {
     let best = Level::new();
     #[allow(unused_mut, reason = "only x86 has levels below the best one")]
     let mut levels = vec![Level::fallback(), best];
@@ -83,13 +112,8 @@ pub fn level_decoders() -> Vec<Decoder> {
         levels.extend(best.as_sse4_2().map(Level::Sse4_2));
         levels.extend(best.as_avx2().map(Level::Avx2));
     }
-    levels.into_iter().map(Decoder::At).collect()
-}
-
-/// Every way of calling the decoder.
-pub fn all_decoders() -> Vec<Decoder> {
-    let mut all = default_decoder();
-    all.extend(level_decoders());
+    let mut all = vec![Decoder::New];
+    all.extend(levels.into_iter().map(Decoder::At));
     all
 }
 
@@ -142,13 +166,41 @@ pub fn reference(src: &[u8], cap: usize) -> Reference {
 /// oracle's verdict. Oracle `Ok` means ours is `Ok` with the same bytes;
 /// oracle error or overflow means ours is an `Err`. Returns what the oracle
 /// said, for coverage statistics.
-#[allow(clippy::panic, reason = "a failed property is a panic")]
 pub fn check_against_reference(decoder: Decoder, src: &[u8], cap: usize) -> &'static str {
     let want = reference(src, cap);
     let mut out = vec![0xA5; cap];
     let got = decoder.run(src, &mut out);
-    let who = decoder.name();
-    match (&want, &got) {
+    check_outcome(&decoder.name(), &want, &got, &out, cap)
+}
+
+/// The long-lived decoder and a decoder made for this call give the same
+/// result on `src`, into `cap` bytes.
+pub fn check_fresh_agrees(decoder: Decoder, src: &[u8], cap: usize) {
+    let (mut reused, mut fresh) = (vec![0xA5; cap], vec![0xA5; cap]);
+    let a = decoder.run(src, &mut reused);
+    let b = decoder.run_fresh(src, &mut fresh);
+    assert_eq!(a, b, "{}: reused vs fresh decoder", decoder.name());
+    if let Ok(n) = a {
+        assert!(
+            reused[..n] == fresh[..n],
+            "{}: bytes differ from a fresh decoder's",
+            decoder.name()
+        );
+    }
+}
+
+/// The differential rule applied to a finished call: `got` is its result and
+/// `out` the `cap` bytes it wrote into, filled with 0xA5 beforehand so that a
+/// write past the returned length shows.
+#[allow(clippy::panic, reason = "a failed property is a panic")]
+pub fn check_outcome(
+    who: &str,
+    want: &Reference,
+    got: &Result<usize, Error>,
+    out: &[u8],
+    cap: usize,
+) -> &'static str {
+    match (want, got) {
         (Reference::Ok(bytes), Ok(n)) => {
             assert_eq!(*n, bytes.len(), "{who}: length (cap {cap})");
             assert!(

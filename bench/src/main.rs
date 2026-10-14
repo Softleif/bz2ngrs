@@ -41,8 +41,14 @@ type Dec = fn(&[u8], &mut [u8]) -> Result<usize, String>;
 const NAMES: [&str; 3] = ["ours", "bzip2", "C"];
 const DECODERS: [Dec; 3] = [dec_ours, dec_bzip2, dec_c];
 
+thread_local! {
+    // One decoder for the whole run, as a reader keeps one.
+    static OURS: std::cell::RefCell<bz2ngrs::Decoder> = std::cell::RefCell::new(bz2ngrs::Decoder::new());
+}
+
 fn dec_ours(src: &[u8], out: &mut [u8]) -> Result<usize, String> {
-    bz2ngrs::decompress(src, out).map_err(|e| e.to_string())
+    OURS.with(|d| d.borrow_mut().decompress(src, out))
+        .map_err(|e| e.to_string())
 }
 
 fn dec_bzip2(src: &[u8], out: &mut [u8]) -> Result<usize, String> {

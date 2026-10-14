@@ -39,9 +39,10 @@ fn main() {
                     e.finish().expect("compress")
                 })
                 .collect();
+            let mut decoder = bz2ngrs::Decoder::new();
             let mut out = vec![0u8; chunk];
             for (c, r) in comps.iter().zip(&raws) {
-                let n = bz2ngrs::decompress(c, &mut out).expect("decode");
+                let n = decoder.decompress(c, &mut out).expect("decode");
                 assert!(out[..n] == **r, "round trip");
             }
             let total = data.len() as f64;
@@ -50,7 +51,7 @@ fn main() {
                     .map(|_| {
                         let t = Instant::now();
                         for c in &comps {
-                            std::hint::black_box(bz2ngrs::decompress(c, &mut out).expect("decode"));
+                            std::hint::black_box(decoder.decompress(c, &mut out).expect("decode"));
                         }
                         total / t.elapsed().as_secs_f64() / 1e6
                     })
