@@ -1,0 +1,31 @@
+# cargo-deny: https://embarkstudios.github.io/cargo-deny/
+# Run locally with `cargo deny check`. CI: .github/workflows/audit.yml
+
+[graph]
+all-features = true
+
+[advisories]
+ignore = []
+
+[licenses]
+allow = [
+    "Apache-2.0",
+    "BSD-3-Clause",
+    "MIT",
+    "NCSA", # libfuzzer-sys (fuzz crate only)
+    "Unicode-3.0",
+    "bzip2-1.0.6", # libbz2-rs-sys (fuzz crate only)
+]
+confidence-threshold = 0.9
+# The fuzz and bench crates are `publish = false` and have no license field.
+private = { ignore = true }
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+# Path deps within the workspace have no version requirement.
+allow-wildcard-paths = true
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"

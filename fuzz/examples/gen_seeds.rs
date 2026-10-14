@@ -23,7 +23,9 @@ impl Rng {
     }
 
     fn bytes(&mut self, len: usize, alphabet: u64) -> Vec<u8> {
-        (0..len).map(|_| u8::try_from(self.next() % alphabet).expect("alphabet <= 256")).collect()
+        (0..len)
+            .map(|_| u8::try_from(self.next() % alphabet).expect("alphabet <= 256"))
+            .collect()
     }
 }
 
@@ -57,7 +59,10 @@ fn small_cram_blocks(dir: &Path) -> Vec<(String, Vec<u8>)> {
         };
         let small = n.trim().parse::<usize>().is_ok_and(|n| n <= 4096);
         let count = per_source.entry((*s).to_owned()).or_default();
-        if small && *count < 12 && let Ok(bytes) = fs::read(dir.join(p)) {
+        if small
+            && *count < 12
+            && let Ok(bytes) = fs::read(dir.join(p))
+        {
             *count += 1;
             out.push((format!("cram-{}", p.replace('/', "-")), bytes));
         }
@@ -76,10 +81,22 @@ fn main() {
     for level in [1, 5, 9] {
         let text = b"the quick brown fox jumps over the lazy dog ".repeat(40);
         seeds.push((format!("text-l{level}"), compress(&text, level)));
-        seeds.push((format!("noise-l{level}"), compress(&rng.bytes(1500, 256), level)));
-        seeds.push((format!("dna-l{level}"), compress(&rng.bytes(3000, 4), level)));
-        seeds.push((format!("zeros-l{level}"), compress(&vec![0; 100_000], level)));
-        seeds.push((format!("abab-l{level}"), compress(&b"ab".repeat(5000), level)));
+        seeds.push((
+            format!("noise-l{level}"),
+            compress(&rng.bytes(1500, 256), level),
+        ));
+        seeds.push((
+            format!("dna-l{level}"),
+            compress(&rng.bytes(3000, 4), level),
+        ));
+        seeds.push((
+            format!("zeros-l{level}"),
+            compress(&vec![0; 100_000], level),
+        ));
+        seeds.push((
+            format!("abab-l{level}"),
+            compress(&b"ab".repeat(5000), level),
+        ));
     }
     for run in [3usize, 4, 5, 255, 256, 259, 260] {
         let mut data = b"x".to_vec();
@@ -88,7 +105,9 @@ fn main() {
         seeds.push((format!("run-{run}"), compress(&data, 1)));
     }
     // Several blocks: BZ_FLUSH after each piece.
-    let pieces: Vec<Vec<u8>> = (1..=12).map(|i| rng.bytes(40 * i, 1 + 20 * i as u64)).collect();
+    let pieces: Vec<Vec<u8>> = (1..=12)
+        .map(|i| rng.bytes(40 * i, 1 + 20 * i as u64))
+        .collect();
     let refs: Vec<&[u8]> = pieces.iter().map(Vec::as_slice).collect();
     seeds.push(("blocks-12-l9".into(), compress_pieces(&refs, 9)));
     // A real block boundary at level 1 (about 100 KB of compressible data).
