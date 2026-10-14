@@ -1,15 +1,16 @@
 //! un-RLE1 (the first run-length stage) from the block's text into the
 //! caller's buffer, and libbz2's block randomisation.
 
-use fearless_simd::{Simd, SimdBase, u8x16};
+use fearless_simd::{Simd, SimdBase, u8x32};
 
 use crate::Error;
 
 /// Text bytes that must remain for a bulk step. A step consumes at most 12
-/// and stores at most 15 bytes past its output, and the at least 36 text
-/// bytes left after it decode to at least 28 bytes, which overwrite those
-/// stores. So on success no byte past the returned length is ever written.
-const MARGIN: usize = 48;
+/// and stores at most 31 bytes past its output, and the at least 52 text
+/// bytes left after it decode to at least 40 bytes (at most one in five text
+/// bytes is a count), which overwrite those stores. So on success no byte
+/// past the returned length is ever written.
+const MARGIN: usize = 64;
 
 /// Zero bytes of `x` as 0x80, others 0 (exact, no carries between bytes).
 #[inline(always)]
@@ -26,24 +27,33 @@ fn le8(w: &[u8; 16], i: usize) -> u64 {
     u64::from_le_bytes(b)
 }
 
-/// Decodes `text` (one block's text) into `out[o..]` and returns the new
-/// output position. Four equal bytes are followed by a count byte (0..=255)
-/// of further copies.
+/// Text bytes that must remain for a step of the wide bulk loop, whose run
+/// fill stores up to 288 bytes from the run's start (284 past its end): the
+/// at least 360 text bytes left after a step decode to at least 4 * 72 = 288
+/// bytes, which overwrite them.
+const WIDE_MARGIN: usize = 12 + 360;
+
+/// Bulk un-RLE1, eight candidate run starts at a time, from text position
+/// `j` and output position `o` with the current stretch of literals starting
+/// at `lit`, while `MARGIN` (or `WIDE_MARGIN`) text bytes remain. Candidate k
+/// is set when `text[j+k..j+k+4]` are equal; the first one after a clean
+/// state is a true run start (an earlier equal byte would have set an
+/// earlier candidate). Returns the new `(j, o, lit)`.
 #[inline(always)]
-pub(crate) fn unrle<S: Simd>(
+fn bulk<S: Simd, const WIDE: bool>(
     simd: S,
     text: &[u8],
     out: &mut [u8],
+    mut j: usize,
     mut o: usize,
-) -> Result<usize, Error> {
-    let n = text.len();
-    let mut j = 0;
-    // Start of the current stretch of literals (just after the last run).
-    let mut lit = 0;
-    // Bulk: eight candidate run starts at a time. Candidate k is set when
-    // text[j+k..j+k+4] are equal; the first one after a clean state is a true
-    // run start (an earlier equal byte would have set an earlier candidate).
-    while j + MARGIN <= n && o + 8 <= out.len() {
+    mut lit: usize,
+) -> Result<(usize, usize, usize), Error> {
+    let (margin, room) = if WIDE {
+        (WIDE_MARGIN, 288)
+    } else {
+        (MARGIN, 8)
+    };
+    while j + margin <= text.len() && o + room <= out.len() {
         let Some(w) = text.get(j..j + 16).and_then(|s| s.first_chunk::<16>()) else {
             break;
         };
@@ -63,9 +73,46 @@ pub(crate) fn unrle<S: Simd>(
         j += k + 5;
         o += k;
         lit = j;
-        fill(simd, out, o, ch, total)?;
+        if WIDE {
+            fill_wide(simd, out, o, ch, total);
+        } else {
+            fill(simd, out, o, ch, total)?;
+        }
         o += total;
     }
+    Ok((j, o, lit))
+}
+
+/// Writes `total` (at most 259) copies of `ch` at `out[o..]` without a
+/// variable-length loop, whose exit would mispredict on most runs: one
+/// 32-byte store, and for a longer run eight more. The caller guarantees 288
+/// bytes of room.
+#[inline(always)]
+fn fill_wide<S: Simd>(simd: S, out: &mut [u8], o: usize, ch: u8, total: usize) {
+    let v = u8x32::splat(simd, ch);
+    if let Some(d) = out.get_mut(o..).and_then(|d| d.first_chunk_mut::<288>()) {
+        let (c, _) = d.as_chunks_mut::<32>();
+        v.store_slice(&mut c[0]);
+        if total > 32 {
+            for c in &mut c[1..] {
+                v.store_slice(c);
+            }
+        }
+    }
+}
+
+/// Decodes `text` (one block's text) into `out[o..]` and returns the new
+/// output position. Four equal bytes are followed by a count byte (0..=255)
+/// of further copies.
+#[inline(always)]
+pub(crate) fn unrle<S: Simd>(
+    simd: S,
+    text: &[u8],
+    out: &mut [u8],
+    o: usize,
+) -> Result<usize, Error> {
+    let (j, o, lit) = bulk::<S, true>(simd, text, out, 0, o, 0)?;
+    let (mut j, mut o, lit) = bulk::<S, false>(simd, text, out, j, o, lit)?;
 
     // Tail: byte by byte, with the equal bytes carried in from the bulk loop.
     let mut last = 0u8;
@@ -102,16 +149,21 @@ pub(crate) fn unrle<S: Simd>(
     Ok(o)
 }
 
-/// Writes `total` copies of `ch` at `out[o..]`, in 16-byte stores when there
-/// is room for the overshoot.
+/// Writes `total` copies of `ch` at `out[o..]` in 32-byte stores. A run of
+/// up to 32 bytes is one store (most are that short, so no loop exit to
+/// mispredict) that may overshoot; a longer one ends with a store that
+/// overlaps the previous one, so it does not.
 #[inline(always)]
 fn fill<S: Simd>(simd: S, out: &mut [u8], o: usize, ch: u8, total: usize) -> Result<(), Error> {
-    let wide = total.next_multiple_of(16);
-    let v = u8x16::splat(simd, ch);
-    if let Some(d) = out.get_mut(o..o + wide) {
-        for c in d.as_chunks_mut::<16>().0 {
-            v.store_slice(c);
+    let v = u8x32::splat(simd, ch);
+    if let Some(d) = out.get_mut(o..o + total.max(32)) {
+        let last = d.len() - 32;
+        let mut k = 0;
+        while k < last {
+            v.store_slice(&mut d[k..k + 32]);
+            k += 32;
         }
+        v.store_slice(&mut d[last..]);
         Ok(())
     } else {
         out.get_mut(o..o + total)
