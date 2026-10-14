@@ -22,6 +22,10 @@ pub(crate) fn update(crc: u32, data: &[u8]) -> u32 {
 /// unsafe to call on a CPU without their features, so each safe closure here
 /// is built only inside the branch that detected them.
 #[allow(dead_code, reason = "also used by tests and examples/crc_speed.rs")]
+#[allow(
+    unsafe_code,
+    reason = "calls #[target_feature] kernels once each, right after detecting their features"
+)]
 pub(crate) fn paths() -> Vec<(&'static str, Kernel)> {
     let mut v: Vec<(&'static str, Kernel)> = vec![("bytewise", bytewise), ("slice16", slice16)];
     #[cfg(target_arch = "aarch64")]
@@ -29,12 +33,13 @@ pub(crate) fn paths() -> Vec<(&'static str, Kernel)> {
         if std::arch::is_aarch64_feature_detected!("crc") {
             v.push(("armv8-crc", |c, d| {
                 // SAFETY: this closure exists only where `crc` was detected.
-                unsafe { arm::crc_checked(c, d) }
+                unsafe { arm::crc_kernel(c, d) }
             }));
             if std::arch::is_aarch64_feature_detected!("aes") {
                 v.push(("pmull", |c, d| {
-                    // SAFETY: this closure exists only where `crc` and `aes` were detected.
-                    unsafe { arm::pmull_checked(c, d) }
+                    // SAFETY: this closure exists only where `crc` and `aes` were detected;
+                    // NEON is baseline.
+                    unsafe { arm::pmull_kernel(c, d) }
                 }));
             }
         }
@@ -46,7 +51,7 @@ pub(crate) fn paths() -> Vec<(&'static str, Kernel)> {
         {
             v.push(("pclmul", |c, d| {
                 // SAFETY: this closure exists only where pclmulqdq and sse4.1 were detected.
-                unsafe { x86::pclmul_checked(c, d) }
+                unsafe { x86::pclmul_kernel(c, d) }
             }));
         }
     }
@@ -137,22 +142,6 @@ mod arm {
     use super::k::*;
     use core::arch::aarch64::*;
 
-    /// # Safety
-    ///
-    /// The CPU must support the `crc` feature.
-    pub(super) unsafe fn crc_checked(crc: u32, data: &[u8]) -> u32 {
-        // SAFETY: the caller guarantees `crc`.
-        unsafe { crc_kernel(crc, data) }
-    }
-
-    /// # Safety
-    ///
-    /// The CPU must support the `crc` and `aes` (PMULL) features.
-    pub(super) unsafe fn pmull_checked(crc: u32, data: &[u8]) -> u32 {
-        // SAFETY: the caller guarantees `crc` and `aes`; NEON is baseline.
-        unsafe { pmull_kernel(crc, data) }
-    }
-
     /// `x` with the bits of every byte reversed and the byte order kept.
     #[inline(always)]
     fn rev_bits_in_bytes(x: u64) -> u64 {
@@ -163,7 +152,7 @@ mod arm {
     /// the register is bit-reversed on entry and exit and the bits of every
     /// input byte are reversed.
     #[target_feature(enable = "crc")]
-    fn crc_kernel(crc: u32, data: &[u8]) -> u32 {
+    pub(super) fn crc_kernel(crc: u32, data: &[u8]) -> u32 {
         let mut r = crc.reverse_bits();
         let (words, bytes) = data.as_chunks::<8>();
         for w in words {
@@ -175,17 +164,17 @@ mod arm {
         r.reverse_bits()
     }
 
-    #[inline(always)]
+    #[inline]
+    #[target_feature(enable = "neon")]
     fn consts(k_d: u64, k_d64: u64) -> poly64x2_t {
-        // SAFETY: a `[u64; 2]` is 16 readable bytes and `vld1q_u64` has no alignment need.
-        unsafe { vreinterpretq_p64_u64(vld1q_u64([k_d, k_d64].as_ptr())) }
+        vreinterpretq_p64_u64(vcombine_u64(vcreate_u64(k_d), vcreate_u64(k_d64)))
     }
 
     /// The 16 bytes in reverse order: bit i is the coefficient of x^i.
-    #[inline(always)]
+    #[inline]
+    #[target_feature(enable = "neon,aes")]
     fn load_rev(p: &[u8; 16], rev: uint8x16_t) -> uint8x16_t {
-        // SAFETY: `p` is 16 readable bytes and `vld1q_u8` has no alignment need.
-        unsafe { vqtbl1q_u8(vld1q_u8(p.as_ptr()), rev) }
+        vqtbl1q_u8(vreinterpretq_u8_p128(u128::from_le_bytes(*p)), rev)
     }
 
     /// acc * x^D + d (mod P), each product at most 96 bits.
@@ -202,13 +191,15 @@ mod arm {
     /// on Apple cores and Neoverse V2. The residual and the tail go through
     /// the `crc32` instructions, as do inputs too short to fold.
     #[target_feature(enable = "neon,aes,crc")]
-    fn pmull_kernel(crc: u32, data: &[u8]) -> u32 {
+    pub(super) fn pmull_kernel(crc: u32, data: &[u8]) -> u32 {
         if data.len() < PMULL_MIN {
             return crc_kernel(crc, data);
         }
-        const REV: [u8; 16] = [15, 14, 13, 12, 11, 10, 9, 8, 7, 6, 5, 4, 3, 2, 1, 0];
-        // SAFETY: `REV` is 16 readable bytes.
-        let rev = unsafe { vld1q_u8(REV.as_ptr()) };
+        // The `tbl` index 15, 14, ..., 0.
+        let rev = vreinterpretq_u8_u64(vcombine_u64(
+            vcreate_u64(0x0809_0a0b_0c0d_0e0f),
+            vcreate_u64(0x0001_0203_0405_0607),
+        ));
         let (k1024, k512, k128) = (
             consts(K_1024, K_1088),
             consts(K_512, K_576),
@@ -269,12 +260,11 @@ mod x86 {
     use super::slice16;
     use core::arch::x86_64::*;
 
-    /// # Safety
-    ///
-    /// The CPU must support `pclmulqdq` and `sse4.1`.
-    pub(super) unsafe fn pclmul_checked(crc: u32, data: &[u8]) -> u32 {
-        // SAFETY: the caller guarantees `pclmulqdq` and `sse4.1`.
-        unsafe { pclmul_kernel(crc, data) }
+    /// The two little-endian halves of 16 bytes.
+    #[inline(always)]
+    fn halves(p: &[u8; 16]) -> (u64, u64) {
+        let (h, _) = p.as_chunks::<8>();
+        (u64::from_le_bytes(h[0]), u64::from_le_bytes(h[1]))
     }
 
     #[inline]
@@ -296,8 +286,8 @@ mod x86 {
     #[inline]
     #[target_feature(enable = "sse4.1")]
     fn load_rev(p: &[u8; 16]) -> __m128i {
-        // SAFETY: `p` is 16 readable bytes and `loadu` has no alignment need.
-        rev16(unsafe { _mm_loadu_si128(p.as_ptr().cast()) })
+        let (lo, hi) = halves(p);
+        rev16(_mm_set_epi64x(hi.cast_signed(), lo.cast_signed()))
     }
 
     /// acc * x^D mod P: `k` holds x^(D+64) mod P in the high qword, x^D mod P in the low.
@@ -314,14 +304,16 @@ mod x86 {
     #[inline]
     #[target_feature(enable = "sse4.1")]
     fn finish(r: __m128i, tail: &[u8]) -> u32 {
+        let v = rev16(r);
+        let (lo, hi) = (_mm_cvtsi128_si64(v), _mm_extract_epi64::<1>(v));
         let mut bytes = [0u8; 16];
-        // SAFETY: `bytes` is 16 writable bytes and `storeu` has no alignment need.
-        unsafe { _mm_storeu_si128(bytes.as_mut_ptr().cast(), rev16(r)) };
+        let (h, _) = bytes.as_chunks_mut::<8>();
+        (h[0], h[1]) = (lo.to_le_bytes(), hi.to_le_bytes());
         slice16(slice16(0, &bytes), tail)
     }
 
     #[target_feature(enable = "pclmulqdq,sse4.1")]
-    fn pclmul_kernel(crc: u32, data: &[u8]) -> u32 {
+    pub(super) fn pclmul_kernel(crc: u32, data: &[u8]) -> u32 {
         if data.len() < 64 {
             return slice16(crc, data);
         }
