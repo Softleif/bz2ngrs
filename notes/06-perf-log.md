@@ -108,3 +108,11 @@ ends with a store that overlaps the previous one instead of overshooting.
 
 Best pass, MB/s, base -> new (3 alternating runs each): QUAL 1m 1096 -> 1125
 (+2.7%), QUAL 64k 970 -> 984 (+1.4%).
+
+### 4. Walk prefetch at 24 lanes (rejected)
+
+`prfm pldl1keep` (aarch64 `asm!`) on the next row's table entry right after
+each step of the 24-lane loop. Best pass, base -> new: MC 1m 440 -> 434
+(-1.3%), MC 64k 411 -> 406 (-1.2%). At these sizes the table fits in the M4
+Pro's L2 and the out-of-order window already overlaps the 24 lanes' loads;
+the prefetch only adds instructions. Reverted (no `unsafe` added).
