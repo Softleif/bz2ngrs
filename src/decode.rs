@@ -2,7 +2,7 @@
 //! RUNA/RUNB) and the per-block driver (`decompress.c` decode(),
 //! `kern_template.h` bzng_symbols).
 
-use fearless_simd::{Simd, SimdBase, SimdFrom, u8x16};
+use fearless_simd::{Select, Simd, SimdBase, SimdFrom, u8x16};
 
 use crate::Error;
 use crate::bits::Bits;
@@ -27,7 +27,7 @@ pub(crate) struct Scratch {
     selectors: [u8; 1 << 15],
     lens: [[u8; MAX_ALPHA]; 6],
     /// The MTF list; entries 16.. are the tail behind the vector head.
-    mtf: [u8; 256],
+    mtf: [u8; 272],
 }
 
 impl Scratch {
@@ -338,7 +338,7 @@ fn step<S: Simd>(
     st: &mut Run<S>,
     sym: u32,
     ll: &mut [u8; BYTES],
-    mtf: &mut [u8; 256],
+    mtf: &mut [u8; 272],
     eob: u32,
     nmax: u32,
 ) -> u32 {
@@ -379,18 +379,7 @@ fn step<S: Simd>(
     if idx < 16 {
         st.head = st.head.swizzle_dyn(u8x16::simd_from(simd, PERM[idx]));
     } else {
-        // Rare: move the entry within the whole list in memory.
-        let idx = idx & 255;
-        st.head.store_slice(&mut mtf[..16]);
-        let c = mtf[idx];
-        mtf.copy_within(0..idx, 1);
-        mtf[0] = c;
-        // black_box: otherwise LLVM forwards `c` into lane 0 and splits the
-        // head on the hot path too (see above).
-        st.head = core::hint::black_box(u8x16::simd_from(
-            simd,
-            *mtf.first_chunk::<16>().unwrap_or(&[0; 16]),
-        ));
+        st.head = tail_move(simd, mtf, st.head, idx & 255);
     }
     // The new head's first byte is the literal; the other 15 are overwritten
     // later or land in L's slack.
@@ -404,6 +393,39 @@ fn step<S: Simd>(
     st.rshift = if is_run { st.rshift + 1 } else { 0 };
     CONT
 }
+
+/// Moves MTF entry `idx` (16..=255) to the front of a list whose first 16
+/// entries are `head` and the rest `mtf[16..]` (`kern_template.h`
+/// mtf_tail_move): the tail shifts up one entry, 16 at a time, each vector
+/// taking the previous one's last byte, the last one merged up to `idx`.
+/// Returns the new head.
+#[inline(always)]
+fn tail_move<S: Simd>(simd: S, mtf: &mut [u8; 272], head: u8x16<S>, idx: usize) -> u8x16<S> {
+    let c = mtf[idx];
+    let mut prev = head;
+    let mut j = 16;
+    while j + 16 <= idx {
+        let v = load16(simd, mtf, j);
+        prev.slide::<15>(v).store_slice(&mut mtf[j..j + 16]);
+        prev = v;
+        j += 16;
+    }
+    let v = load16(simd, mtf, j);
+    let keep = u8x16::simd_from(simd, IOTA).simd_le(u8x16::splat(simd, (idx - j) as u8));
+    keep.select(prev.slide::<15>(v), v)
+        .store_slice(&mut mtf[j..j + 16]);
+    // black_box: `c` is a scalar, and an LLVM that sees lane 0 as one splits
+    // the head into a vector and a scalar lane on the hot path too.
+    core::hint::black_box(u8x16::splat(simd, c).slide::<15>(head))
+}
+
+/// `mtf[j..j + 16]` (`j <= 255`, and the list has 16 bytes of slack).
+#[inline(always)]
+fn load16<S: Simd>(simd: S, mtf: &[u8; 272], j: usize) -> u8x16<S> {
+    u8x16::simd_from(simd, *mtf[j..].first_chunk::<16>().unwrap_or(&[0; 16]))
+}
+
+const IOTA: [u8; 16] = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15];
 
 /// Stores 16 bytes at `ll[at & ROW_MASK..]` (in range: `BYTES` has slack).
 #[inline(always)]
@@ -427,5 +449,32 @@ mod tests {
             assert_eq!(s[..3], [7, 100, 101]);
             assert_eq!(s[15], 114);
         });
+    }
+
+    /// The vector tail move against a plain move-to-front of the whole list,
+    /// for every index past the head, at the fallback and the best level.
+    #[test]
+    fn tail_move_is_move_to_front() {
+        for level in [Level::fallback(), Level::new()] {
+            for idx in 16..=255usize {
+                let list: [u8; 256] =
+                    core::array::from_fn(|i| (i as u8).wrapping_mul(37).wrapping_add(5));
+                let mut want = list;
+                want.copy_within(0..idx, 1);
+                want[0] = list[idx];
+                let mut mtf = [0xEEu8; 272];
+                mtf[..256].copy_from_slice(&list);
+                let head: [u8; 16] = dispatch!(level, simd => {
+                    let head = u8x16::simd_from(simd, *list.first_chunk::<16>().unwrap_or(&[0; 16]));
+                    super::tail_move(simd, &mut mtf, head, idx).into()
+                });
+                assert_eq!(head[..], want[..16], "{level:?} idx {idx}");
+                assert_eq!(mtf[16..256], want[16..], "{level:?} idx {idx}");
+                assert!(
+                    mtf[256..].iter().all(|&b| b == 0xEE),
+                    "{level:?} idx {idx}: slack written"
+                );
+            }
+        }
     }
 }
