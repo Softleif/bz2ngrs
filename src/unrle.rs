@@ -6,10 +6,11 @@ use fearless_simd::{Simd, SimdBase, u8x16};
 use crate::Error;
 
 /// Text bytes that must remain for a bulk step. A step consumes at most 12
-/// and stores at most 15 bytes past its output, and the at least 36 text
-/// bytes left after it decode to at least 28 bytes, which overwrite those
-/// stores. So on success no byte past the returned length is ever written.
-const MARGIN: usize = 48;
+/// and stores at most 31 bytes past its output, and the at least 52 text
+/// bytes left after it decode to at least 40 bytes (at most one in five text
+/// bytes is a count), which overwrite those stores. So on success no byte
+/// past the returned length is ever written.
+const MARGIN: usize = 64;
 
 /// Zero bytes of `x` as 0x80, others 0 (exact, no carries between bytes).
 #[inline(always)]
@@ -102,15 +103,20 @@ pub(crate) fn unrle<S: Simd>(
     Ok(o)
 }
 
-/// Writes `total` copies of `ch` at `out[o..]`, in 16-byte stores when there
-/// is room for the overshoot.
+/// Writes `total` copies of `ch` at `out[o..]`: two 16-byte stores, then a
+/// loop only for runs past 32 bytes (most are shorter, so its exit is
+/// predictable), when there is room for the overshoot.
 #[inline(always)]
 fn fill<S: Simd>(simd: S, out: &mut [u8], o: usize, ch: u8, total: usize) -> Result<(), Error> {
-    let wide = total.next_multiple_of(16);
+    let wide = total.max(32).next_multiple_of(16);
     let v = u8x16::splat(simd, ch);
     if let Some(d) = out.get_mut(o..o + wide) {
-        for c in d.as_chunks_mut::<16>().0 {
-            v.store_slice(c);
+        if let [c0, c1, rest @ ..] = d.as_chunks_mut::<16>().0 {
+            v.store_slice(c0);
+            v.store_slice(c1);
+            for c in rest {
+                v.store_slice(c);
+            }
         }
         Ok(())
     } else {
