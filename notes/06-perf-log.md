@@ -128,3 +128,19 @@ stage and the byte tail follow as before.
 Best pass, MB/s, base -> new: QUAL 1m 1146 -> 1197 (+4.5%, 5 alternating
 runs each, median +4.9%), QUAL 64k 978 -> 1011 (+3.3%), XA 64k 259 -> 258
 (=).
+
+### 6. Vector MTF tail move (kept)
+
+A literal with MTF index 16 or more stored the head to memory, `memmove`d the
+list and reloaded the head, stalling on store forwarding. Archive-profile
+CRAM data takes this path often (`copy_within`'s `checked_sub` alone was 4%
+of the profile). Now bz2-ng's `mtf_tail_move` in fearless_simd: the head
+stays in its register, the tail shifts up 16 entries at a time with `slide`,
+each vector taking the previous one's last byte, and the last vector merges
+up to the index with a lane mask. The list gets 16 bytes of slack (272).
+Tested against a scalar move-to-front for every index, at the fallback and
+the best level.
+
+Best pass, MB/s, base -> new (3 alternating runs each):
+ultima-L7388-v31-archive 261 -> 274 (+5%), ultima-L7386-v30-bz9 581 -> 633
+(+9%), XA 64k 257 -> 259 (=).
