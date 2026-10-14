@@ -1,0 +1,215 @@
+//! Round trips against the `bzip2` crate (libbz2-rs-sys) at every SIMD level.
+
+use std::io::Write;
+
+use crate::{__decompress_at, Error, decompress};
+
+fn levels() -> Vec<fearless_simd::Level> {
+    let best = fearless_simd::Level::new();
+    let v = vec![fearless_simd::Level::fallback(), best];
+    #[cfg(target_arch = "x86_64")]
+    let v = {
+        let mut v = v;
+        v.extend(best.as_sse2().map(fearless_simd::Level::Sse2));
+        v.extend(best.as_sse4_2().map(fearless_simd::Level::Sse4_2));
+        v.extend(best.as_avx2().map(fearless_simd::Level::Avx2));
+        v
+    };
+    v
+}
+
+fn compress(data: &[u8], level: u32) -> Vec<u8> {
+    let mut e = bzip2::write::BzEncoder::new(Vec::new(), bzip2::Compression::new(level));
+    e.write_all(data).unwrap();
+    e.finish().unwrap()
+}
+
+/// libbz2's verdict: the output, or whether it rejected the stream.
+fn reference(src: &[u8]) -> Result<Vec<u8>, ()> {
+    let mut out = Vec::new();
+    let mut d = bzip2::read::BzDecoder::new(src);
+    std::io::Read::read_to_end(&mut d, &mut out)
+        .map(|_| out)
+        .map_err(|_| ())
+}
+
+fn check(data: &[u8], level: u32) {
+    let c = compress(data, level);
+    for lv in levels() {
+        let mut out = vec![0xA5; data.len() + 7];
+        let n = __decompress_at(lv, &c, &mut out)
+            .unwrap_or_else(|e| panic!("{lv:?} level {level}: {e:?}"));
+        assert_eq!(n, data.len(), "{lv:?} level {level}");
+        assert!(out[..n] == *data, "{lv:?} level {level}: wrong output");
+        assert!(
+            out[n..].iter().all(|&b| b == 0xA5),
+            "{lv:?}: wrote past the end"
+        );
+        // Exact fit, and one byte short.
+        let mut out = vec![0; data.len()];
+        assert_eq!(__decompress_at(lv, &c, &mut out), Ok(data.len()));
+        if !data.is_empty() {
+            let mut out = vec![0; data.len() - 1];
+            assert_eq!(
+                __decompress_at(lv, &c, &mut out),
+                Err(Error::OutputTooSmall)
+            );
+        }
+    }
+}
+
+fn lcg(n: usize, seed: u64, alphabet: u8) -> Vec<u8> {
+    let mut x = seed;
+    (0..n)
+        .map(|_| {
+            x = x
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            ((x >> 33) % u64::from(alphabet)) as u8
+        })
+        .collect()
+}
+
+#[test]
+fn edge_inputs() {
+    for level in [1, 6, 9] {
+        check(b"", level);
+        check(b"a", level);
+        check(b"ab", level);
+        check(b"aaaa", level);
+        check(b"aaaaa", level);
+        check(&[0u8; 300], level);
+        check(&[7u8; 100_000], level);
+        check(&b"ab".repeat(5000), level);
+        check(&b"abcabcabd".repeat(3000), level);
+    }
+}
+
+#[test]
+fn runs_and_text() {
+    // Runs of every length around the RLE1 thresholds, between literals.
+    let mut d = Vec::new();
+    for len in 0..300usize {
+        d.extend(std::iter::repeat_n((len % 251) as u8, len));
+        d.push(b'x');
+    }
+    check(&d, 9);
+    check(&lcg(50_000, 1, 4), 9);
+    check(&lcg(50_000, 2, 255), 9);
+    let text: Vec<u8> = (0..20_000)
+        .flat_map(|i: u32| format!("line {i} of some text\n").into_bytes())
+        .collect();
+    check(&text, 9);
+}
+
+#[test]
+fn sizes_across_lane_counts() {
+    // Blocks of about 4 Ki, 16 Ki and 64 Ki rows switch to 2, 8 and 24 lanes.
+    for n in [
+        100, 2047, 2048, 4095, 4096, 5000, 16_383, 16_384, 40_000, 65_535, 65_536, 200_000, 899_000,
+    ] {
+        check(&lcg(n, n as u64, 200), 9);
+    }
+}
+
+#[test]
+fn multi_block() {
+    // Level 1 has 100 kB blocks.
+    check(&lcg(350_000, 3, 255), 1);
+    check(&lcg(350_000, 4, 3), 1);
+    check(&[0u8; 2_000_000], 1);
+}
+
+#[test]
+fn trailing_bytes_are_ignored() {
+    let mut c = compress(b"hello hello hello", 9);
+    c.extend_from_slice(b"garbage after the stream");
+    let mut out = [0u8; 64];
+    assert_eq!(decompress(&c, &mut out), Ok(17));
+}
+
+#[test]
+fn truncation_at_every_byte() {
+    let data = lcg(3000, 9, 20);
+    let c = compress(&data, 9);
+    let mut out = vec![0; data.len()];
+    for cut in 0..c.len() {
+        assert_eq!(
+            decompress(&c[..cut], &mut out),
+            Err(Error::UnexpectedEof),
+            "cut {cut}"
+        );
+    }
+}
+
+#[test]
+fn corruptions_match_libbz2() {
+    let data = lcg(5000, 5, 30);
+    let c = compress(&data, 9);
+    let mut out = vec![0; data.len() + 100];
+    for i in 0..c.len() {
+        for bit in [0, 3, 7] {
+            let mut bad = c.clone();
+            bad[i] ^= 1 << bit;
+            let ours = decompress(&bad, &mut out).map(|n| out[..n].to_vec());
+            let theirs = reference(&bad);
+            assert_eq!(ours.is_ok(), theirs.is_ok(), "byte {i} bit {bit}: {ours:?}");
+            if let (Ok(a), Ok(b)) = (&ours, &theirs) {
+                assert!(a == b, "byte {i} bit {bit}: different output");
+            }
+        }
+    }
+}
+
+#[test]
+fn bad_headers() {
+    let mut out = [0u8; 16];
+    assert_eq!(decompress(b"BZh0", &mut out), Err(Error::Corrupt));
+    assert_eq!(decompress(b"BZx9", &mut out), Err(Error::Corrupt));
+    assert_eq!(decompress(b"BZh9", &mut out), Err(Error::UnexpectedEof));
+    assert_eq!(decompress(b"", &mut out), Err(Error::UnexpectedEof));
+    // An empty stream with a wrong combined CRC.
+    let mut c = compress(b"", 9);
+    let last = c.len() - 1;
+    c[last] ^= 1;
+    assert_eq!(decompress(&c, &mut out), Err(Error::CrcMismatch));
+}
+
+/// Sets the randomised bit of a single-block stream's block, then fixes up
+/// the block and combined CRCs to the output libbz2 produces for it.
+#[test]
+fn randomised_block() {
+    let data = lcg(30_000, 11, 50);
+    let mut c = compress(&data, 9);
+    c[14] |= 0x80; // the bit right after the block CRC (bytes 10..14)
+    // libbz2 delivers the block, then reports the CRC error.
+    let mut d = bzip2::Decompress::new(false);
+    let mut y = Vec::with_capacity(data.len() * 2);
+    assert!(d.decompress_vec(&c, &mut y).is_err());
+    assert_ne!(y, data);
+    let crc = !crate::crc::update(!0, &y);
+    c[10..14].copy_from_slice(&crc.to_be_bytes());
+    // The combined CRC is the last 32 bits before the 0..7 padding bits.
+    let total = c.len() * 8;
+    let pad = (0..8)
+        .find(|p| {
+            let at = total - p - 80;
+            (0..48).all(|k| {
+                let bit = |i: usize| (c[i / 8] >> (7 - i % 8)) & 1;
+                bit(at + k) == ((0x1772_4538_5090u64 >> (47 - k)) & 1) as u8
+            })
+        })
+        .unwrap();
+    let at = total - pad - 32;
+    for k in 0..32 {
+        let i = at + k;
+        let v = ((crc >> (31 - k)) & 1) as u8;
+        c[i / 8] = (c[i / 8] & !(1 << (7 - i % 8))) | (v << (7 - i % 8));
+    }
+    assert_eq!(reference(&c), Ok(y.clone()));
+    for lv in levels() {
+        let mut out = vec![0; y.len()];
+        assert_eq!(__decompress_at(lv, &c, &mut out), Ok(y.len()));
+        assert!(out == y);
+    }
+}

@@ -16,7 +16,11 @@ static TABLE: [u32; 256] = {
         let mut c = (i as u32) << 24;
         let mut k = 0;
         while k < 8 {
-            c = if c & 0x8000_0000 != 0 { (c << 1) ^ 0x04C1_1DB7 } else { c << 1 };
+            c = if c & 0x8000_0000 != 0 {
+                (c << 1) ^ 0x04C1_1DB7
+            } else {
+                c << 1
+            };
             k += 1;
         }
         t[i] = c;
