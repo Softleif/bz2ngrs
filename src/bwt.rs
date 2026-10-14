@@ -23,9 +23,13 @@ const CHUNK: usize = 1024;
 /// Pool chunks: the pool holds at most 900,000 bytes, and each of at most 24
 /// lanes has one chunk that is not full, so at most 878 + 24 = 902 are used.
 const CHUNKS: usize = 1024;
-/// Target rows per segment.
-const SEG_ROWS: u32 = 2048;
-/// Segments: at most 900,000 / 2048 = 439, plus `orig_ptr`, are used.
+/// Target rows per segment. When the first lane runs out of segments the
+/// others finish theirs with less overlap, so shorter segments shorten that
+/// tail; bz2-ng's 2048 left a third of the walk there at 64 Ki rows. Above
+/// `SEGS * 512` rows the cap below lengthens them again, which is what the
+/// larger blocks prefer (notes/06-perf-log.md).
+const SEG_ROWS: u32 = 512;
+/// Segments, at most this many minus one (with `orig_ptr`) are used.
 const SEGS: usize = 512;
 const SPLIT: u32 = 0x8000_0000;
 

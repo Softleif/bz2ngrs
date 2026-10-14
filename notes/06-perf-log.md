@@ -219,3 +219,67 @@ between runs, and the cells that moved more than 2% moved both ways (QUAL
 16k down, QUAL 1m up), so there is no change beyond noise. Absolute `ours`
 MB/s, median of 4: MC 16k 405.6 -> 400.5, MC 1m 437.4 -> 436.0, QUAL 1m
 1247.8 -> 1273.3. Empty-stream fixed cost 12 ns -> 11 ns.
+
+## Round 2 (profile-driven; see notes/11-perf-round2.md)
+
+Method changes: `examples/prof` best pass over pre-compressed chunk
+directories (`cram:DIR`), alternated between a saved baseline and the new
+binary, 5-6 rounds, best of each; and the bench with `--decoders ours,C
+--stat max` for same-run ours/C. The machine ran at load averages of
+140-350 for most of the session (other agents); the `prof` best pass stayed
+within about 3% of its quiet-machine value there, the bench's ratios did not
+(0.4-1.5), so bench tables below were taken when the load fell to 10-25.
+
+### R2.1 Hoist the `ll` box deref out of the symbol loop (rejected)
+
+In the bench binary the step reloaded `sc.ll`'s pointer through two
+dependent loads per symbol (`ldr x11,[sp,#..]; ldr x11,[x11,#0x3018]`) and
+`nmax` from the stack. A `let ll: &mut [u8; BYTES] = ll;` before the loop
+removed both. Best pass, base -> new (6 rounds, load 140-220): XA 1m 255.3
+-> 251.6, XA 64k 242.5 -> 238.4, MC 64k 388.2 -> 389.2, QUAL 64k 1060.8 ->
+1041.8. The reloads are off the MTF and Huffman chains; no gain. Reverted.
+
+### R2.2 Segments of 512 rows instead of 2048 (kept)
+
+The profile showed the straggler phase (`bwt::walk` after the lock-step
+loop exits, lanes finishing their last segments with less overlap) at 38% of
+walk samples on MC and QUAL 64k, 39-52% on the small CRAM sets, 14% on XA
+1m. At 64 Ki rows and 2048-row segments each of the 24 lanes walks three
+segments, so the tail is about one segment long.
+
+Sweep (temporary env knob, best of 5, ratio to 2048 rows / 3 per lane):
+
+| rows/seg, min segs/lane | MC 64k | QUAL 64k | XA 1m | MC 1m | level-3 | XA 16k |
+|---|---|---|---|---|---|---|
+| 2048, 6 | 1.034 | 0.968 | 1.004 | | 1.033 | |
+| 1024, 10 | 1.034 | 0.924 | 0.998 | | 1.029 | |
+| 512, 16 | 1.014 | 0.871 | 0.991 | | 1.009 | |
+| 1024, 3 | 1.002 | 0.998 | 1.005 | 1.009 | 1.006 | 1.002 |
+| 512, 3 | 1.053 | 0.999 | 1.001 | 0.999 | 1.037 | 0.993 |
+| 384, 3 | 1.062 | 0.999 | 0.997 | 0.995 | 1.040 | 1.003 |
+| 256, 3 | 1.052 | 0.999 | 0.992 | 0.991 | 1.034 | 1.001 |
+
+More segments per lane hurt QUAL 64k (about 9k rows: 63-row segments, where
+the per-segment cost dominates); the row count per segment is the knob.
+`SEG_ROWS = 512` with `SEGS` still 512: above 261k rows the cap lengthens
+segments again, as the 1m cells prefer.
+
+A/B, `prof` best pass, 6 rounds, base -> new: MC 16k 0.999, MC 64k 1.034,
+MC 1m 1.012, XA 16k 1.000, XA 64k 1.022, XA 1m 1.018, QUAL 16k 0.991, QUAL
+64k 0.996, QUAL 1m 1.042, level-3 1.032, v31-small 1.024, v30-bz1 1.050,
+ultima-v31-archive 1.018.
+
+Same-run ours/C (bench `--stat max`, 7 rounds, two alternating runs each,
+load 20-26), base -> new:
+
+| set | 16k | 64k | 1m |
+|---|---|---|---|
+| MC | 1.128 -> 1.126 | 0.997 -> 1.024 | 0.990 -> 0.999 |
+| XA | 1.088 -> 1.088 | 1.005 -> 1.029 | 0.993 -> 1.004 |
+| QUAL | 1.137 -> 1.139 | 1.111 -> 1.103 | 1.069 -> 1.112 |
+
+CRAM (5 rounds, load 9-20): level-3 0.988 -> 1.047, level-4 1.038 -> 1.015
+(0.11 MB, noisy), v30-bz1 1.025 -> 1.065, v30-bz9 1.061 -> 1.068,
+v31-archive 1.146 -> 1.148, v31-bzonly 1.030 -> 1.047, v31-small 1.025 ->
+1.029, ultima-bz6 1.034 -> 1.044, ultima-bz1 1.039 -> 1.064, ultima-bz9 1.036
+-> 1.058, ultima-archive 0.988 -> 1.009.
