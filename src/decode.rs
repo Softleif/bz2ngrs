@@ -15,19 +15,32 @@ const MAX_SELECTORS: usize = 18002;
 /// Symbols per Huffman group.
 const G_SIZE: usize = 50;
 
+/// Allocates a zeroed `Box<[$t; $n]>` without a copy. `vec!` of a zero
+/// literal of a concrete integer type is `alloc_zeroed`, so a thread makes
+/// resident only the pages its blocks touch.
+macro_rules! zeroed_box {
+    ($t:ty, $n:expr) => {
+        <Box<[$t; $n]>>::try_from(vec![0 as $t; $n].into_boxed_slice())
+            // The length is $n by construction, so this arm is unreachable; it
+            // only has to be sound, and clippy::panic forbids the alternative.
+            .unwrap_or_else(|_| Box::new([0; $n]))
+    };
+}
+pub(crate) use zeroed_box;
+
 /// Per-thread working memory, reused between calls. Every byte that is read
 /// is written first in each block, so it is never cleared.
-///
-/// [`Scratch::new_boxed`] creates it from zeroed memory, so every field, here
-/// and in the types it holds, must be an integer or an array or struct of
-/// integers: a `bool`, enum, reference or `NonZero` field would make that
-/// undefined behaviour.
 pub(crate) struct Scratch {
     bwt: Bwt,
     /// The symbol loop's output L, then the walk's pool.
-    ll: [u8; BYTES],
+    ll: Box<[u8; BYTES]>,
     /// The block's text, gathered in order.
-    text: [u8; BYTES],
+    text: Box<[u8; BYTES]>,
+    small: Small,
+}
+
+/// The parts that are small enough to build on the stack.
+struct Small {
     tables: [HTable; 8],
     selectors: [u8; 1 << 15],
     lens: [[u8; MAX_ALPHA]; 6],
@@ -36,13 +49,18 @@ pub(crate) struct Scratch {
 }
 
 impl Scratch {
-    #[allow(unsafe_code, reason = "lazily zeroed boxed scratch via new_zeroed")]
     pub(crate) fn new_boxed() -> Box<Scratch> {
-        // SAFETY: Scratch holds only integers and arrays of integers (and
-        // structs of those), for which all-zero bytes are a valid value.
-        // alloc_zeroed leaves the large arrays as untouched zero pages, so a
-        // thread only makes resident what its blocks use.
-        unsafe { Box::<Scratch>::new_zeroed().assume_init() }
+        Box::new(Scratch {
+            bwt: Bwt::new(),
+            ll: zeroed_box!(u8, BYTES),
+            text: zeroed_box!(u8, BYTES),
+            small: Small {
+                tables: [HTable::ZERO; 8],
+                selectors: [0; 1 << 15],
+                lens: [[0; MAX_ALPHA]; 6],
+                mtf: [0; 272],
+            },
+        })
     }
 }
 
@@ -141,7 +159,7 @@ fn block_tables<S: Simd>(simd: S, br: &mut Bits, sc: &mut Scratch) -> Result<(u3
             let bits = br.get(16);
             for j in 0..16 {
                 if bits & (0x8000 >> j) != 0 {
-                    sc.mtf[n_in_use % 256] = (i * 16 + j) as u8;
+                    sc.small.mtf[n_in_use % 256] = (i * 16 + j) as u8;
                     n_in_use += 1;
                 }
             }
@@ -177,7 +195,7 @@ fn block_tables<S: Simd>(simd: S, br: &mut Bits, sc: &mut Scratch) -> Result<(u3
             let v = pos[j % 6];
             pos.copy_within(0..j % 6, 1);
             pos[0] = v;
-            sc.selectors[i % (1 << 15)] = v;
+            sc.small.selectors[i % (1 << 15)] = v;
         }
     }
     let n_selectors = n_selectors.min(MAX_SELECTORS);
@@ -202,11 +220,11 @@ fn block_tables<S: Simd>(simd: S, br: &mut Bits, sc: &mut Scratch) -> Result<(u3
                 br.consume(2);
                 curr += if two == 2 { 1 } else { -1 };
             }
-            sc.lens[t % 6][i % MAX_ALPHA] = curr as u8;
+            sc.small.lens[t % 6][i % MAX_ALPHA] = curr as u8;
         }
     }
     for t in 0..n_groups {
-        sc.tables[t % 8].build(simd, &sc.lens[t % 6][..alpha_size.min(MAX_ALPHA)]);
+        sc.small.tables[t % 8].build(simd, &sc.small.lens[t % 6][..alpha_size.min(MAX_ALPHA)]);
     }
     Ok((n_in_use as u32 + 1, n_selectors))
 }
@@ -256,13 +274,13 @@ fn symbols<S: Simd>(
     n_selectors: usize,
     nmax: u32,
 ) -> Result<u32, Error> {
-    let Scratch {
-        ll,
+    let Scratch { ll, small, .. } = sc;
+    let Small {
         tables,
         selectors,
         mtf,
         ..
-    } = sc;
+    } = small;
     let head = u8x16::simd_from(simd, *mtf.first_chunk::<16>().unwrap_or(&[0; 16]));
     let mut st = Run {
         nb: 0,

@@ -167,3 +167,25 @@ CRAM: level-3 0.99, level-4 1.00, v30-bz1 1.00, v30-bz9 1.06, v31-archive
 1.08, v31-bzonly 1.02, v31-small 1.00, ultima-bz6 1.01, ultima-bz1 1.01,
 ultima-bz9 1.02, ultima-archive 0.99. A second run of the cram set (9
 rounds) had every set between 0.97 and 1.09.
+
+## Safe scratch allocation (kept; `unsafe` removed outside the CRC)
+
+`Scratch::new_boxed` used `Box::new_zeroed().assume_init()`. Now `tt`, `ll`
+and `text` are separate `Box<[T; N]>` built as
+`vec![0; N].into_boxed_slice().try_into()` (still `alloc_zeroed`, no copy, so
+untouched pages stay non-resident), and the small parts are plain array
+literals in one struct. The kernels still take `&mut [T; N]`, so the masked
+indices keep their bounds-check elision. The `try_into` error arm cannot
+happen (the length is N); it falls back to `Box::new([0; N])` rather than
+panic.
+
+Same-run ours/C, 5 rounds, base -> new: MC 16k 1.13 -> 1.13, 64k 1.00 ->
+1.00, 1m 1.02 -> 1.00; XA 1.08 -> 1.09, 1.00 -> 1.01, 0.98 -> 1.02; QUAL 1.11
+-> 1.15, 1.09 -> 1.11, 1.05 -> 1.07. The cells that moved were repeated as
+alternating A/B (`examples/prof.rs`, best of 3 s passes, MB/s, 4 pairs):
+QUAL 64k 1119 -> 1124 (+0.5%), QUAL 1m 1291 -> 1300 (+0.7%), XA 1m 268 -> 267
+(=), XA 16k 250 -> 249 (=), MC 16k 413 -> 412 (-0.3%, two runs: -0.9%, -0.5%).
+The ratio moves were C-side noise. Max RSS of `prof` (includes the
+compressor): 100-byte stream 2.38 -> 2.40 MB, full BZh9 block 10.97 -> 10.99
+MB, so the lazy zero pages are kept. Empty-stream call 11 -> 19 ns in the
+bench's fixed-cost row (noise-level, thread-local path unchanged).
