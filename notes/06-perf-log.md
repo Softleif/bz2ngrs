@@ -219,3 +219,37 @@ between runs, and the cells that moved more than 2% moved both ways (QUAL
 16k down, QUAL 1m up), so there is no change beyond noise. Absolute `ours`
 MB/s, median of 4: MC 16k 405.6 -> 400.5, MC 1m 437.4 -> 436.0, QUAL 1m
 1247.8 -> 1273.3. Empty-stream fixed cost 12 ns -> 11 ns.
+
+## `Decoder` owns the scratch (no thread-local), ours/C
+
+The scratch moved from a thread-local into `Decoder`, allocated on first
+decode; the free `decompress` was removed. The bench's "ours" is now one
+`Decoder` reused for the whole run (a thread-local in the bench holds it, so
+the call is still a plain `fn`). The decode path is the same code: the scratch
+is reached through `&mut self` instead of a `Cell::take`/`set` pair per call.
+
+Same command as the final table (`MC,XA,QUAL`, 16k/64k/1m, 5 rounds). The
+machine was heavily loaded (load average 80 to 340), so each side was run
+three times alternating, and runs with a disturbed cell (C's own MB/s off by
+more than 20%) were dropped. Per-run ours/C, two clean runs each, before (the
+thread-local, d363fd5) then after:
+
+| set | chunk | before | after |
+|---|---|---|---|
+| MC | 16k | 1.14, 1.12 | 1.12, 1.12 |
+| MC | 64k | 1.01, 1.01 | 0.99, 1.01 |
+| MC | 1m | 0.99, 1.00 | 0.97, 0.98 |
+| XA | 16k | 1.08, 1.09 | 1.06, 1.09 |
+| XA | 64k | 1.01, 1.01 | 0.99, 1.00 |
+| XA | 1m | 0.99, 1.00 | 0.99, 1.00 |
+| QUAL | 16k | 1.16, 1.16 | 1.15, 1.15 |
+| QUAL | 64k | 1.12, 1.12 | 1.11, 1.11 |
+| QUAL | 1m | 1.07, 1.08 | 1.07, 1.08 |
+
+MC 1m was the one marginal cell (0.97 to 1.00 on both sides), so it was
+repeated: 5 alternating pairs of `--sets MC --chunks 1m --rounds 7`, ours/C
+before 0.99 0.99 0.97 1.00 0.99, after 0.98 0.99 0.99 0.97 1.00 (the same
+spread on both sides, no difference). Empty-stream fixed cost, reused
+`Decoder`: 19, 16, 16 ns before, 17, 16, 16 ns after. A one-off
+`Decoder::new().decompress(..)` allocates and frees about 6 MiB per call and
+was not measured: callers that decode more than one stream keep a `Decoder`.

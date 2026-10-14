@@ -2,7 +2,7 @@
 
 Decode benchmark. Compares, on identical independent streams:
 
-1. `bz2ngrs::decompress` (`ours`)
+1. `bz2ngrs::Decoder::decompress` on one `Decoder` reused for the whole run (`ours`)
 2. the `bzip2` 0.6.1 crate, i.e. libbz2-rs-sys (`bzip2`)
 3. bz2-ng C (`C`), the target, linked in-process
 

@@ -2,7 +2,15 @@
 
 use std::io::Write;
 
-use crate::{__decompress_at, Error, Position, decompress};
+use crate::{Decoder, Error, Position};
+
+fn decompress(src: &[u8], out: &mut [u8]) -> Result<usize, Error> {
+    Decoder::new().decompress(src, out)
+}
+
+fn decompress_at(level: fearless_simd::Level, src: &[u8], out: &mut [u8]) -> Result<usize, Error> {
+    Decoder::__with_level(level).decompress(src, out)
+}
 
 fn levels() -> Vec<fearless_simd::Level> {
     let best = fearless_simd::Level::new();
@@ -37,7 +45,7 @@ fn check(data: &[u8], level: u32) {
     let c = compress(data, level);
     for lv in levels() {
         let mut out = vec![0xA5; data.len() + 7];
-        let n = __decompress_at(lv, &c, &mut out)
+        let n = decompress_at(lv, &c, &mut out)
             .unwrap_or_else(|e| panic!("{lv:?} level {level}: {e:?}"));
         assert_eq!(n, data.len(), "{lv:?} level {level}");
         assert!(out[..n] == *data, "{lv:?} level {level}: wrong output");
@@ -47,11 +55,11 @@ fn check(data: &[u8], level: u32) {
         );
         // Exact fit, and one byte short.
         let mut out = vec![0; data.len()];
-        assert_eq!(__decompress_at(lv, &c, &mut out), Ok(data.len()));
+        assert_eq!(decompress_at(lv, &c, &mut out), Ok(data.len()));
         if !data.is_empty() {
             let mut out = vec![0; data.len() - 1];
             assert_eq!(
-                __decompress_at(lv, &c, &mut out),
+                decompress_at(lv, &c, &mut out),
                 Err(Error::OutputTooSmall {
                     capacity: data.len() - 1
                 })
@@ -221,7 +229,7 @@ fn randomised_block() {
     assert_eq!(reference(&c), Ok(y.clone()));
     for lv in levels() {
         let mut out = vec![0; y.len()];
-        assert_eq!(__decompress_at(lv, &c, &mut out), Ok(y.len()));
+        assert_eq!(decompress_at(lv, &c, &mut out), Ok(y.len()));
         assert!(out == y);
     }
 }

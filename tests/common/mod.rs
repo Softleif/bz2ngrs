@@ -22,7 +22,7 @@ pub mod pinned {
 }
 
 /// Every property, against the decoders `$decoders` evaluates to. One
-/// invocation per surface (`decompress`, `__decompress_at`).
+/// invocation per surface (`Decoder::new()` and every level).
 #[allow(unused_macros)]
 macro_rules! surface_properties {
     ($decoders:expr) => {
@@ -191,6 +191,29 @@ macro_rules! surface_properties {
         #[hegel::test]
         fn failed_decode_leaves_no_state(tc: hegel::TestCase) {
             $crate::common::props::failure_leaves_no_state(&tc, &$decoders);
+        }
+
+        #[hegel::test(
+                                            test_cases = $crate::common::pinned::cases(100),
+                                            suppress_health_check = [hegel::HealthCheck::TooSlow]
+                                        )]
+        fn reuse_independent_of_earlier_calls(tc: hegel::TestCase) {
+            $crate::common::props::reuse_independent(&tc, &$decoders);
+        }
+
+        #[hegel::test]
+        fn to_vec_equals_oracle_with_actual_length(tc: hegel::TestCase) {
+            $crate::common::props::to_vec_equals_oracle(&tc, &$decoders);
+        }
+
+        #[hegel::test]
+        fn to_vec_below_actual_length_is_output_too_small(tc: hegel::TestCase) {
+            $crate::common::props::to_vec_too_small(&tc, &$decoders);
+        }
+
+        #[hegel::test]
+        fn to_vec_mutated_agrees_with_reference(tc: hegel::TestCase) {
+            $crate::common::props::to_vec_mutated_agrees(&tc, &$decoders);
         }
     };
 }
