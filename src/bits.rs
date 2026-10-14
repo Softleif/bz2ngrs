@@ -39,23 +39,11 @@ impl<'a> Bits<'a> {
     pub(crate) fn refill(&mut self) {
         let w = match self.src.get(self.pos..).and_then(|s| s.first_chunk::<8>()) {
             Some(b) => u64::from_be_bytes(*b),
-            None => self.tail_word(),
+            None => tail_word(self.src, self.pos),
         };
         self.buf |= w >> self.cnt;
         self.pos += ((63 - self.cnt) >> 3) as usize;
         self.cnt |= 56;
-    }
-
-    /// The 8 bytes at `pos` near or past the end, zero-padded.
-    #[cold]
-    #[inline(never)]
-    fn tail_word(&self) -> u64 {
-        let mut b = [0u8; 8];
-        if let Some(rest) = self.src.get(self.pos..) {
-            let k = rest.len().min(8);
-            b[..k].copy_from_slice(&rest[..k]);
-        }
-        u64::from_be_bytes(b)
     }
 
     /// Drops `n` (< 64) bits that are known to be valid.
@@ -107,6 +95,20 @@ impl<'a> Bits<'a> {
         self.buf = m.buf;
         self.cnt = m.cnt;
     }
+}
+
+/// The 8 bytes at `pos` near or past the end of `src`, zero-padded. Takes
+/// values, not the reader, so that the reader's address never escapes and
+/// its fields stay in registers.
+#[cold]
+#[inline(never)]
+fn tail_word(src: &[u8], pos: usize) -> u64 {
+    let mut b = [0u8; 8];
+    if let Some(rest) = src.get(pos..) {
+        let k = rest.len().min(8);
+        b[..k].copy_from_slice(&rest[..k]);
+    }
+    u64::from_be_bytes(b)
 }
 
 #[cfg(test)]

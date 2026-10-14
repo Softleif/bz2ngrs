@@ -7,6 +7,8 @@
 //! are unreachable, and in an incomplete set the unused patterns are no code.
 
 /// Primary table width in bits.
+use fearless_simd::{Simd, SimdBase, u16x8};
+
 const K: u32 = 11;
 /// Longest code bzip2 allows.
 pub(crate) const MAX_CODE: u32 = 20;
@@ -28,7 +30,8 @@ pub(crate) struct HTable {
 
 impl HTable {
     /// Builds the table for `lengths` (each 1..=20, at most 258 of them).
-    pub(crate) fn build(&mut self, lengths: &[u8]) {
+    #[inline(always)]
+    pub(crate) fn build<S: Simd>(&mut self, simd: S, lengths: &[u8]) {
         let mut count = [0u32; MAX_CODE as usize + 2];
         for &l in lengths {
             count[usize::from(l).min(MAX_CODE as usize + 1)] += 1;
@@ -74,7 +77,15 @@ impl HTable {
                 let sym = self.perm.get(first + k).copied().unwrap_or(0);
                 let e = (sym << 5) | l as u16;
                 if let Some(s) = self.prim.get_mut(pos..pos + span) {
-                    s.fill(e);
+                    // Spans are powers of two: whole 16-byte stores from 8 up.
+                    if span >= 8 {
+                        let v = u16x8::splat(simd, e);
+                        for c in s.as_chunks_mut::<8>().0 {
+                            v.store_slice(c);
+                        }
+                    } else {
+                        s.fill(e);
+                    }
                 }
                 pos += span;
             }
@@ -144,11 +155,15 @@ mod tests {
         (e >> 5, e & 31)
     }
 
+    fn build(t: &mut HTable, lens: &[u8]) {
+        fearless_simd::dispatch!(fearless_simd::Level::new(), simd => t.build(simd, lens));
+    }
+
     #[test]
     fn canonical_codes() {
         // lengths 2, 1, 3, 3 -> codes: sym1 = 0, sym0 = 10, sym2 = 110, sym3 = 111
         let mut t = HTable::default();
-        t.build(&[2, 1, 3, 3]);
+        build(&mut t, &[2, 1, 3, 3]);
         assert_eq!(code(&t, "0"), (1, 1));
         assert_eq!(code(&t, "10"), (0, 2));
         assert_eq!(code(&t, "110"), (2, 3));
@@ -161,7 +176,7 @@ mod tests {
         let mut lens = vec![1u8];
         lens.extend(12..=20u8);
         let mut t = HTable::default();
-        t.build(&lens);
+        build(&mut t, &lens);
         assert_eq!(code(&t, "0"), (0, 1));
         // first 12-bit code is 1000_0000_0000
         assert_eq!(code(&t, "100000000000"), (1, 12));
@@ -173,7 +188,7 @@ mod tests {
     fn oversubscribed_set_truncates() {
         // Three 1-bit codes: the third is unreachable.
         let mut t = HTable::default();
-        t.build(&[1, 1, 1]);
+        build(&mut t, &[1, 1, 1]);
         assert_eq!(code(&t, "0"), (0, 1));
         assert_eq!(code(&t, "1"), (1, 1));
     }
