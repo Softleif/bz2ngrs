@@ -78,7 +78,9 @@ fn run_length(tc: &TestCase) -> usize {
 }
 
 /// Runs of bytes (lengths around 4, 5, 255, 256, 259, and multiples), the
-/// RLE1 stage's boundaries.
+/// RLE1 stage's boundaries. libbz2's encoder ends a run at 255 bytes (four
+/// bytes and a count of at most 251), so a count byte of 252 to 255, which
+/// the decoder must also take, comes only from the forged streams.
 #[hegel::composite]
 pub fn runs(tc: &TestCase) -> Vec<u8> {
     let mut out = Vec::new();

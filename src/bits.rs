@@ -141,4 +141,52 @@ mod tests {
         }
         assert!(!b.overrun());
     }
+
+    /// The bit `i` of `src`, most significant first; zero past the end.
+    fn bit(src: &[u8], i: usize) -> u64 {
+        src.get(i / 8)
+            .map_or(0, |&x| u64::from((x >> (7 - i % 8)) & 1))
+    }
+
+    /// Reads of 1 to 32 bits give the bits of the input in order, zeros past
+    /// its end; `consumed` counts the bits taken and `overrun_by(k)` is set
+    /// exactly when they and `k` more pass the input.
+    #[hegel::test]
+    fn reads_follow_the_bit_string(tc: hegel::TestCase) {
+        use hegel::generators as gs;
+        let src = tc.draw(gs::binary().max_size(40));
+        let widths =
+            tc.draw(gs::vecs(gs::integers::<u32>().min_value(1).max_value(32)).max_size(80));
+        let extra = tc.draw(gs::integers::<u64>().max_value(70));
+        let mut b = Bits::new(&src);
+        let mut at = 0usize;
+        for w in widths {
+            let want = (at..at + w as usize).fold(0u64, |acc, i| acc << 1 | bit(&src, i));
+            assert_eq!(u64::from(b.get(w)), want, "read of {w} bits at {at}");
+            at += w as usize;
+            let len_bits = src.len() as u64 * 8;
+            assert_eq!(b.consumed(), at as u64);
+            assert_eq!(b.overrun(), at as u64 > len_bits);
+            assert_eq!(b.overrun_by(extra), at as u64 + extra > len_bits);
+        }
+    }
+
+    /// Resetting to a mark replays the same bits.
+    #[hegel::test]
+    fn reset_replays_the_reads(tc: hegel::TestCase) {
+        use hegel::generators as gs;
+        let src = tc.draw(gs::binary().max_size(40));
+        let before = tc.draw(gs::integers::<u32>().min_value(1).max_value(32));
+        let widths =
+            tc.draw(gs::vecs(gs::integers::<u32>().min_value(1).max_value(32)).max_size(20));
+        let mut b = Bits::new(&src);
+        b.get(before);
+        let mark = b.mark();
+        let first: Vec<u32> = widths.iter().map(|&w| b.get(w)).collect();
+        let consumed = b.consumed();
+        b.reset(mark);
+        let second: Vec<u32> = widths.iter().map(|&w| b.get(w)).collect();
+        assert_eq!(first, second);
+        assert_eq!(b.consumed(), consumed);
+    }
 }

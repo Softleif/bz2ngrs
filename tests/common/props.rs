@@ -9,7 +9,7 @@ use bz2ngrs::{Corruption, Error, Position};
 use hegel::TestCase;
 use hegel::generators::{self as gs, PrintableGenerator};
 
-use super::forge::{Spec, block_crc, forge, naive_block};
+use super::forge::{self, Broken, Rule, Spec, block_crc, forge, naive_block};
 use super::inputs;
 use super::oracle::{
     Decoder, Reference, block_starts, check_against_reference, check_exact, check_outcome,
@@ -61,7 +61,12 @@ pub fn roundtrip_pieces(tc: &TestCase, decoders: &[Decoder]) {
 #[allow(clippy::panic, reason = "a failed property is a panic")]
 pub fn larger_out(tc: &TestCase, decoders: &[Decoder]) {
     let v = tc.draw(inputs::valid_stream());
-    let extra = 1 + below(tc, 70_000);
+    // Slack of a few bytes (the run fills overshoot by up to 288) or a lot.
+    let extra = 1 + if tc.draw(gs::booleans()) {
+        below(tc, 300)
+    } else {
+        below(tc, 70_000)
+    };
     for d in decoders {
         let mut out = vec![0xA5; v.data.len() + extra];
         match d.run(&v.stream, &mut out) {
@@ -84,7 +89,11 @@ pub fn larger_out(tc: &TestCase, decoders: &[Decoder]) {
 pub fn short_out(tc: &TestCase, decoders: &[Decoder]) {
     let v = tc.draw(inputs::valid_stream());
     tc.assume(!v.data.is_empty());
-    let k = tc.draw(gs::integers::<usize>().min_value(1).max_value(v.data.len()));
+    let k = if tc.draw(gs::booleans()) {
+        1 + below(tc, v.data.len().min(8))
+    } else {
+        tc.draw(gs::integers::<usize>().min_value(1).max_value(v.data.len()))
+    };
     for d in decoders {
         let capacity = v.data.len() - k;
         let mut out = vec![0xA5; capacity];
@@ -373,20 +382,40 @@ pub fn forged_agrees(tc: &TestCase, decoders: &[Decoder], spec: impl PrintableGe
     }
 }
 
-/// Property 7: Reject, forged streams whose last block is invalid in the block
-/// header (`origPtr` not below the row count, more rows than the digit allows)
-/// are `Err(Corrupt)` of the given kind, in that block, as libbz2's data
-/// error. The earlier blocks are valid (the property discards the cases where
-/// they are not), so the block index is the one the spec put the defect in.
+fn corruption(rule: Rule) -> Corruption {
+    match rule {
+        Rule::OrigPtr => Corruption::OrigPtr,
+        Rule::BlockTooLong => Corruption::BlockTooLong,
+        Rule::BlockMagic => Corruption::BlockMagic,
+        Rule::NoSymbols => Corruption::NoSymbols,
+        Rule::GroupCount => Corruption::GroupCount,
+        Rule::SelectorCount => Corruption::SelectorCount,
+        Rule::Selector => Corruption::Selector,
+        Rule::CodeLength => Corruption::CodeLength,
+        Rule::HuffmanCode => Corruption::HuffmanCode,
+        Rule::NoEndOfBlock => Corruption::NoEndOfBlock,
+        Rule::RunTooLong => Corruption::RunTooLong,
+    }
+}
+
+/// Property 7: Reject, forged streams whose last block breaks one format rule
+/// (`origPtr` not below the row count, more rows than the digit allows, a
+/// defect in the block header or symbols) are `Err(Corrupt)` of the matching
+/// kind, in that block, as libbz2's data error. The earlier blocks are valid
+/// (the property discards the cases where they are not), so the block index
+/// is the one the spec put the defect in. The bit is at or just after the
+/// offending field: no earlier than where the field starts, and no later than
+/// 21 bits (the most libbz2 reads of a Huffman code) past where it ends.
 #[allow(clippy::panic, reason = "a failed property is a panic")]
 pub fn forged_is_corrupt(
     tc: &TestCase,
     decoders: &[Decoder],
-    spec: impl PrintableGenerator<Spec>,
-    want: Corruption,
+    broken: impl PrintableGenerator<Broken>,
 ) {
-    let spec = tc.draw(spec);
+    let Broken { spec, rule } = tc.draw(broken);
+    let want = corruption(rule);
     let f = forge(&spec);
+    tc.assume(f.applied);
     let bad_block = spec.blocks.len() as u32 - 1;
     // A forged block is not always valid (four equal bytes at its very end
     // are not), so the prefix is checked with the naive reference.
@@ -397,19 +426,65 @@ pub fn forged_is_corrupt(
     );
     let libbz2 = reference(&f.stream, f.cap);
     assert!(
-        f.expected.is_none() && matches!(libbz2, Reference::Err(_)),
+        f.expected.is_none() && matches!(libbz2, Reference::Err(std::io::ErrorKind::InvalidInput)),
         "premise: the naive reference and libbz2 reject ({})",
         describe(&libbz2)
     );
+    let (lo, hi) = f
+        .field
+        .map_or((f.last_block_bit, u64::MAX), |(a, b)| (a, b + 21));
+    let hi = hi.min(f.stream.len() as u64 * 8);
     for d in decoders {
         let mut out = vec![0xA5; f.cap];
         match d.run(&f.stream, &mut out) {
             Err(Error::Corrupt { kind, at }) => {
                 assert_eq!(kind, want, "{}", d.name());
                 assert_eq!(at.block, bad_block, "{}", d.name());
+                assert!(
+                    (lo..=hi).contains(&at.bit),
+                    "{}: bit {} outside {lo}..={hi}",
+                    d.name(),
+                    at.bit
+                );
             }
-            other => panic!("{}: expected Corrupt, got {other:?}", d.name()),
+            other => panic!("{}: expected Corrupt({want:?}), got {other:?}", d.name()),
         }
+    }
+}
+
+/// Property 7: Accept, a block with more selectors than libbz2 keeps (it
+/// reads up to 32767 and ignores those past 18002) decodes like the same block
+/// without them.
+pub fn forged_excess_selectors(tc: &TestCase, decoders: &[Decoder]) {
+    let f = forge(&tc.draw(forge::excess_selectors()));
+    tc.assume(f.expected.is_some());
+    let want = f.expected.unwrap_or_default();
+    assert!(
+        matches!(reference(&f.stream, f.cap), Reference::Ok(ref got) if *got == want),
+        "premise: libbz2 decodes the block"
+    );
+    for d in decoders {
+        check_exact(*d, &f.stream, &want);
+    }
+}
+
+/// Property 7: Reject, a defective stream cut off at a random point, around
+/// the defect or anywhere from the defective block on: whether the cut falls
+/// before the decoder can tell (`UnexpectedEof`) or after (the defect's own
+/// error) is libbz2's call, by its error class.
+pub fn forged_defect_cut_agrees(tc: &TestCase, decoders: &[Decoder]) {
+    let b = tc.draw(forge::any_defective());
+    let f = forge(&b.spec);
+    let total = f.stream.len();
+    let first = (f.last_block_bit / 8) as usize;
+    let (lo, hi) = match f.field {
+        Some((a, e)) if tc.draw(gs::booleans()) => ((a / 8) as usize, (e / 8) as usize + 4),
+        _ => (first, total),
+    };
+    let hi = hi.min(total);
+    let cut = lo.min(hi) + below(tc, hi.saturating_sub(lo) + 1);
+    for d in decoders {
+        tc.event(check_against_reference(*d, &f.stream[..cut], f.cap));
     }
 }
 
@@ -504,7 +579,7 @@ pub fn reuse_independent(tc: &TestCase, decoders: &[Decoder]) {
                     s.what
                 );
             }
-            check_outcome(&d.name(), want, &got, &out, s.cap);
+            check_outcome(&d.name(), &s.stream, want, &got, &out, s.cap);
         }
     }
 }
@@ -521,13 +596,16 @@ pub fn to_vec_equals_oracle(tc: &TestCase, decoders: &[Decoder]) {
         below(tc, 70_000)
     };
     let size = v.data.len() + extra;
-    let Reference::Ok(want) = reference(&v.stream, size) else {
-        panic!("premise: libbz2 decodes a valid stream");
-    };
+    assert!(
+        matches!(reference(&v.stream, size), Reference::Ok(ref got) if *got == v.data),
+        "premise: libbz2 decodes a valid stream to its data"
+    );
     for d in decoders {
         let got = d.run_to_vec(&v.stream, size);
-        assert_eq!(got.as_deref(), Ok(&want[..]), "{}: size {size}", d.name());
-        assert_eq!(got.map(|g| g.len()), Ok(v.data.len()), "{}", d.name());
+        assert_eq!(got.as_deref(), Ok(&v.data[..]), "{}: size {size}", d.name());
+        // "The `Vec` keeps capacity `size` even when shorter."
+        let capacity = got.map(|g| g.capacity());
+        assert!(capacity.is_ok_and(|c| c >= size), "{}: {capacity:?}", d.name());
     }
 }
 
@@ -536,7 +614,11 @@ pub fn to_vec_equals_oracle(tc: &TestCase, decoders: &[Decoder]) {
 pub fn to_vec_too_small(tc: &TestCase, decoders: &[Decoder]) {
     let v = tc.draw(inputs::valid_stream());
     tc.assume(!v.data.is_empty());
-    let k = tc.draw(gs::integers::<usize>().min_value(1).max_value(v.data.len()));
+    let k = if tc.draw(gs::booleans()) {
+        1 + below(tc, v.data.len().min(8))
+    } else {
+        tc.draw(gs::integers::<usize>().min_value(1).max_value(v.data.len()))
+    };
     let size = v.data.len() - k;
     for d in decoders {
         assert_eq!(
@@ -559,6 +641,7 @@ pub fn to_vec_mutated_agrees(tc: &TestCase, decoders: &[Decoder]) {
         let n = got.as_ref().map(Vec::len).map_err(|e| *e);
         tc.event(check_outcome(
             &d.name(),
+            &m.stream,
             &want,
             &n,
             got.as_deref().unwrap_or(&[]),

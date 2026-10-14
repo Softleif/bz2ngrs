@@ -21,6 +21,27 @@ pub mod pinned {
     }
 }
 
+/// One property per header rule: a forged block that breaks just that rule is
+/// `Corrupt` of that kind.
+#[allow(unused_macros)]
+macro_rules! header_defect_properties {
+    ($decoders:expr; $($name:ident: $rule:ident,)*) => {
+        $(
+            #[hegel::test(
+                test_cases = $crate::common::pinned::cases(1000),
+                suppress_health_check = [hegel::HealthCheck::TooSlow]
+            )]
+            fn $name(tc: hegel::TestCase) {
+                $crate::common::props::forged_is_corrupt(
+                    &tc,
+                    &$decoders,
+                    $crate::common::forge::defective($crate::common::forge::Rule::$rule),
+                );
+            }
+        )*
+    };
+}
+
 /// Every property, against the decoders `$decoders` evaluates to. One
 /// invocation per surface (`Decoder::new()` and every level).
 #[allow(unused_macros)]
@@ -171,7 +192,6 @@ macro_rules! surface_properties {
                 &tc,
                 &$decoders,
                 $crate::common::forge::bad_orig_ptr_last(),
-                bz2ngrs::Corruption::OrigPtr,
             );
         }
 
@@ -184,8 +204,59 @@ macro_rules! surface_properties {
                 &tc,
                 &$decoders,
                 $crate::common::forge::oversize_block(),
-                bz2ngrs::Corruption::BlockTooLong,
             );
+        }
+
+        #[hegel::test(
+            test_cases = $crate::common::pinned::cases(1500),
+            suppress_health_check = [hegel::HealthCheck::TooSlow]
+        )]
+        fn forged_run_length_boundary_is_run_too_long_from_22_symbols(tc: hegel::TestCase) {
+            $crate::common::props::forged_is_corrupt(
+                &tc,
+                &$decoders,
+                $crate::common::forge::run_boundary(),
+            );
+        }
+
+        #[hegel::test(
+            test_cases = $crate::common::pinned::cases(30),
+            suppress_health_check = [hegel::HealthCheck::TooSlow]
+        )]
+        fn forged_largest_block_agrees_with_reference(tc: hegel::TestCase) {
+            $crate::common::props::forged_agrees(
+                &tc,
+                &$decoders,
+                $crate::common::forge::largest_block(),
+            );
+        }
+
+        #[hegel::test(
+            test_cases = $crate::common::pinned::cases(1500),
+            suppress_health_check = [hegel::HealthCheck::TooSlow]
+        )]
+        fn forged_excess_selectors_are_ignored(tc: hegel::TestCase) {
+            $crate::common::props::forged_excess_selectors(&tc, &$decoders);
+        }
+
+        #[hegel::test(
+            test_cases = $crate::common::pinned::cases(2000),
+            suppress_health_check = [hegel::HealthCheck::TooSlow]
+        )]
+        fn forged_defect_cut_off_agrees_with_reference(tc: hegel::TestCase) {
+            $crate::common::props::forged_defect_cut_agrees(&tc, &$decoders);
+        }
+
+        header_defect_properties! {
+            $decoders;
+            forged_bad_block_magic_is_corrupt_block_magic: BlockMagic,
+            forged_empty_symbol_map_is_corrupt_no_symbols: NoSymbols,
+            forged_table_count_out_of_range_is_corrupt_group_count: GroupCount,
+            forged_zero_selectors_is_corrupt_selector_count: SelectorCount,
+            forged_selector_beyond_tables_is_corrupt_selector: Selector,
+            forged_code_length_out_of_range_is_corrupt_code_length: CodeLength,
+            forged_unassigned_code_is_corrupt_huffman_code: HuffmanCode,
+            forged_missing_end_of_block_is_corrupt_no_end_of_block: NoEndOfBlock,
         }
 
         #[hegel::test]

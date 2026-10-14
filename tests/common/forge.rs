@@ -35,6 +35,10 @@ pub enum Shape {
     Runs,
     /// The BWT of a run-heavy text, so `L` looks like real data.
     Text,
+    /// A few distinct symbols in a fixed cycle: no two neighbours are equal,
+    /// so every row is a literal symbol of its own (a block of 900 000 rows
+    /// needs 18 001 selectors).
+    Cycle,
 }
 
 /// Everything needed to write one block and to rebuild its `L`.
@@ -50,6 +54,64 @@ pub struct Recipe {
     /// Per Huffman table, how far its code length lies above the minimum.
     pub table_extra: Vec<u8>,
     pub selector_seed: u64,
+    /// Selectors written beyond the ones the symbols need. libbz2 1.0.8 reads
+    /// up to 32767 and keeps at most 18002.
+    pub extra_selectors: u32,
+    /// Code lengths that differ within a table (canonical Huffman codes),
+    /// rather than one length for every symbol.
+    pub varied: bool,
+    /// A defect written into the block's header or symbols; the stream is
+    /// otherwise valid.
+    pub defect: Option<Defect>,
+}
+
+const BLOCK_MAGIC: u64 = 0x3141_5926_5359;
+const END_MAGIC: u64 = 0x1772_4538_5090;
+
+/// What is wrong with a block. Each one breaks exactly one format rule, at a
+/// place libbz2 reads before any later rule can fire.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Defect {
+    /// This 48-bit value, neither magic, where the block magic belongs.
+    Magic(u64),
+    /// An empty symbol map.
+    NoSymbols,
+    /// This table count (0, 1 or 7), outside 2 to 6.
+    TableCount(u8),
+    /// A selector count of 0.
+    NoSelectors,
+    /// A selector whose unary code has `tables` or more ones.
+    SelectorBeyondTables,
+    /// A first code length of 0 or 21 to 31.
+    CodeStart(u8),
+    /// A code length stepped down from 1 to 0.
+    CodeBelow,
+    /// A code length stepped up from 20 to 21.
+    CodeAbove,
+    /// A symbol coded with a bit pattern no code of its table has.
+    UnassignedCode,
+    /// The end-of-block symbol left out, and the symbols padded to fill the
+    /// last selector's group of 50.
+    NoEndOfBlock,
+    /// This many RUNB symbols in a row at the start of the block.
+    Run(u32),
+}
+
+/// The rule a defect breaks (the `Corruption` kinds that forged streams can
+/// reach), named here so that this module does not depend on the crate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Rule {
+    OrigPtr,
+    BlockTooLong,
+    BlockMagic,
+    NoSymbols,
+    GroupCount,
+    SelectorCount,
+    Selector,
+    CodeLength,
+    HuffmanCode,
+    NoEndOfBlock,
+    RunTooLong,
 }
 
 impl Recipe {
@@ -81,6 +143,12 @@ impl Recipe {
                 l
             }
             Shape::Runs => runs(&mut rng, self.n),
+            Shape::Cycle => {
+                let period = 2 + (self.seed >> 8) as usize % 7;
+                (0..self.n)
+                    .map(|i| (((i % period) * stride + offset) % 256) as u8)
+                    .collect()
+            }
             Shape::Text => {
                 let text = runs(&mut rng, self.n);
                 let mut starts: Vec<usize> = (0..text.len()).collect();
@@ -120,6 +188,17 @@ pub fn block_crc(data: &[u8]) -> u32 {
 /// case libbz2 first emits the run and a count byte read from past the end of
 /// the block, so the bytes are a prefix of what libbz2 writes before failing.
 pub fn naive_block(l: &[u8], orig_ptr: usize, randomised: bool) -> (Vec<u8>, bool) {
+    naive_block_with(l, orig_ptr, randomised, None)
+}
+
+/// [`naive_block`] with the count byte of a run of four at the very end of the
+/// block taken to be `past_end` instead of the byte libbz2 reads there.
+pub fn naive_block_with(
+    l: &[u8],
+    orig_ptr: usize,
+    randomised: bool,
+    past_end: Option<u8>,
+) -> (Vec<u8>, bool) {
     let n = l.len();
     if orig_ptr >= n {
         return (Vec::new(), false);
@@ -145,7 +224,7 @@ pub fn naive_block(l: &[u8], orig_ptr: usize, randomised: bool) -> (Vec<u8>, boo
         row = next[row];
     }
     // The extra symbol is the one libbz2 reads past the block's end.
-    let past_end = text.pop().unwrap_or_default();
+    let past_end = past_end.unwrap_or(text.pop().unwrap_or_default());
     if randomised {
         let mut at = 0usize;
         for &step in RAND_NUMS.iter().cycle() {
@@ -195,6 +274,11 @@ impl Bits {
     fn put48(&mut self, v: u64) {
         self.put((v >> 24) as u32, 24);
         self.put(v as u32 & 0xFF_FFFF, 24);
+    }
+
+    /// Bits written so far.
+    fn pos(&self) -> u64 {
+        self.out.len() as u64 * 8 + u64::from(self.n)
     }
 
     fn finish(mut self) -> Vec<u8> {
@@ -269,17 +353,108 @@ const RAND_NUMS: [u16; 512] = [
     857, 265, 203, 50, 668, 108, 645, 990, 626, 197, 510, 357, 358, 850, 858, 364, 936, 638,
 ];
 
+/// Code lengths (1 to 20) of a prefix code over `alpha` symbols: the leaves
+/// of a random binary tree, so a complete code, a quarter of the time with
+/// some lengthened by one, so an incomplete one. Shuffled over the symbols.
+fn varied_lens(rng: &mut Rng, alpha: usize) -> Vec<u32> {
+    let mut lens = vec![1u32, 1];
+    while lens.len() < alpha {
+        let i = (rng.next() >> 8) as usize % lens.len();
+        if lens[i] < 20 {
+            lens[i] += 1;
+            lens.push(lens[i]);
+        }
+    }
+    for i in (1..lens.len()).rev() {
+        lens.swap(i, (rng.next() >> 8) as usize % (i + 1));
+    }
+    if rng.next() & 3 == 0 {
+        for l in &mut lens {
+            if *l < 20 && rng.next().is_multiple_of(8) {
+                *l += 1;
+            }
+        }
+    }
+    lens
+}
+
+/// The canonical code of each symbol (libbz2's `BZ2_hbAssignCodes`): by
+/// length, then by symbol, each code one more than the last, shifted up at
+/// every step in length.
+fn canonical(lens: &[u32]) -> Vec<u32> {
+    let mut codes = vec![0u32; lens.len()];
+    let mut code = 0u32;
+    for len in 1..=20 {
+        for (sym, &l) in lens.iter().enumerate() {
+            if l == len {
+                codes[sym] = code;
+                code += 1;
+            }
+        }
+        code <<= 1;
+    }
+    codes
+}
+
+/// What [`write_block`] did.
+struct Written {
+    /// Whether the recipe's defect took effect (some need a block of a
+    /// certain shape and are not written otherwise).
+    applied: bool,
+    /// Where in the stream the defect sits: the bit it starts at and the bit
+    /// after its last.
+    field: Option<(u64, u64)>,
+}
+
 /// Writes one block. `crc` is its stored CRC.
-fn write_block(bits: &mut Bits, r: &Recipe, l: &[u8], crc: u32) {
-    let (used, syms) = mtf_symbols(l);
-    bits.put48(0x3141_5926_5359);
+fn write_block(bits: &mut Bits, r: &Recipe, l: &[u8], crc: u32) -> Written {
+    let (used, mut syms) = mtf_symbols(l);
+    let alpha = used.len() as u32 + 2;
+    let min_len = (alpha - 1).ilog2() + 1;
+    let tables = r.table_extra.len() as u32;
+    let mut applied = true;
+    let mut field = None;
+
+    // The run goes where it cannot join a run of the block's own.
+    let mut run_at = 0;
+    match r.defect {
+        Some(Defect::Run(k)) => {
+            let at = (0..syms.len()).find(|&p| syms[p] >= 2 && (p == 0 || syms[p - 1] >= 2));
+            applied = at.is_some();
+            run_at = at.unwrap_or_default();
+            syms.splice(run_at..run_at, std::iter::repeat_n(1u16, k as usize));
+        }
+        Some(Defect::NoEndOfBlock) => {
+            syms.pop();
+            applied = used.len() >= 2;
+            // Literals (MTF index 1) up to a whole last group.
+            while applied && (syms.len() % 50 != 0 || syms.is_empty()) {
+                syms.push(2);
+            }
+        }
+        _ => {}
+    }
+
+    let at = bits.pos();
+    bits.put48(match r.defect {
+        Some(Defect::Magic(m)) => m,
+        _ => BLOCK_MAGIC,
+    });
+    if matches!(r.defect, Some(Defect::Magic(_))) {
+        field = Some((at, bits.pos()));
+    }
     bits.put(crc, 32);
     bits.put(u32::from(r.randomised), 1);
     bits.put(r.orig_ptr, 24);
 
+    let at = bits.pos();
     let mut groups = 0u32;
     for &u in &used {
         groups |= 1 << (15 - u / 16);
+    }
+    if r.defect == Some(Defect::NoSymbols) {
+        groups = 0;
+        field = Some((at, at + 16));
     }
     bits.put(groups, 16);
     for g in 0..16u8 {
@@ -292,43 +467,104 @@ fn write_block(bits: &mut Bits, r: &Recipe, l: &[u8], crc: u32) {
         }
     }
 
-    let alpha = used.len() as u32 + 2;
-    let min_len = (alpha - 1).ilog2() + 1;
-    let tables = r.table_extra.len() as u32;
-    let lens: Vec<u32> = r
+    // Per table and symbol, the code length: all the same (a flat code), or
+    // varied. A flat code longer than needed leaves bit patterns unassigned.
+    let varied = r.varied && r.defect != Some(Defect::UnassignedCode);
+    let lens: Vec<Vec<u32>> = r
         .table_extra
         .iter()
-        .map(|&x| {
-            min_len
-                + if x < 128 {
-                    0
-                } else {
-                    u32::from(x) % (21 - min_len)
+        .enumerate()
+        .map(|(t, &x)| {
+            if varied {
+                varied_lens(
+                    &mut Rng(r.seed ^ ((t as u64 + 1) << 40) ^ u64::from(x)),
+                    alpha as usize,
+                )
+            } else {
+                let mut len = min_len;
+                if x >= 128 {
+                    len += u32::from(x) % (21 - min_len);
                 }
+                if r.defect == Some(Defect::UnassignedCode) {
+                    len = len.max(min_len + 1);
+                }
+                vec![len; alpha as usize]
+            }
         })
         .collect();
+    let codes: Vec<Vec<u32>> = lens.iter().map(|l| canonical(l)).collect();
+
     let n_sel = syms.len().div_ceil(50);
-    bits.put(tables, 3);
-    bits.put(n_sel as u32, 15);
+    let n_written = (n_sel + r.extra_selectors as usize).min(32767);
+    let at = bits.pos();
+    bits.put(
+        match r.defect {
+            Some(Defect::TableCount(t)) => u32::from(t),
+            _ => tables,
+        },
+        3,
+    );
+    if matches!(r.defect, Some(Defect::TableCount(_))) {
+        field = Some((at, bits.pos()));
+    }
+    let at = bits.pos();
+    let declared = if r.defect == Some(Defect::NoSelectors) {
+        0
+    } else {
+        n_written as u32
+    };
+    bits.put(declared, 15);
+    if r.defect == Some(Defect::NoSelectors) {
+        field = Some((at, bits.pos()));
+    }
+    let bad_selector = (r.selector_seed >> 33) as usize % n_written;
     let mut rng = Rng(r.selector_seed);
     let mut order: Vec<u32> = (0..tables).collect();
-    let mut selectors = Vec::with_capacity(n_sel);
-    for _ in 0..n_sel {
+    let mut selectors = Vec::with_capacity(n_written);
+    for i in 0..n_written {
         let s = (rng.next() >> 8) as u32 % tables;
         let pos = order.iter().position(|&x| x == s).unwrap_or_default();
         order.remove(pos);
         order.insert(0, s);
-        for _ in 0..pos {
+        let at = bits.pos();
+        let ones = if r.defect == Some(Defect::SelectorBeyondTables) && i == bad_selector {
+            tables + (r.selector_seed >> 20) as u32 % 3
+        } else {
+            pos as u32
+        };
+        for _ in 0..ones {
             bits.put(1, 1);
         }
         bits.put(0, 1);
+        if ones >= tables {
+            field = Some((at, bits.pos()));
+        }
         selectors.push(s as usize);
     }
-    for (t, &len) in lens.iter().enumerate() {
+
+    for (t, tl) in lens.iter().enumerate() {
+        let at = bits.pos();
+        let bad = match (t, r.defect) {
+            (0, Some(Defect::CodeStart(v))) => Some((u32::from(v), 5, None)),
+            (0, Some(Defect::CodeBelow)) => Some((1, 5, Some(0b11))),
+            (0, Some(Defect::CodeAbove)) => Some((20, 5, Some(0b10))),
+            _ => None,
+        };
+        if let Some((start, width, step)) = bad {
+            bits.put(start, width);
+            if let Some(step) = step {
+                bits.put(step, 2);
+            }
+            for _ in 0..alpha {
+                bits.put(0, 1);
+            }
+            field = Some((at, bits.pos()));
+            continue;
+        }
         // Starting away from the target exercises the delta coding.
         let mut cur = 1 + (u32::from(r.table_extra[t]) * 7 + 3) % 20;
         bits.put(cur, 5);
-        for _ in 0..alpha {
+        for &len in tl {
             while cur != len {
                 bits.put(if cur < len { 0b10 } else { 0b11 }, 2);
                 cur = if cur < len { cur + 1 } else { cur - 1 };
@@ -336,9 +572,41 @@ fn write_block(bits: &mut Bits, r: &Recipe, l: &[u8], crc: u32) {
             bits.put(0, 1);
         }
     }
+
+    let bad_symbol = (r.selector_seed >> 7) as usize % syms.len();
+    let mut last_group_at = 0;
+    let (mut run_start, mut run_end) = (0, 0);
     for (i, &s) in syms.iter().enumerate() {
-        bits.put(u32::from(s), lens[selectors[i / 50]]);
+        let at = bits.pos();
+        let t = selectors[i / 50];
+        if i == (n_sel - 1) * 50 {
+            last_group_at = at;
+        }
+        if r.defect == Some(Defect::UnassignedCode) && i == bad_symbol {
+            let len = lens[t][0];
+            let v = alpha + (r.selector_seed >> 40) as u32 % ((1 << len) - alpha);
+            bits.put(v, len);
+            field = Some((at, bits.pos()));
+        } else {
+            bits.put(codes[t][usize::from(s)], lens[t][usize::from(s)]);
+        }
+        if let Some(Defect::Run(k)) = r.defect {
+            if i == run_at {
+                run_start = at;
+            }
+            if i == run_at + k as usize {
+                run_end = bits.pos();
+            }
+        }
     }
+    match r.defect {
+        Some(Defect::NoEndOfBlock) => field = Some((last_group_at, bits.pos())),
+        // The error comes at the 22nd symbol of the run, or at the symbol
+        // after it.
+        Some(Defect::Run(_)) => field = Some((run_start, run_end)),
+        _ => {}
+    }
+    Written { applied, field }
 }
 
 /// A forged stream and what both oracles must make of it.
@@ -348,6 +616,12 @@ pub struct Forged {
     pub expected: Option<Vec<u8>>,
     /// An output capacity that no byte libbz2 writes before failing exceeds.
     pub cap: usize,
+    /// Whether every defect in the spec took effect.
+    pub applied: bool,
+    /// The bit the last block begins at.
+    pub last_block_bit: u64,
+    /// The bit range of the last defect written.
+    pub field: Option<(u64, u64)>,
 }
 
 /// Writes the blocks of `spec`, each with a correct CRC for what it decodes
@@ -362,22 +636,35 @@ pub fn forge(spec: &Spec) -> Forged {
     };
     bits.put(u32::from(b'0' + spec.digit), 8);
     let (mut combined, mut data, mut valid, mut cap) = (0u32, Vec::new(), true, 1);
+    let (mut applied, mut last_block_bit, mut field) = (true, 0, None);
     for r in &spec.blocks {
         let l = r.column();
         let (out, ok) = naive_block(&l, r.orig_ptr as usize, r.randomised);
-        valid &= ok && l.len() <= max_rows(spec.digit);
-        let crc = block_crc(&naive_block(&l, r.orig_ptr as usize % l.len(), r.randomised).0);
-        write_block(&mut bits, r, &l, crc);
+        valid &= ok && l.len() <= max_rows(spec.digit) && r.defect.is_none();
+        // For a block that ends in four equal bytes, half the time the CRC is
+        // that of the bytes before the missing count, so that a decoder that
+        // took the count to be 0 would see a CRC that fits; the other half it
+        // is that of what libbz2 writes, count and all.
+        let count = (r.seed & 1 == 1).then_some(0);
+        let crc =
+            block_crc(&naive_block_with(&l, r.orig_ptr as usize % l.len(), r.randomised, count).0);
+        last_block_bit = bits.pos();
+        let w = write_block(&mut bits, r, &l, crc);
+        applied &= w.applied;
+        field = w.field.or(field);
         combined = combined.rotate_left(1) ^ crc;
         cap += out.len() + 260;
         data.extend(out);
     }
-    bits.put48(0x1772_4538_5090);
+    bits.put48(END_MAGIC);
     bits.put(combined, 32);
     Forged {
         stream: bits.finish(),
         expected: valid.then_some(data),
         cap,
+        applied,
+        last_block_bit,
+        field,
     }
 }
 
@@ -459,6 +746,7 @@ pub fn recipe(tc: &TestCase, digit: u8, cap: usize, class: OrigClass) -> Recipe 
         Shape::Sorted,
         Shape::Runs,
         Shape::Text,
+        Shape::Cycle,
     ]));
     let mut n = rows(tc, cap.min(max_rows(digit)));
     if shape == Shape::Text {
@@ -469,6 +757,13 @@ pub fn recipe(tc: &TestCase, digit: u8, cap: usize, class: OrigClass) -> Recipe 
         1 => tc.draw(gs::sampled_from(vec![4usize, 16, 17, 255, 256])),
         _ => 1 + below(tc, 256),
     };
+    // Selectors past what the symbols need: none, a few, or enough to pass the
+    // 18002 libbz2 keeps.
+    let extra_selectors = match tc.draw(gs::integers::<u8>().max_value(7)) {
+        0..=4 => 0,
+        5 => 1 + below(tc, 100) as u32,
+        _ => 18_003 + below(tc, 14_000) as u32,
+    };
     Recipe {
         n,
         shape,
@@ -478,6 +773,9 @@ pub fn recipe(tc: &TestCase, digit: u8, cap: usize, class: OrigClass) -> Recipe 
         randomised: tc.draw(gs::booleans()),
         table_extra: tc.draw(gs::vecs(gs::integers::<u8>()).min_size(2).max_size(6)),
         selector_seed: tc.draw(gs::integers::<u64>()),
+        extra_selectors,
+        varied: tc.draw(gs::booleans()),
+        defect: None,
     }
 }
 
@@ -504,21 +802,59 @@ pub fn several_blocks(tc: &TestCase) -> Spec {
     Spec { digit, blocks }
 }
 
+/// One block of 899 950 to 900 000 rows at digit 9, every row a literal
+/// symbol, so 18 000 to 18 001 selectors: the most a block can need.
+#[hegel::composite]
+pub fn largest_block(tc: &TestCase) -> Spec {
+    let mut r = tc.draw(recipe(9, 3000, OrigClass::Any));
+    r.shape = Shape::Cycle;
+    r.n = max_rows(9) - below(tc, 51);
+    r.orig_ptr = origin(tc, r.n, max_rows(9), OrigClass::InRange);
+    r.extra_selectors = 0;
+    Spec {
+        digit: 9,
+        blocks: vec![r],
+    }
+}
+
+/// A valid block with more selectors than libbz2 keeps: every one past 18002
+/// is read and ignored.
+#[hegel::composite]
+pub fn excess_selectors(tc: &TestCase) -> Spec {
+    let digit = digit(tc);
+    let mut r = tc.draw(recipe(digit, 3000, OrigClass::InRange));
+    r.extra_selectors = 18_003 + below(tc, 14_000) as u32;
+    Spec {
+        digit,
+        blocks: vec![r],
+    }
+}
+
+/// A spec whose last block breaks `rule`, and that rule.
+#[derive(Debug, Clone)]
+pub struct Broken {
+    pub spec: Spec,
+    pub rule: Rule,
+}
+
 /// Zero to three valid blocks, then one whose `origPtr` is out of range.
 #[hegel::composite]
-pub fn bad_orig_ptr_last(tc: &TestCase) -> Spec {
+pub fn bad_orig_ptr_last(tc: &TestCase) -> Broken {
     let digit = digit(tc);
     let mut blocks: Vec<Recipe> = (0..below(tc, 4))
         .map(|_| tc.draw(recipe(digit, 3000, OrigClass::InRange)))
         .collect();
     blocks.push(tc.draw(recipe(digit, usize::MAX, OrigClass::OutOfRange)));
-    Spec { digit, blocks }
+    Broken {
+        spec: Spec { digit, blocks },
+        rule: Rule::OrigPtr,
+    }
 }
 
 /// Zero to two valid blocks, then one of one to three rows more than the
 /// digit allows.
 #[hegel::composite]
-pub fn oversize_block(tc: &TestCase) -> Spec {
+pub fn oversize_block(tc: &TestCase) -> Broken {
     let digit = digit(tc);
     let mut blocks: Vec<Recipe> = (0..below(tc, 3))
         .map(|_| tc.draw(recipe(digit, 3000, OrigClass::InRange)))
@@ -529,5 +865,102 @@ pub fn oversize_block(tc: &TestCase) -> Spec {
         last.shape = Shape::Runs;
     }
     blocks.push(last);
-    Spec { digit, blocks }
+    Broken {
+        spec: Spec { digit, blocks },
+        rule: Rule::BlockTooLong,
+    }
+}
+
+/// A 48-bit value that is neither the block nor the end-of-stream magic: one
+/// of them with a bit flipped (so its first bytes may still match), or any.
+fn wrong_magic(tc: &TestCase) -> u64 {
+    let m = match tc.draw(gs::integers::<u8>().max_value(2)) {
+        0 => BLOCK_MAGIC ^ (1 << below(tc, 48)),
+        1 => END_MAGIC ^ (1 << below(tc, 48)),
+        _ => tc.draw(gs::integers::<u64>()) & ((1 << 48) - 1),
+    };
+    if m == BLOCK_MAGIC || m == END_MAGIC {
+        m ^ 1
+    } else {
+        m
+    }
+}
+
+/// Zero to two valid blocks, then one that breaks `rule` in its header or
+/// symbols and is otherwise valid. `rule` is one of the header rules (not
+/// `OrigPtr`, `BlockTooLong` or `RunTooLong`, which have their own
+/// generators).
+#[hegel::composite]
+pub fn defective(tc: &TestCase, rule: Rule) -> Broken {
+    let digit = digit(tc);
+    let mut blocks: Vec<Recipe> = (0..below(tc, 3))
+        .map(|_| tc.draw(recipe(digit, 3000, OrigClass::InRange)))
+        .collect();
+    let mut last = tc.draw(recipe(digit, 3000, OrigClass::InRange));
+    if rule == Rule::NoEndOfBlock {
+        // An extra selector gives the decoder another group to find it in.
+        last.extra_selectors = 0;
+    }
+    last.defect = Some(match rule {
+        Rule::BlockMagic => Defect::Magic(wrong_magic(tc)),
+        Rule::NoSymbols => Defect::NoSymbols,
+        Rule::GroupCount => Defect::TableCount(tc.draw(gs::sampled_from(vec![0u8, 1, 7]))),
+        Rule::SelectorCount => Defect::NoSelectors,
+        Rule::Selector => Defect::SelectorBeyondTables,
+        Rule::CodeLength => match tc.draw(gs::integers::<u8>().max_value(2)) {
+            0 => Defect::CodeStart(0),
+            1 => Defect::CodeStart(21 + below(tc, 11) as u8),
+            _ => tc.draw(gs::sampled_from(vec![Defect::CodeBelow, Defect::CodeAbove])),
+        },
+        Rule::HuffmanCode => Defect::UnassignedCode,
+        Rule::NoEndOfBlock => Defect::NoEndOfBlock,
+        Rule::OrigPtr | Rule::BlockTooLong | Rule::RunTooLong => {
+            unreachable!("has its own generator")
+        }
+    });
+    blocks.push(last);
+    Broken {
+        spec: Spec { digit, blocks },
+        rule,
+    }
+}
+
+/// A run of RUNB symbols around the length libbz2 refuses: from 19 symbols
+/// the run passes the largest block, from 22 it passes 2^21 and is `RunTooLong`
+/// instead of `BlockTooLong`.
+#[hegel::composite]
+pub fn run_boundary(tc: &TestCase) -> Broken {
+    let digit = digit(tc);
+    let mut blocks: Vec<Recipe> = (0..below(tc, 3))
+        .map(|_| tc.draw(recipe(digit, 3000, OrigClass::InRange)))
+        .collect();
+    let mut last = tc.draw(recipe(digit, 3000, OrigClass::InRange));
+    let symbols = 19 + below(tc, 12) as u32;
+    last.defect = Some(Defect::Run(symbols));
+    blocks.push(last);
+    Broken {
+        spec: Spec { digit, blocks },
+        rule: if symbols >= 22 {
+            Rule::RunTooLong
+        } else {
+            Rule::BlockTooLong
+        },
+    }
+}
+
+/// A spec with any one of the defects above, or a bad `origPtr`.
+#[hegel::composite]
+pub fn any_defective(tc: &TestCase) -> Broken {
+    match tc.draw(gs::integers::<u8>().max_value(9)) {
+        0 => tc.draw(bad_orig_ptr_last()),
+        1 => tc.draw(run_boundary()),
+        2 => tc.draw(defective(Rule::BlockMagic)),
+        3 => tc.draw(defective(Rule::NoSymbols)),
+        4 => tc.draw(defective(Rule::GroupCount)),
+        5 => tc.draw(defective(Rule::SelectorCount)),
+        6 => tc.draw(defective(Rule::Selector)),
+        7 => tc.draw(defective(Rule::CodeLength)),
+        8 => tc.draw(defective(Rule::HuffmanCode)),
+        _ => tc.draw(defective(Rule::NoEndOfBlock)),
+    }
 }
