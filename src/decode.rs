@@ -230,8 +230,9 @@ struct Run<S: Simd> {
     rshift: u32,
     /// MTF entries 0..16; the rest are in `Scratch::mtf[16..]`.
     head: u8x16<S>,
-    /// `head[0]`.
-    front: u8,
+    /// All zeros, as indices that broadcast lane 0. Opaque to LLVM (see
+    /// `step`).
+    zero: u8x16<S>,
 }
 
 const CONT: u32 = 0;
@@ -262,7 +263,7 @@ fn symbols<S: Simd>(
         run: 0,
         rshift: 0,
         head,
-        front: mtf[0],
+        zero: core::hint::black_box(u8x16::splat(simd, 0)),
     };
     let mut syms = [0u16; 64];
     for g in 0..n_selectors {
@@ -344,8 +345,11 @@ fn step<S: Simd>(
         if st.nb + st.run > nmax {
             return ERR;
         }
-        if let Some(d) = ll.get_mut(st.nb as usize..(st.nb + st.run) as usize) {
-            d.fill(st.front);
+        let fv = st.head.swizzle_dyn(st.zero);
+        let mut j = 0;
+        while j < st.run as usize {
+            store16(ll, st.nb as usize + j, fv);
+            j += 16;
         }
         st.nb += st.run;
         return EOB;
@@ -356,34 +360,40 @@ fn step<S: Simd>(
     if (is_run & (st.rshift >= 21)) | (st.nb + flush + u32::from(!is_run) > nmax) {
         return ERR;
     }
-    let fv = [st.front; 16];
-    let at = st.nb as usize & ROW_MASK;
-    ll[at..at + 16].copy_from_slice(&fv);
+    // The front byte stays in the vector domain throughout. Taking it out as
+    // a scalar (or a broadcast LLVM can see is one) lets LLVM split the head
+    // into a vector and a scalar lane 0, which puts two more operations on
+    // the MTF dependency chain; hence the opaque zero indices.
+    let fv = st.head.swizzle_dyn(st.zero);
+    store16(ll, st.nb as usize, fv);
     if flush > 16 {
         let mut j = 16;
         while j < flush as usize {
-            let at = (st.nb as usize + j) & ROW_MASK;
-            ll[at..at + 16].copy_from_slice(&fv);
+            store16(ll, st.nb as usize + j, fv);
             j += 16;
         }
     }
     st.nb += flush;
     let idx = if is_run { 0 } else { sym - 1 } as usize;
-    let c;
     if idx < 16 {
         st.head = st.head.swizzle_dyn(u8x16::simd_from(simd, PERM[idx]));
-        c = st.head[0];
     } else {
-        // Remove entry idx from the tail, shift the tail up by one and carry
-        // the head's last entry into it.
+        // Rare: move the entry within the whole list in memory.
         let idx = idx & 255;
-        c = mtf[idx];
-        mtf.copy_within(16..idx, 17);
-        mtf[16] = st.head[15];
-        st.head = u8x16::splat(simd, c).slide::<15>(st.head);
+        st.head.store_slice(&mut mtf[..16]);
+        let c = mtf[idx];
+        mtf.copy_within(0..idx, 1);
+        mtf[0] = c;
+        // black_box: otherwise LLVM forwards `c` into lane 0 and splits the
+        // head on the hot path too (see above).
+        st.head = core::hint::black_box(u8x16::simd_from(
+            simd,
+            *mtf.first_chunk::<16>().unwrap_or(&[0; 16]),
+        ));
     }
-    ll[st.nb as usize & ROW_MASK] = c;
-    st.front = c;
+    // The new head's first byte is the literal; the other 15 are overwritten
+    // later or land in L's slack.
+    store16(ll, st.nb as usize, st.head);
     st.nb += u32::from(!is_run);
     st.run = if is_run {
         st.run.wrapping_add((sym + 1).wrapping_shl(st.rshift))
@@ -392,6 +402,13 @@ fn step<S: Simd>(
     };
     st.rshift = if is_run { st.rshift + 1 } else { 0 };
     CONT
+}
+
+/// Stores 16 bytes at `ll[at & ROW_MASK..]` (in range: `BYTES` has slack).
+#[inline(always)]
+fn store16<S: Simd>(ll: &mut [u8; BYTES], at: usize, v: u8x16<S>) {
+    let at = at & ROW_MASK;
+    v.store_slice(&mut ll[at..at + 16]);
 }
 
 #[cfg(test)]
