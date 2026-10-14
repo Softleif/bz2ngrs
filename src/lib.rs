@@ -1,15 +1,4 @@
-//! Fast one-shot bzip2 decompression: a Rust port of the decoder of
-//! bz2-ng, the fast libbz2 replacement in C, for callers that hold a whole
-//! compressed stream in memory and know its uncompressed size (CRAM blocks).
-//!
-//! # Memory
-//!
-//! Each thread that calls [`decompress`] keeps its working memory for later
-//! calls: about 6 MiB of address space, allocated zeroed on first use. Only
-//! the pages a block touches become resident: about 6 bytes per byte of the
-//! largest block (after bzip2's first run-length stage) decoded on that
-//! thread, plus about 40 KiB. That is at most about 5.5 MB for `BZh9` streams
-//! and 3.7 MB for `BZh6`.
+#![doc = include_str!("../README.md")]
 
 // The decoder's casts narrow row indices, symbols and code lengths, which
 // the format bounds far below the target types (rows < 2^20, symbols < 258,
@@ -58,6 +47,20 @@ use decode::Scratch;
 /// memory aborts, as Rust's allocation failures do). On success the bytes of
 /// `out` past the returned length are untouched. On error the contents of
 /// `out` are unspecified.
+///
+/// # Examples
+///
+/// ```
+/// use std::io::Write;
+///
+/// let mut enc = bzip2::write::BzEncoder::new(Vec::new(), bzip2::Compression::best());
+/// enc.write_all(b"hello hello hello hello").unwrap();
+/// let stream = enc.finish().unwrap();
+///
+/// let mut out = [0u8; 23];
+/// let n = bz2ngrs::decompress(&stream, &mut out).unwrap();
+/// assert_eq!(&out[..n], b"hello hello hello hello");
+/// ```
 pub fn decompress(src: &[u8], out: &mut [u8]) -> Result<usize, Error> {
     let level = fearless_simd::Level::new();
     // bz2-ng measured no gain from AVX-512, and its byte shuffle (`vpermb`)
