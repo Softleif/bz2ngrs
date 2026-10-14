@@ -22,10 +22,10 @@ fn mixed_30mb() -> Vec<u8> {
 fn thirty_megabytes_of_mixed_data_at_level_9() {
     let data = mixed_30mb();
     let stream = compress(&data, 9);
-    // 30 MB of data holds at least 33 blocks of 899981 bytes: the premise of a
-    // multi-block scale probe.
+    // The runs in the data shrink in the first run-length stage, so 30 MB fill
+    // fewer than 34 blocks of 899 981 bytes; the premise is dozens of them.
     assert!(
-        count_blocks(&stream) >= 30,
+        count_blocks(&stream) >= 20,
         "{} blocks",
         count_blocks(&stream)
     );

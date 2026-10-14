@@ -5,12 +5,13 @@ bz2ngrs is a one-shot bzip2 decoder, ported from the C decoder of bz2-ng. Its on
 ## Rules
 
 - **Correctness.**
-  - `decompress` must never panic, whatever its input.
+  - `Decoder::decompress` must never panic, whatever its input.
+  - A `Decoder`'s results never depend on earlier calls.
   - It accepts and rejects exactly the streams libbz2 1.0.8 does.
   - On success it never touches `out` past the returned length.
 - **Tests.**
   - Write property tests with hegel (`hegeltest`). Follow the hegel skill; never weaken a failing property.
-  - Every kernel runs at every SIMD level, `Level::fallback()` included (`__decompress_at`).
+  - Every kernel runs at every SIMD level, `Level::fallback()` included (`Decoder::__with_level`).
   - The oracle is the `bzip2` crate, a dev-dependency.
   - For every property, ask: is it tautological? An oracle that shares the implementation's code or assumptions proves nothing. Neither does an expected value derived the way the code derives it.
 - **SIMD.**

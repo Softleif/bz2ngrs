@@ -1,5 +1,5 @@
 //! The property bodies, one function per property, shared by the two surfaces
-//! (`decompress` and `__decompress_at`) so that they cannot drift apart.
+//! (`Decoder::new()` and a decoder at each level) so that they cannot drift apart.
 #![allow(
     clippy::cast_possible_truncation,
     reason = "block indices and 32-bit CRC fields of test-sized streams"
@@ -12,8 +12,8 @@ use hegel::generators::{self as gs, PrintableGenerator};
 use super::forge::{self, Broken, Rule, Spec, block_crc, forge, naive_block};
 use super::inputs;
 use super::oracle::{
-    Decoder, Reference, block_starts, check_against_reference, check_exact, compress,
-    compress_pieces, read_bits, reference, stream_crc_bit, write_bits,
+    Decoder, Reference, block_starts, check_against_reference, check_exact, check_outcome,
+    compress, compress_pieces, read_bits, reference, stream_crc_bit, write_bits,
 };
 
 /// Output capacity for the hostile-input properties.
@@ -57,7 +57,7 @@ pub fn roundtrip_pieces(tc: &TestCase, decoders: &[Decoder]) {
 }
 
 /// Property 2: A larger `out` still gives `Ok(len)` and the same prefix, and the bytes
-/// past `len` are untouched (a documented promise of `bz2ngrs::decompress`).
+/// past `len` are untouched (a documented promise of `Decoder::decompress`).
 #[allow(clippy::panic, reason = "a failed property is a panic")]
 pub fn larger_out(tc: &TestCase, decoders: &[Decoder]) {
     let v = tc.draw(inputs::valid_stream());
@@ -485,5 +485,160 @@ pub fn forged_defect_cut_agrees(tc: &TestCase, decoders: &[Decoder]) {
     let cut = lo.min(hi) + below(tc, hi.saturating_sub(lo) + 1);
     for d in decoders {
         tc.event(check_against_reference(*d, &f.stream[..cut], f.cap));
+    }
+}
+
+/// One call in a sequence for [`reuse_independent`].
+#[derive(Debug, Clone)]
+struct Step {
+    what: &'static str,
+    stream: Vec<u8>,
+    cap: usize,
+}
+
+#[hegel::composite]
+fn step(tc: &TestCase) -> Step {
+    match tc.draw(gs::integers::<u8>().max_value(5)) {
+        0 => {
+            let v = tc.draw(inputs::valid_stream());
+            Step {
+                what: "valid, exact cap",
+                cap: v.data.len(),
+                stream: v.stream,
+            }
+        }
+        1 => {
+            let v = tc.draw(inputs::valid_stream());
+            Step {
+                what: "valid, any cap",
+                cap: tc.draw(inputs::output_cap(v.data.len())),
+                stream: v.stream,
+            }
+        }
+        2 => {
+            let m = tc.draw(inputs::mutated_stream());
+            Step {
+                what: "mutated",
+                cap: tc.draw(inputs::output_cap(m.original.data.len())),
+                stream: m.stream,
+            }
+        }
+        3 => {
+            let v = tc.draw(inputs::valid_stream());
+            let cut = below(tc, v.stream.len());
+            Step {
+                what: "truncated",
+                cap: v.data.len(),
+                stream: v.stream[..cut].to_vec(),
+            }
+        }
+        4 => {
+            // A block that fills most of the scratch, to follow a small one
+            // and to be followed by one.
+            let seed = tc.draw(gs::integers::<u64>());
+            let len = 150_000 + below(tc, 750_000);
+            let data = inputs::mixed(seed, len, 1 + below(tc, 256));
+            Step {
+                what: "big block",
+                cap: data.len(),
+                stream: compress(&data, 9),
+            }
+        }
+        _ => Step {
+            what: "hostile bytes",
+            stream: tc.draw(inputs::hostile_bzh()),
+            cap: HOSTILE_CAP,
+        },
+    }
+}
+
+/// Property 8: Reuse independence. One long-lived decoder decodes a sequence
+/// of streams (valid, mutated, truncated, hostile; big and small; with `out`
+/// too small or not). Each result equals what a decoder made for that stream
+/// gives (the documented contract: results never depend on earlier calls),
+/// and agrees with the oracle (which keeps both from being wrong in the same
+/// way).
+pub fn reuse_independent(tc: &TestCase, decoders: &[Decoder]) {
+    let steps = tc.draw(gs::vecs(step()).min_size(2).max_size(6));
+    for s in &steps {
+        tc.event(s.what);
+    }
+    let wants: Vec<Reference> = steps.iter().map(|s| reference(&s.stream, s.cap)).collect();
+    for d in decoders {
+        for (s, want) in steps.iter().zip(&wants) {
+            let mut out = vec![0xA5; s.cap];
+            let got = d.run(&s.stream, &mut out);
+            let mut fresh_out = vec![0xA5; s.cap];
+            let fresh = d.run_fresh(&s.stream, &mut fresh_out);
+            assert_eq!(got, fresh, "{} ({}): reused vs fresh", d.name(), s.what);
+            if let Ok(n) = got {
+                assert!(
+                    out[..n] == fresh_out[..n],
+                    "{} ({}): bytes differ from a fresh decoder's",
+                    d.name(),
+                    s.what
+                );
+            }
+            check_outcome(&d.name(), &s.stream, want, &got, &out, s.cap);
+        }
+    }
+}
+
+/// Property 9: `decompress_to_vec` with a size at or above the stream's
+/// length is the oracle's bytes, and its length is the stream's length (the
+/// vector is cut to what was written).
+#[allow(clippy::panic, reason = "a failed property is a panic")]
+pub fn to_vec_equals_oracle(tc: &TestCase, decoders: &[Decoder]) {
+    let v = tc.draw(inputs::valid_stream());
+    let extra = if tc.draw(gs::booleans()) {
+        0
+    } else {
+        below(tc, 70_000)
+    };
+    let size = v.data.len() + extra;
+    let Reference::Ok(want) = reference(&v.stream, size) else {
+        panic!("premise: libbz2 decodes a valid stream");
+    };
+    for d in decoders {
+        let got = d.run_to_vec(&v.stream, size);
+        assert_eq!(got.as_deref(), Ok(&want[..]), "{}: size {size}", d.name());
+        assert_eq!(got.map(|g| g.len()), Ok(v.data.len()), "{}", d.name());
+    }
+}
+
+/// Property 9: `decompress_to_vec` with a size below the stream's length is
+/// `OutputTooSmall` with `capacity: size`.
+pub fn to_vec_too_small(tc: &TestCase, decoders: &[Decoder]) {
+    let v = tc.draw(inputs::valid_stream());
+    tc.assume(!v.data.is_empty());
+    let k = tc.draw(gs::integers::<usize>().min_value(1).max_value(v.data.len()));
+    let size = v.data.len() - k;
+    for d in decoders {
+        assert_eq!(
+            d.run_to_vec(&v.stream, size),
+            Err(Error::OutputTooSmall { capacity: size }),
+            "{}",
+            d.name()
+        );
+    }
+}
+
+/// Property 9: `decompress_to_vec` on mutated streams follows the same
+/// differential rule as `decompress`.
+pub fn to_vec_mutated_agrees(tc: &TestCase, decoders: &[Decoder]) {
+    let m = tc.draw(inputs::mutated_stream());
+    let size = tc.draw(inputs::output_cap(m.original.data.len()));
+    let want = reference(&m.stream, size);
+    for d in decoders {
+        let got = d.run_to_vec(&m.stream, size);
+        let n = got.as_ref().map(Vec::len).map_err(|e| *e);
+        tc.event(check_outcome(
+            &d.name(),
+            &m.stream,
+            &want,
+            &n,
+            got.as_deref().unwrap_or(&[]),
+            size,
+        ));
     }
 }
