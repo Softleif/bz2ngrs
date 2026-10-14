@@ -20,15 +20,17 @@ pub(crate) const ROW_MASK: usize = ROWS - 1;
 pub(crate) const BYTES: usize = ROWS + 64;
 
 const CHUNK: usize = 1024;
-/// Pool chunks: at most (900,000 + 25 * 1024) / 1024 + 1 = 905 are used.
+/// Pool chunks: the pool holds at most 900,000 bytes, and each of at most 24
+/// lanes has one chunk that is not full, so at most 878 + 24 = 902 are used.
 const CHUNKS: usize = 1024;
 /// Target rows per segment.
 const SEG_ROWS: u32 = 2048;
-/// Segments: at most 900,000 / 2048 + 1 = 440 are used.
+/// Segments: at most 900,000 / 2048 = 439, plus `orig_ptr`, are used.
 const SEGS: usize = 512;
 const SPLIT: u32 = 0x8000_0000;
 
-/// Per-thread arrays of the inverse BWT.
+/// Per-thread arrays of the inverse BWT. Part of [`crate::decode::Scratch`],
+/// so it must hold only integers (all-zero bytes must be a valid value).
 pub(crate) struct Bwt {
     tt: [u32; ROWS],
     m: Meta,
@@ -36,7 +38,7 @@ pub(crate) struct Bwt {
 
 /// The walk's bookkeeping. Kept apart from the table and the pool so that
 /// the walk can take all three as separate arguments: LLVM then knows the
-/// pool's byte stores do not change them.
+/// pool's byte stores do not change them. Integers only, like [`Bwt`].
 struct Meta {
     chunk_next: [u32; CHUNKS],
     seg_row: [u32; SEGS],

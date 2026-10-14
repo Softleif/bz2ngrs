@@ -17,6 +17,11 @@ const G_SIZE: usize = 50;
 
 /// Per-thread working memory, reused between calls. Every byte that is read
 /// is written first in each block, so it is never cleared.
+///
+/// [`Scratch::new_boxed`] creates it from zeroed memory, so every field, here
+/// and in the types it holds, must be an integer or an array or struct of
+/// integers: a `bool`, enum, reference or `NonZero` field would make that
+/// undefined behaviour.
 pub(crate) struct Scratch {
     bwt: Bwt,
     /// The symbol loop's output L, then the walk's pool.
