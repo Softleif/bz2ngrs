@@ -1,7 +1,7 @@
 //! un-RLE1 (the first run-length stage) from the block's text into the
 //! caller's buffer, and libbz2's block randomisation.
 
-use fearless_simd::{Simd, SimdBase, u8x32};
+use fearless_simd::{Simd, SimdBase, SimdFrom, u8x16, u8x32};
 
 use crate::Corruption;
 use crate::error::Fail;
@@ -34,7 +34,14 @@ fn le8(w: &[u8; 16], i: usize) -> u64 {
 /// bytes, which overwrite them.
 const WIDE_MARGIN: usize = 12 + 360;
 
-/// Bulk un-RLE1, eight candidate run starts at a time, from text position
+/// `w[i..i + 16]` (constant `i`, so no bounds check survives).
+#[inline(always)]
+fn at16<S: Simd>(simd: S, w: &[u8; 32], i: usize) -> u8x16<S> {
+    u8x16::simd_from(simd, *w[i..].first_chunk::<16>().unwrap_or(&[0; 16]))
+}
+
+/// Bulk un-RLE1, sixteen candidate run starts at a time (eight once one is
+/// set), from text position
 /// `j` and output position `o` with the current stretch of literals starting
 /// at `lit`, while `MARGIN` (or `WIDE_MARGIN`) text bytes remain. Candidate k
 /// is set when `text[j+k..j+k+4]` are equal; the first one after a clean
@@ -52,12 +59,33 @@ fn bulk<S: Simd, const WIDE: bool>(
     let (margin, room) = if WIDE {
         (WIDE_MARGIN, 288)
     } else {
-        (MARGIN, 8)
+        (MARGIN, 16)
     };
+    let mut literals = false;
     while j + margin <= text.len() && o + room <= out.len() {
-        let Some(w) = text.get(j..j + 16).and_then(|s| s.first_chunk::<16>()) else {
+        let Some(w) = text.get(j..j + 32).and_then(|s| s.first_chunk::<32>()) else {
             break;
         };
+        // In a stretch of literals, test 16 candidates at once; none set
+        // means all 16 bytes are literals. Where runs are dense the test
+        // mostly fails and only lengthens the step, so it waits for a step
+        // without a candidate.
+        if literals {
+            let v = at16(simd, w, 0);
+            let m = v.simd_eq(at16(simd, w, 1))
+                & v.simd_eq(at16(simd, w, 2))
+                & v.simd_eq(at16(simd, w, 3));
+            if !simd.any_true_mask8x16(m) {
+                if let Some(d) = out.get_mut(o..o + 16) {
+                    v.store_slice(d);
+                }
+                j += 16;
+                o += 16;
+                continue;
+            }
+            literals = false;
+        }
+        let w = w.first_chunk::<16>().unwrap_or(&[0; 16]);
         let a = le8(w, 0);
         let m = zero_bytes(a ^ le8(w, 1)) & zero_bytes(a ^ le8(w, 2)) & zero_bytes(a ^ le8(w, 3));
         if let Some(d) = out.get_mut(o..o + 8) {
@@ -66,6 +94,7 @@ fn bulk<S: Simd, const WIDE: bool>(
         if m == 0 {
             j += 8;
             o += 8;
+            literals = true;
             continue;
         }
         let k = (m.trailing_zeros() / 8) as usize & 7;

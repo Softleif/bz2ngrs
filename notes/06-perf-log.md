@@ -283,3 +283,27 @@ CRAM (5 rounds, load 9-20): level-3 0.988 -> 1.047, level-4 1.038 -> 1.015
 v31-archive 1.146 -> 1.148, v31-bzonly 1.030 -> 1.047, v31-small 1.025 ->
 1.029, ultima-bz6 1.034 -> 1.044, ultima-bz1 1.039 -> 1.064, ultima-bz9 1.036
 -> 1.058, ultima-archive 0.988 -> 1.009.
+
+### R2.3 un-RLE1: 16-candidate vector test in literal stretches (kept)
+
+Profile, MC 64k: un-RLE1 8.9% of ours against 3.7% of C, which tests 16
+candidate run starts per NEON step where ours tested 8 with SWAR.
+
+First form, the vector test on every step and the SWAR step redone on the
+window when it finds a candidate. Best pass, base (R2.2) -> new, 6 rounds:
+MC 16k +3.4%, MC 64k +3.9%, MC 1m +3.4%, XA 64k +1.5%, but QUAL 16k -3.4%,
+64k -3.8%, 1m -3.9%, v30-bz1 -2.4%. Where runs are dense the test mostly
+fails and lengthens the loop-carried chain (taking the position from
+`to_bitmask` would be and+ext+zip+addv on NEON, longer still).
+
+Kept form: the vector test only runs after an 8-byte SWAR step found no
+candidate, and the loop drops back to SWAR when the test finds one. Best
+pass, base -> new, 6 rounds, load 18-23: MC 16k +3.9%, MC 64k +2.7%, MC 1m
++7.2% (base pass low that run; +3.4% before), XA 64k +4.0%, QUAL 16k +0.7%,
+64k +1.7%, 1m +0.1%, level-3 +0.4%, v30-bz1 0.0%.
+
+x86 (`--emit asm`, x86_64-apple-darwin): the test is `vpcmpeqb`/`vpand`/
+`vpmovmskb`/`test` at the Avx2 level; the Avx2 kernel has 406 stack
+references against 411 before. The Sse4_2 kernel has 458 against 440, the
+extra ones in inlined bit-reader code (register allocation moved), not in
+the un-RLE1 loop; `Level::new()` picks Avx2 on x86-64-v3 CPUs.
