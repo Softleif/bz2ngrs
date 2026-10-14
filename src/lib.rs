@@ -45,3 +45,16 @@ pub fn decompress(src: &[u8], out: &mut [u8]) -> Result<usize, Error> {
     let _ = (src, out, crc::update(0, &[]));
     Err(Error::Corrupt)
 }
+
+/// [`decompress`] with the SIMD level fixed, so tests and fuzz targets can
+/// run every kernel at every level the CPU supports, `Level::fallback()`
+/// included. Not part of the stable API.
+#[doc(hidden)]
+pub fn __decompress_at(
+    level: fearless_simd::Level,
+    src: &[u8],
+    out: &mut [u8],
+) -> Result<usize, Error> {
+    let _ = level;
+    decompress(src, out)
+}
