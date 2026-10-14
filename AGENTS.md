@@ -12,6 +12,7 @@ bz2ngrs is a one-shot bzip2 decoder, ported from the C decoder of bz2-ng. Its on
   - Write property tests with hegel (`hegeltest`). Follow the hegel skill; never weaken a failing property.
   - Every kernel runs at every SIMD level, `Level::fallback()` included (`__decompress_at`).
   - The oracle is the `bzip2` crate, a dev-dependency.
+  - For every property, ask: is it tautological? An oracle that shares the implementation's code or assumptions proves nothing. Neither does an expected value derived the way the code derives it.
 - **SIMD.**
   - Write kernels once, generic over `fearless_simd::Simd`, reached via `dispatch!`. Helpers are `#[inline(always)]`, with no vector ops in closures.
   - `core::arch` is allowed only where fearless_simd lacks the operation (the CRC's carry-less multiply). It must be feature-detected and tested against the portable path.
