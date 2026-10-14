@@ -307,3 +307,26 @@ x86 (`--emit asm`, x86_64-apple-darwin): the test is `vpcmpeqb`/`vpand`/
 references against 411 before. The Sse4_2 kernel has 458 against 440, the
 extra ones in inlined bit-reader code (register allocation moved), not in
 the un-RLE1 loop; `Level::new()` picks Avx2 on x86-64-v3 CPUs.
+
+### R2.4 Table build in 8 parts (kept)
+
+Profile: the table build was 21.8% of ours on XA 1m (C 18.9%), 22.1% on
+v31-small (C 19.6%), 20.5% on level-3 (C 17.4%), with the same code shape as
+C's: four quarters, each a chain of `h[k][c]++` and of cursor
+load/store-entry/store-cursor. L is mostly runs of one byte, so each update
+waits on the previous one's store; four chains do not fill the core.
+
+Eight parts (histogram and scatter), best pass, base (R2.3) -> new, 6
+rounds, load 34-95: MC 64k +6.2%, XA 16k +1.9%, XA 1m +5.4%, QUAL 64k +1.9%,
+QUAL 1m +3.7%, level-3 +3.0%, v31-small +3.6%, v30-bz1 +4.4%. Twelve and
+sixteen parts are worse than eight everywhere (12: -1.4% to -5.4%, 16: -3.7%
+to -13.3%; the 8-16 KiB of counters and cursors stop fitting the chains'
+working set in L1 and the zeroing grows).
+
+On x86-64 the eight-part scatter loop spills about 30 times per iteration
+(16 registers); the histogram loop does not. The scatter now runs as two
+passes of four parts over its own cursors: x86 per-iteration stack
+references 3 and 9 (the old four-part loop: 4), histogram 0. On aarch64 the
+two forms are equal within noise (best pass vs the base: two passes MC 64k
++8.4%, XA 1m +6.1%, level-3 +4.4%, v31-small +2.6%; one pass +6.7%, +3.3%,
++5.0%, +5.8%). The two-pass form is kept.
