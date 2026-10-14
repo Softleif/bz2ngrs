@@ -1,0 +1,205 @@
+//! The `bzip2` crate (libbz2 1.0.8 via `libbz2-rs-sys`) as an oracle, plus the
+//! decoders under test. No hegel in here: the fuzz targets include this file
+//! with `#[path]`.
+#![allow(dead_code)]
+
+use std::io::{self, Read, Write};
+
+use bz2ngrs::Error;
+use bzip2::Compression;
+use bzip2::read::BzDecoder;
+use bzip2::write::BzEncoder;
+use fearless_simd::Level;
+
+/// One way of calling the decoder: the public entry point, or the hidden one
+/// with a fixed SIMD level.
+#[derive(Clone, Copy)]
+pub enum Decoder {
+    Default,
+    At(Level),
+}
+
+impl Decoder {
+    pub fn run(self, src: &[u8], out: &mut [u8]) -> Result<usize, Error> {
+        match self {
+            Decoder::Default => bz2ngrs::decompress(src, out),
+            Decoder::At(level) => bz2ngrs::__decompress_at(level, src, out),
+        }
+    }
+
+    pub fn name(self) -> String {
+        match self {
+            Decoder::Default => "decompress".into(),
+            Decoder::At(level) => format!("__decompress_at({level:?})"),
+        }
+    }
+}
+
+/// The `decompress` surface.
+pub fn default_decoder() -> Vec<Decoder> {
+    vec![Decoder::Default]
+}
+
+/// The `__decompress_at` surface: every level this CPU can run, the scalar
+/// `Fallback` included (the dev-dependency compiles it in on every target).
+pub fn level_decoders() -> Vec<Decoder> {
+    let best = Level::new();
+    #[allow(unused_mut, reason = "only x86 has levels below the best one")]
+    let mut levels = vec![Level::fallback(), best];
+    #[cfg(target_arch = "x86_64")]
+    {
+        levels.extend(best.as_sse2().map(Level::Sse2));
+        levels.extend(best.as_sse4_2().map(Level::Sse4_2));
+        levels.extend(best.as_avx2().map(Level::Avx2));
+    }
+    levels.into_iter().map(Decoder::At).collect()
+}
+
+/// Every way of calling the decoder.
+pub fn all_decoders() -> Vec<Decoder> {
+    let mut all = default_decoder();
+    all.extend(level_decoders());
+    all
+}
+
+/// Compresses `data` as one stream at bzip2 level `level` (1 to 9).
+pub fn compress(data: &[u8], level: u32) -> Vec<u8> {
+    compress_pieces(&[data], level)
+}
+
+/// Compresses the pieces into one stream, ending the current block after each
+/// piece (`BZ_FLUSH`) when there is more than one, so every non-empty piece
+/// gets its own block.
+pub fn compress_pieces(pieces: &[&[u8]], level: u32) -> Vec<u8> {
+    let mut enc = BzEncoder::new(Vec::new(), Compression::new(level));
+    for piece in pieces {
+        enc.write_all(piece).expect("write to Vec");
+        if pieces.len() > 1 {
+            enc.flush().expect("flush to Vec");
+        }
+    }
+    enc.finish().expect("finish into Vec")
+}
+
+/// What the oracle makes of a stream when it may produce at most `cap` bytes.
+#[derive(Debug)]
+pub enum Reference {
+    /// One stream decoded, to at most `cap` bytes.
+    Ok(Vec<u8>),
+    /// The output reached `cap + 1` bytes.
+    Exceeds,
+    /// libbz2 rejected the stream: `UnexpectedEof` for input that ends early,
+    /// `InvalidInput` for everything else.
+    Err(io::ErrorKind),
+}
+
+pub fn reference(src: &[u8], cap: usize) -> Reference {
+    let mut out = Vec::with_capacity(cap.saturating_add(1));
+    // `BzDecoder` (not `MultiBzDecoder`) stops after one stream and ignores
+    // what follows, which is our contract.
+    match BzDecoder::new(src)
+        .take(cap as u64 + 1)
+        .read_to_end(&mut out)
+    {
+        Ok(_) if out.len() > cap => Reference::Exceeds,
+        Ok(_) => Reference::Ok(out),
+        Err(e) => Reference::Err(e.kind()),
+    }
+}
+
+/// The differential rule: decode `src` into `cap` bytes and compare with the
+/// oracle's verdict. Oracle `Ok` means ours is `Ok` with the same bytes;
+/// oracle error or overflow means ours is an `Err`. Returns what the oracle
+/// said, for coverage statistics.
+#[allow(clippy::panic, reason = "a failed property is a panic")]
+pub fn check_against_reference(decoder: Decoder, src: &[u8], cap: usize) -> &'static str {
+    let want = reference(src, cap);
+    let mut out = vec![0xA5; cap];
+    let got = decoder.run(src, &mut out);
+    let who = decoder.name();
+    match (&want, &got) {
+        (Reference::Ok(bytes), Ok(n)) => {
+            assert_eq!(*n, bytes.len(), "{who}: length (cap {cap})");
+            assert!(
+                out[..*n] == bytes[..],
+                "{who}: bytes differ from the reference"
+            );
+        }
+        (Reference::Ok(bytes), Err(e)) => {
+            panic!(
+                "{who}: reference decodes {} bytes, we fail with {e:?} (cap {cap})",
+                bytes.len()
+            )
+        }
+        (Reference::Exceeds | Reference::Err(_), Ok(n)) => {
+            panic!("{who}: reference gives {want:?}, we return Ok({n}) (cap {cap})")
+        }
+        (Reference::Exceeds | Reference::Err(_), Err(_)) => {}
+    }
+    match want {
+        Reference::Ok(_) => "reference ok",
+        Reference::Exceeds => "reference exceeds cap",
+        Reference::Err(io::ErrorKind::UnexpectedEof) => "reference unexpected eof",
+        Reference::Err(_) => "reference invalid input",
+    }
+}
+
+/// Decodes into exactly `expected.len()` bytes and demands the exact bytes.
+#[allow(clippy::panic, reason = "a failed property is a panic")]
+pub fn check_exact(decoder: Decoder, src: &[u8], expected: &[u8]) {
+    let mut out = vec![0xA5; expected.len()];
+    match decoder.run(src, &mut out) {
+        Ok(n) => {
+            assert_eq!(n, expected.len(), "{}: length", decoder.name());
+            assert!(out == expected, "{}: bytes differ", decoder.name());
+        }
+        Err(e) => panic!("{}: valid stream rejected with {e:?}", decoder.name()),
+    }
+}
+
+/// `len` bits of `bytes` from bit `start`, most significant bit first.
+fn bits(bytes: &[u8], start: usize, len: usize) -> u64 {
+    (start..start + len).fold(0, |acc, i| {
+        (acc << 1) | u64::from((bytes[i / 8] >> (7 - i % 8)) & 1)
+    })
+}
+
+/// Flips bit `at` (counted from the most significant bit of byte 0).
+pub fn flip_bit(bytes: &mut [u8], at: usize) {
+    bytes[at / 8] ^= 0x80 >> (at % 8);
+}
+
+const BLOCK_MAGIC: u64 = 0x3141_5926_5359;
+const END_MAGIC: u64 = 0x1772_4538_5090;
+
+/// Bit offset of the first block's stored CRC (the 32 bits after the block
+/// magic, which is byte aligned in the first block), if there is a block.
+pub fn first_block_crc_bit(stream: &[u8]) -> Option<usize> {
+    (stream.len() >= 14 && bits(stream, 32, 48) == BLOCK_MAGIC).then_some(80)
+}
+
+/// Bit offset of the stream's combined CRC: the 32 bits after the end-of-stream
+/// magic, followed by 0 to 7 padding bits.
+pub fn stream_crc_bit(stream: &[u8]) -> Option<usize> {
+    (0..8usize).find_map(|pad| {
+        let crc = (stream.len() * 8).checked_sub(pad + 32)?;
+        let magic = crc.checked_sub(48).filter(|&m| m >= 32)?;
+        (bits(stream, magic, 48) == END_MAGIC).then_some(crc)
+    })
+}
+
+/// How many blocks `stream` holds: block magics at any bit offset. A false
+/// positive needs 48 matching bits inside compressed data.
+pub fn count_blocks(stream: &[u8]) -> usize {
+    let mut window = 0u64;
+    let mut count = 0;
+    for (i, bit) in stream
+        .iter()
+        .flat_map(|b| (0..8).map(move |k| (b >> (7 - k)) & 1))
+        .enumerate()
+    {
+        window = ((window << 1) | u64::from(bit)) & ((1 << 48) - 1);
+        count += usize::from(i >= 47 + 32 && window == BLOCK_MAGIC);
+    }
+    count
+}

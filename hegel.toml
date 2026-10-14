@@ -1,0 +1,21 @@
+# Hegel property-based testing settings (see `hegel::docs::settings`).
+#
+# The properties are cheap (a stream of a few KB per case, decoded at every
+# SIMD level next to the `bzip2` oracle), so counts are in the thousands.
+# Slow properties (multi-block streams of 100 KB to 900 KB per block) pin
+# their own count with `tests/common::pinned::cases(N)`, which wins over the
+# profile and over `HEGEL_TEST_CASES`; `BZ2NGRS_PINNED_CASES` overrides all
+# of those.
+#
+# Deeper runs:
+#   HEGEL_DEFAULT_PROFILE=thorough cargo test --release
+#   BZ2NGRS_PINNED_CASES=500 cargo test --release
+
+[profiles.development]
+test_cases = 2000
+
+[profiles.ci]
+test_cases = 5000
+
+[profiles.thorough]
+test_cases = 50000
