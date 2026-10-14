@@ -82,6 +82,7 @@ fn isa_flags(src: &str, arch: &str) -> &'static [&'static str] {
 
 fn main() {
     println!("cargo:rerun-if-env-changed=BZ2NG_C_DIR");
+    println!("cargo:rerun-if-env-changed=BZ2NG_C_DEBUG");
     println!("cargo:rerun-if-changed=build.rs");
     let dir = PathBuf::from(
         env::var("BZ2NG_C_DIR").unwrap_or_else(|_| "/Users/pascal/code/tfenne/bz2-ng/c".into()),
@@ -109,7 +110,8 @@ fn main() {
             .include(dir.join("lib"))
             .std("c11")
             .opt_level(if O3.contains(src) { 3 } else { 2 })
-            .debug(false)
+            // -g moves a few instructions, so only on request (for a profile).
+            .debug(env::var_os("BZ2NG_C_DEBUG").is_some())
             .warnings(false)
             .pic(true)
             .flag("-fvisibility=hidden")

@@ -6,10 +6,12 @@
 //! symbol; in an oversubscribed set the codes past the end of the code space
 //! are unreachable, and in an incomplete set the unused patterns are no code.
 
-/// Primary table width in bits.
 use fearless_simd::{Simd, SimdBase, u16x8};
 
-const K: u32 = 11;
+/// Primary table width in bits. bz2-ng's 11 fills twice the entries per
+/// table, a fixed cost per block that small blocks feel more than the rarer
+/// fallback to `decode_long` for 11-bit codes (notes/06-perf-log.md).
+const K: u32 = 10;
 /// Longest code bzip2 allows.
 pub(crate) const MAX_CODE: u32 = 20;
 /// Most symbols in an alphabet (256 bytes + RUNA/RUNB, minus one, plus EOB).

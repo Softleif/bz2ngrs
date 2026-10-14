@@ -23,9 +23,13 @@ const CHUNK: usize = 1024;
 /// Pool chunks: the pool holds at most 900,000 bytes, and each of at most 24
 /// lanes has one chunk that is not full, so at most 878 + 24 = 902 are used.
 const CHUNKS: usize = 1024;
-/// Target rows per segment.
-const SEG_ROWS: u32 = 2048;
-/// Segments: at most 900,000 / 2048 = 439, plus `orig_ptr`, are used.
+/// Target rows per segment. When the first lane runs out of segments the
+/// others finish theirs with less overlap, so shorter segments shorten that
+/// tail; bz2-ng's 2048 left a third of the walk there at 64 Ki rows. Above
+/// `SEGS * 512` rows the cap below lengthens them again, which is what the
+/// larger blocks prefer (notes/06-perf-log.md).
+const SEG_ROWS: u32 = 512;
+/// Segments, at most this many minus one (with `orig_ptr`) are used.
 const SEGS: usize = 512;
 const SPLIT: u32 = 0x8000_0000;
 
@@ -77,61 +81,57 @@ pub(crate) fn inverse(
     gather(m, ll, origin, n, text);
 }
 
-/// Builds the table from L, four quarters with their own cursors.
+/// Parts of L that the table build counts and scatters interleaved. L is
+/// mostly runs of one byte, so within a part each counter and cursor update
+/// waits for the previous one; the parts are independent chains.
+const PARTS: usize = 8;
+
+/// Builds the table from L, in `PARTS` parts with their own cursors.
 fn build_t(tt: &mut [u32; ROWS], ll: &[u8; BYTES], n: u32) {
     let n = (n as usize).min(ROWS);
-    let q = n / 4;
-    let (l0, rest) = ll[..n].split_at(q);
-    let (l1, rest) = rest.split_at(q);
-    let (l2, l3) = rest.split_at(q);
+    let q = n / PARTS;
+    // Byte `i` of part `k`; the last part also takes the `n % PARTS` tail.
+    let at = |k: usize, i: usize| usize::from(ll[(k * q + i) & ROW_MASK]);
 
-    let mut h = [[0u32; 256]; 4];
-    for (((&c0, &c1), &c2), &c3) in l0.iter().zip(l1).zip(l2).zip(l3) {
-        h[0][usize::from(c0)] += 1;
-        h[1][usize::from(c1)] += 1;
-        h[2][usize::from(c2)] += 1;
-        h[3][usize::from(c3)] += 1;
+    let mut h = [[0u32; 256]; PARTS];
+    for i in 0..q {
+        for (k, h) in h.iter_mut().enumerate() {
+            h[at(k, i)] += 1;
+        }
     }
-    for &c in &l3[q..] {
-        h[3][usize::from(c)] += 1;
+    for i in q..n - (PARTS - 1) * q {
+        h[PARTS - 1][at(PARTS - 1, i)] += 1;
     }
 
-    // Exclusive prefix sums, split into per-quarter cursors.
-    let mut cf = [[0u32; 256]; 4];
+    // Exclusive prefix sums, split into per-part cursors.
+    let mut cf = [[0u32; 256]; PARTS];
     let mut sum = 0u32;
     for c in 0..256 {
-        for k in 0..4 {
+        for k in 0..PARTS {
             cf[k][c] = sum;
             sum += h[k][c];
         }
     }
 
-    // All four cursors are loaded before any entry is stored, and each entry
-    // is stored before its cursor (the clang order of dec_block.c).
-    let q32 = q as u32;
-    for (i, (((&c0, &c1), &c2), &c3)) in l0.iter().zip(l1).zip(l2).zip(l3).enumerate() {
-        let i = i as u32;
-        let (c0, c1, c2, c3) = (
-            usize::from(c0),
-            usize::from(c1),
-            usize::from(c2),
-            usize::from(c3),
-        );
-        let (j0, j1, j2, j3) = (cf[0][c0], cf[1][c1], cf[2][c2], cf[3][c3]);
-        tt[j0 as usize & ROW_MASK] = i << 8 | c0 as u32;
-        cf[0][c0] = j0 + 1;
-        tt[j1 as usize & ROW_MASK] = (i + q32) << 8 | c1 as u32;
-        cf[1][c1] = j1 + 1;
-        tt[j2 as usize & ROW_MASK] = (i + 2 * q32) << 8 | c2 as u32;
-        cf[2][c2] = j2 + 1;
-        tt[j3 as usize & ROW_MASK] = (i + 3 * q32) << 8 | c3 as u32;
-        cf[3][c3] = j3 + 1;
+    // Four parts per pass: eight at once spill on x86-64 (16 registers) and
+    // gain nothing on aarch64. All cursors are loaded before any entry is
+    // stored, and each entry is stored before its cursor (the clang order of
+    // dec_block.c).
+    for g in (0..PARTS).step_by(4) {
+        for i in 0..q {
+            let c: [usize; 4] = core::array::from_fn(|k| at(g + k, i));
+            let j: [u32; 4] = core::array::from_fn(|k| cf[g + k][c[k]]);
+            for k in 0..4 {
+                tt[j[k] as usize & ROW_MASK] = (((g + k) * q + i) as u32) << 8 | c[k] as u32;
+                cf[g + k][c[k]] = j[k] + 1;
+            }
+        }
     }
-    for (i, &c) in l3.iter().enumerate().skip(q) {
-        let c = usize::from(c);
-        let j = cf[3][c];
-        tt[j as usize & ROW_MASK] = (i as u32 + 3 * q32) << 8 | c as u32;
-        cf[3][c] = j + 1;
+    for i in q..n - (PARTS - 1) * q {
+        let c = at(PARTS - 1, i);
+        let j = cf[PARTS - 1][c];
+        tt[j as usize & ROW_MASK] = (((PARTS - 1) * q + i) as u32) << 8 | c as u32;
+        cf[PARTS - 1][c] = j + 1;
     }
 }
 
