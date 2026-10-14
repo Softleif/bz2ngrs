@@ -116,3 +116,15 @@ each step of the 24-lane loop. Best pass, base -> new: MC 1m 440 -> 434
 (-1.3%), MC 64k 411 -> 406 (-1.2%). At these sizes the table fits in the M4
 Pro's L2 and the out-of-order window already overlaps the 24 lanes' loads;
 the prefetch only adds instructions. Reverted (no `unsafe` added).
+
+### 5. Run fill without a variable-length loop (kept)
+
+The fill loop's trip count varies with every run, so its exit mispredicts on
+most runs. A first bulk stage now runs while 372 text bytes remain (enough to
+decode to at least 288 more output bytes): its fill is one 32-byte store,
+plus eight more for runs over 32 bytes, with no loop. The 64-byte-margin
+stage and the byte tail follow as before.
+
+Best pass, MB/s, base -> new: QUAL 1m 1146 -> 1197 (+4.5%, 5 alternating
+runs each, median +4.9%), QUAL 64k 978 -> 1011 (+3.3%), XA 64k 259 -> 258
+(=).
