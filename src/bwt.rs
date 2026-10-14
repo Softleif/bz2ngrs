@@ -31,12 +31,21 @@ const SPLIT: u32 = 0x8000_0000;
 /// Per-thread arrays of the inverse BWT.
 pub(crate) struct Bwt {
     tt: [u32; ROWS],
+    m: Meta,
+}
+
+/// The walk's bookkeeping. Kept apart from the table and the pool so that
+/// the walk can take all three as separate arguments: LLVM then knows the
+/// pool's byte stores do not change them.
+struct Meta {
     chunk_next: [u32; CHUNKS],
     seg_row: [u32; SEGS],
     seg_start: [u32; SEGS],
     seg_len: [u32; SEGS],
     seg_next: [u32; SEGS],
     n_seg: u32,
+    next_chunk: u32,
+    next_split: u32,
 }
 
 /// Inverts the BWT `ll[0..n)` with origin row `orig_ptr < n` into
@@ -50,20 +59,17 @@ pub(crate) fn inverse(
 ) {
     build_t(&mut b.tt, ll, n);
     let lanes = mark_splitters(b, n, orig_ptr);
-    let origin = seg_index(b, orig_ptr);
-    let mut w = Walk {
-        b,
-        pool: ll,
-        next_chunk: 0,
-        next_split: 0,
-    };
+    let Bwt { tt, m } = b;
+    let origin = m.seg_index(orig_ptr);
+    m.next_chunk = 0;
+    m.next_split = 0;
     match lanes {
-        24 => w.walk::<24>(),
-        8 => w.walk::<8>(),
-        2 => w.walk::<2>(),
-        _ => w.walk::<1>(),
+        24 => walk::<24>(tt, ll, m),
+        8 => walk::<8>(tt, ll, m),
+        2 => walk::<2>(tt, ll, m),
+        _ => walk::<1>(tt, ll, m),
     }
-    gather(b, ll, origin, n, text);
+    gather(m, ll, origin, n, text);
 }
 
 /// Builds the table from L, four quarters with their own cursors.
@@ -128,27 +134,28 @@ fn build_t(tt: &mut [u32; ROWS], ll: &[u8; BYTES], n: u32) {
 /// table and returns the lane count.
 fn mark_splitters(b: &mut Bwt, n: u32, op: u32) -> u32 {
     let want = (n / SEG_ROWS).clamp(1, SEGS as u32 - 2);
+    let rows = &mut b.m.seg_row;
     let mut m = 0usize;
     let mut inserted = false;
-    let mut push = |b: &mut Bwt, r: u32| {
-        if m == 0 || b.seg_row[(m - 1) % SEGS] != r {
-            b.seg_row[m % SEGS] = r;
+    let mut push = |r: u32| {
+        if m == 0 || rows[(m - 1) % SEGS] != r {
+            rows[m % SEGS] = r;
             m += 1;
         }
     };
     for k in 0..want {
         let r = (u64::from(k) * u64::from(n) / u64::from(want)) as u32;
         if !inserted && op <= r {
-            push(b, op);
+            push(op);
             inserted = true;
         }
-        push(b, r);
+        push(r);
     }
     if !inserted {
-        push(b, op);
+        push(op);
     }
-    b.n_seg = m as u32;
-    for &r in &b.seg_row[..m.min(SEGS)] {
+    b.m.n_seg = m as u32;
+    for &r in &b.m.seg_row[..m.min(SEGS)] {
         b.tt[r as usize & ROW_MASK] |= SPLIT;
     }
     if n >= 65536 {
@@ -162,11 +169,48 @@ fn mark_splitters(b: &mut Bwt, n: u32, op: u32) -> u32 {
     }
 }
 
-/// Index of `row` in the sorted splitter list (`row` is a splitter).
-#[inline(always)]
-fn seg_index(b: &Bwt, row: u32) -> u32 {
-    let n = (b.n_seg as usize).min(SEGS);
-    b.seg_row[..n].partition_point(|&r| r < row) as u32
+impl Meta {
+    /// Index of `row` in the sorted splitter list (`row` is a splitter).
+    fn seg_index(&self, row: u32) -> u32 {
+        let n = (self.n_seg as usize).min(SEGS);
+        self.seg_row[..n].partition_point(|&r| r < row) as u32
+    }
+
+    /// Gives the lane a fresh chunk, linked after its current one.
+    fn new_chunk(&mut self, ln: &mut Lane) {
+        let c = self.next_chunk;
+        self.next_chunk += 1;
+        if ln.end != 0 {
+            let prev = ln.end as usize / CHUNK - 1;
+            self.chunk_next[prev % CHUNKS] = c;
+            ln.written += CHUNK as u32;
+        }
+        self.chunk_next[c as usize % CHUNKS] = 0;
+        ln.out = (c % CHUNKS as u32) * CHUNK as u32;
+        ln.end = ln.out + CHUNK as u32;
+    }
+
+    /// Starts the next unwalked segment on the lane: emits the splitter
+    /// row's byte and moves to its successor. False if none is left.
+    fn seg_begin(&mut self, tt: &[u32; ROWS], pool: &mut [u8; BYTES], ln: &mut Lane) -> bool {
+        if self.next_split >= self.n_seg {
+            return false;
+        }
+        let seg = self.next_split;
+        self.next_split += 1;
+        if ln.out == ln.end {
+            self.new_chunk(ln);
+        }
+        let s = seg as usize % SEGS;
+        self.seg_start[s] = ln.out;
+        ln.seg = seg;
+        ln.mark = ln.count();
+        let e = tt[self.seg_row[s] as usize & ROW_MASK];
+        pool[ln.out as usize & ROW_MASK] = e as u8;
+        ln.out += 1;
+        ln.p = (e >> 8) & ROW_MASK as u32;
+        true
+    }
 }
 
 #[derive(Clone, Copy, Default)]
@@ -185,134 +229,93 @@ struct Lane {
 }
 
 impl Lane {
-    #[inline(always)]
     fn count(&self) -> u32 {
         self.written + (CHUNK as u32 - (self.end - self.out))
     }
 }
 
-struct Walk<'a> {
-    b: &'a mut Bwt,
-    pool: &'a mut [u8; BYTES],
-    next_chunk: u32,
-    next_split: u32,
+/// One step of a lane: emits the current row's byte and follows the table.
+/// The rare cases (a marked row, a full chunk) go out of line. False when
+/// the lane has nothing left to walk.
+#[inline(always)]
+fn step(tt: &[u32; ROWS], pool: &mut [u8; BYTES], m: &mut Meta, ln: &mut Lane) -> bool {
+    let e = tt[ln.p as usize & ROW_MASK];
+    if e & SPLIT != 0 || ln.out == ln.end {
+        return step_slow(tt, pool, m, ln);
+    }
+    pool[ln.out as usize & ROW_MASK] = e as u8;
+    ln.out += 1;
+    ln.p = (e >> 8) & ROW_MASK as u32;
+    true
 }
 
-impl Walk<'_> {
-    /// Gives the lane a fresh chunk, linked after its current one.
-    #[inline(always)]
-    fn new_chunk(&mut self, ln: &mut Lane) {
-        let c = self.next_chunk;
-        self.next_chunk += 1;
-        if ln.end != 0 {
-            let prev = ln.end as usize / CHUNK - 1;
-            self.b.chunk_next[prev % CHUNKS] = c;
-            ln.written += CHUNK as u32;
-        }
-        self.b.chunk_next[c as usize % CHUNKS] = 0;
-        ln.out = (c % CHUNKS as u32) * CHUNK as u32;
-        ln.end = ln.out + CHUNK as u32;
-    }
-
-    /// Starts segment `seg` on the lane: emits the splitter row's byte and
-    /// moves to its successor.
-    #[inline(always)]
-    fn seg_begin(&mut self, ln: &mut Lane, seg: u32) {
-        if ln.out == ln.end {
-            self.new_chunk(ln);
-        }
-        let s = seg as usize % SEGS;
-        self.b.seg_start[s] = ln.out;
-        ln.seg = seg;
-        ln.mark = ln.count();
-        let e = self.b.tt[self.b.seg_row[s] as usize & ROW_MASK];
-        self.pool[ln.out as usize & ROW_MASK] = e as u8;
-        ln.out += 1;
-        ln.p = (e >> 8) & ROW_MASK as u32;
-    }
-
-    /// One step of a lane: emits the current row's byte and follows the
-    /// table, or ends the segment at a marked row. False when the lane has
-    /// nothing left to walk.
-    #[inline(always)]
-    fn step(&mut self, ln: &mut Lane) -> bool {
-        let e = self.b.tt[ln.p as usize & ROW_MASK];
-        if e & SPLIT != 0 {
-            return self.seg_done(ln);
-        }
-        if ln.out == ln.end {
-            self.new_chunk(ln);
-        }
-        self.pool[ln.out as usize & ROW_MASK] = e as u8;
-        ln.out += 1;
-        ln.p = (e >> 8) & ROW_MASK as u32;
-        true
-    }
-
-    #[inline(never)]
-    fn seg_done(&mut self, ln: &mut Lane) -> bool {
+#[cold]
+#[inline(never)]
+fn step_slow(tt: &[u32; ROWS], pool: &mut [u8; BYTES], m: &mut Meta, ln: &mut Lane) -> bool {
+    let e = tt[ln.p as usize & ROW_MASK];
+    if e & SPLIT != 0 {
+        // End of the segment: record it and take the next one.
         let s = ln.seg as usize % SEGS;
-        self.b.seg_len[s] = ln.count() - ln.mark;
-        self.b.seg_next[s] = seg_index(self.b, ln.p);
-        if self.next_split < self.b.n_seg {
-            let seg = self.next_split;
-            self.next_split += 1;
-            self.seg_begin(ln, seg);
-            true
-        } else {
-            false
-        }
+        m.seg_len[s] = ln.count() - ln.mark;
+        m.seg_next[s] = m.seg_index(ln.p);
+        return m.seg_begin(tt, pool, ln);
     }
+    m.new_chunk(ln);
+    pool[ln.out as usize & ROW_MASK] = e as u8;
+    ln.out += 1;
+    ln.p = (e >> 8) & ROW_MASK as u32;
+    true
+}
 
-    /// Walks every segment with `K` lanes in lock step, then finishes the
-    /// stragglers.
-    fn walk<const K: usize>(&mut self) {
-        let mut ln = [Lane::default(); K];
-        let mut active = 0;
-        while active < K && self.next_split < self.b.n_seg {
-            let mut l = Lane::default();
-            self.new_chunk(&mut l);
-            l.written = 0;
-            let seg = self.next_split;
-            self.next_split += 1;
-            self.seg_begin(&mut l, seg);
-            ln[active] = l;
-            active += 1;
+/// Walks every segment with `K` lanes in lock step, then finishes the
+/// stragglers.
+#[inline(never)]
+fn walk<const K: usize>(tt: &[u32; ROWS], pool: &mut [u8; BYTES], m: &mut Meta) {
+    let mut ln = [Lane::default(); K];
+    let mut active = 0;
+    while active < K {
+        let mut l = Lane::default();
+        m.new_chunk(&mut l);
+        l.written = 0;
+        if !m.seg_begin(tt, pool, &mut l) {
+            break;
         }
-        if active == K {
-            let mut dead = 0u32;
-            while dead == 0 {
-                for (k, l) in ln.iter_mut().enumerate() {
-                    dead |= u32::from(!self.step(l)) << k;
-                }
+        ln[active] = l;
+        active += 1;
+    }
+    if active == K {
+        let mut dead = 0u32;
+        while dead == 0 {
+            for (k, l) in ln.iter_mut().enumerate() {
+                dead |= u32::from(!step(tt, pool, m, l)) << k;
             }
-            let mut a = 0;
-            for k in 0..K {
-                if dead >> k & 1 == 0 {
-                    ln[a] = ln[k];
-                    a += 1;
-                }
-            }
-            active = a;
         }
-        let mut k = 0;
-        while active > 0 {
-            if k >= active {
-                k = 0;
+        let mut a = 0;
+        for k in 0..K {
+            if dead >> k & 1 == 0 {
+                ln[a] = ln[k];
+                a += 1;
             }
-            if self.step(&mut ln[k]) {
-                k += 1;
-            } else {
-                active -= 1;
-                ln[k] = ln[active];
-            }
+        }
+        active = a;
+    }
+    let mut k = 0;
+    while active > 0 {
+        if k >= active {
+            k = 0;
+        }
+        if step(tt, pool, m, &mut ln[k]) {
+            k += 1;
+        } else {
+            active -= 1;
+            ln[k] = ln[active];
         }
     }
 }
 
 /// Copies the segments into `text` in text order, starting with the one at
 /// `orig_ptr` and wrapping round the cycle until `n` bytes are out.
-fn gather(b: &Bwt, pool: &[u8; BYTES], origin: u32, n: u32, text: &mut [u8; BYTES]) {
+fn gather(b: &Meta, pool: &[u8; BYTES], origin: u32, n: u32, text: &mut [u8; BYTES]) {
     let n = (n as usize).min(ROWS);
     let mut seg = origin as usize % SEGS;
     let mut t = 0usize;
