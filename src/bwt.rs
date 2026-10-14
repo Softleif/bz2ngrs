@@ -29,16 +29,24 @@ const SEG_ROWS: u32 = 2048;
 const SEGS: usize = 512;
 const SPLIT: u32 = 0x8000_0000;
 
-/// Per-thread arrays of the inverse BWT. Part of [`crate::decode::Scratch`],
-/// so it must hold only integers (all-zero bytes must be a valid value).
+/// Per-thread arrays of the inverse BWT.
 pub(crate) struct Bwt {
-    tt: [u32; ROWS],
+    tt: Box<[u32; ROWS]>,
     m: Meta,
+}
+
+impl Bwt {
+    pub(crate) fn new() -> Bwt {
+        Bwt {
+            tt: crate::decode::zeroed_box!(u32, ROWS),
+            m: Meta::ZERO,
+        }
+    }
 }
 
 /// The walk's bookkeeping. Kept apart from the table and the pool so that
 /// the walk can take all three as separate arguments: LLVM then knows the
-/// pool's byte stores do not change them. Integers only, like [`Bwt`].
+/// pool's byte stores do not change them.
 struct Meta {
     chunk_next: [u32; CHUNKS],
     seg_row: [u32; SEGS],
@@ -168,6 +176,17 @@ fn mark_splitters(b: &mut Bwt, n: u32, op: u32) -> u32 {
 }
 
 impl Meta {
+    const ZERO: Meta = Meta {
+        chunk_next: [0; CHUNKS],
+        seg_row: [0; SEGS],
+        seg_start: [0; SEGS],
+        seg_len: [0; SEGS],
+        seg_next: [0; SEGS],
+        n_seg: 0,
+        next_chunk: 0,
+        next_split: 0,
+    };
+
     /// Index of `row` in the sorted splitter list (`row` is a splitter).
     fn seg_index(&self, row: u32) -> u32 {
         let n = (self.n_seg as usize).min(SEGS);
