@@ -457,12 +457,14 @@ fn step<S: Simd>(
     // later or land in L's slack.
     store16(ll, st.nb as usize, st.head);
     st.nb += u32::from(!is_run);
-    st.run = if is_run {
-        st.run.wrapping_add((sym + 1).wrapping_shl(st.rshift))
-    } else {
-        0
-    };
-    st.rshift = if is_run { st.rshift + 1 } else { 0 };
+    // The run/literal pattern is close to random, and on x86-64 LLVM turns
+    // plain ternaries here into a branch on it (notes/12-x86.md).
+    st.run = core::hint::select_unpredictable(
+        is_run,
+        st.run.wrapping_add((sym + 1).wrapping_shl(st.rshift)),
+        0,
+    );
+    st.rshift = core::hint::select_unpredictable(is_run, st.rshift + 1, 0);
     CONT
 }
 
