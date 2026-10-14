@@ -31,6 +31,7 @@ pub(crate) struct Scratch {
 }
 
 impl Scratch {
+    #[allow(unsafe_code, reason = "lazily zeroed boxed scratch via new_zeroed")]
     pub(crate) fn new_boxed() -> Box<Scratch> {
         // SAFETY: Scratch holds only integers and arrays of integers (and
         // structs of those), for which all-zero bytes are a valid value.
