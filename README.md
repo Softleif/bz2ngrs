@@ -72,7 +72,7 @@ Decode speed in MB/s of uncompressed data (MB = 10^6 bytes), median of 7 rounds,
 
 On 11 sets of real bzip2 blocks extracted from CRAM files (htslib levels 1, 6 and 9 and CRAM 3.1 profiles; 73 B to 1.9 MB per block), bz2ngrs runs at 1.07 to 1.19 times bz2-ng C and 2.1 to 4.4 times the `bzip2` crate.
 
-- **Machine.** Apple M4 Pro (aarch64, NEON), with desktop applications running, so expect a few percent of noise between runs. **x86 speed has not been measured.** The x86 code paths (SSE4.2, AVX2, PCLMULQDQ) are tested for correctness in CI but not benchmarked.
+- **Machine.** Apple M4 Pro (aarch64, NEON), with desktop applications running, so expect a few percent of noise between runs. On an AMD Ryzen 9 3950X (Zen 2, AVX2), bz2ngrs runs at 0.99 to 1.22 times bz2-ng C at 16 and 64 KiB, but 0.88 to 1.06 times at 1 MiB, and 0.91 to 1.07 times on the CRAM sets (`notes/12-x86.md`).
 - **Per-call cost.** The "bz2ngrs" column is one `Decoder` reused for every stream, as a reader would use it. Decoding an empty 14-byte stream with a reused `Decoder` takes about 16 ns here, against about 150 ns for the C library and about 15 µs for the `bzip2` crate, because the working memory is kept between calls (see Memory).
 - **Reproduce.** The `bench` crate links bz2-ng's C sources, which are not in this repository. Point `BZ2NG_C_DIR` at the `c/` directory of a bz2-ng checkout and the `--data` flag at its `data/corpora/1kg` corpora, then run `cargo run --release -p bz2ngrs-bench`. See `bench/README.md` for flags, and `notes/05-baseline-bench.md` and `notes/06-perf-log.md` for method and history.
 
