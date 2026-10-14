@@ -22,6 +22,7 @@ mod crc;
     reason = "values bounded by the format"
 )]
 mod huffman;
+mod unrle;
 
 use core::fmt;
 
