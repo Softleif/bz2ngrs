@@ -3,7 +3,8 @@
 
 use fearless_simd::{Simd, SimdBase, u8x32};
 
-use crate::Error;
+use crate::Corruption;
+use crate::error::Fail;
 
 /// Text bytes that must remain for a bulk step. A step consumes at most 12
 /// and stores at most 31 bytes past its output, and the at least 52 text
@@ -47,7 +48,7 @@ fn bulk<S: Simd, const WIDE: bool>(
     mut j: usize,
     mut o: usize,
     mut lit: usize,
-) -> Result<(usize, usize, usize), Error> {
+) -> Result<(usize, usize, usize), Fail> {
     let (margin, room) = if WIDE {
         (WIDE_MARGIN, 288)
     } else {
@@ -110,7 +111,7 @@ pub(crate) fn unrle<S: Simd>(
     text: &[u8],
     out: &mut [u8],
     o: usize,
-) -> Result<usize, Error> {
+) -> Result<usize, Fail> {
     let (j, o, lit) = bulk::<S, true>(simd, text, out, 0, o, 0)?;
     let (mut j, mut o, lit) = bulk::<S, false>(simd, text, out, j, o, lit)?;
 
@@ -126,7 +127,7 @@ pub(crate) fn unrle<S: Simd>(
     }
     while let Some(&x) = text.get(j) {
         j += 1;
-        *out.get_mut(o).ok_or(Error::OutputTooSmall)? = x;
+        *out.get_mut(o).ok_or(Fail::OutputFull)? = x;
         o += 1;
         if eq > 0 && x == last {
             eq += 1;
@@ -137,11 +138,9 @@ pub(crate) fn unrle<S: Simd>(
         if eq == 4 {
             // Four equal bytes ending the block, with no count byte, is
             // libbz2's one corrupt-output case.
-            let cnt = usize::from(*text.get(j).ok_or(Error::Corrupt)?);
+            let cnt = usize::from(*text.get(j).ok_or(Fail::Corrupt(Corruption::RunCount))?);
             j += 1;
-            out.get_mut(o..o + cnt)
-                .ok_or(Error::OutputTooSmall)?
-                .fill(x);
+            out.get_mut(o..o + cnt).ok_or(Fail::OutputFull)?.fill(x);
             o += cnt;
             eq = 0;
         }
@@ -154,7 +153,7 @@ pub(crate) fn unrle<S: Simd>(
 /// mispredict) that may overshoot; a longer one ends with a store that
 /// overlaps the previous one, so it does not.
 #[inline(always)]
-fn fill<S: Simd>(simd: S, out: &mut [u8], o: usize, ch: u8, total: usize) -> Result<(), Error> {
+fn fill<S: Simd>(simd: S, out: &mut [u8], o: usize, ch: u8, total: usize) -> Result<(), Fail> {
     let v = u8x32::splat(simd, ch);
     if let Some(d) = out.get_mut(o..o + total.max(32)) {
         let last = d.len() - 32;
@@ -166,9 +165,7 @@ fn fill<S: Simd>(simd: S, out: &mut [u8], o: usize, ch: u8, total: usize) -> Res
         v.store_slice(&mut d[last..]);
         Ok(())
     } else {
-        out.get_mut(o..o + total)
-            .ok_or(Error::OutputTooSmall)?
-            .fill(ch);
+        out.get_mut(o..o + total).ok_or(Fail::OutputFull)?.fill(ch);
         Ok(())
     }
 }

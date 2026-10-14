@@ -504,17 +504,30 @@ pub fn several_blocks(tc: &TestCase) -> Spec {
     Spec { digit, blocks }
 }
 
-/// One block of one to three rows more than the digit allows.
+/// Zero to three valid blocks, then one whose `origPtr` is out of range.
+#[hegel::composite]
+pub fn bad_orig_ptr_last(tc: &TestCase) -> Spec {
+    let digit = digit(tc);
+    let mut blocks: Vec<Recipe> = (0..below(tc, 4))
+        .map(|_| tc.draw(recipe(digit, 3000, OrigClass::InRange)))
+        .collect();
+    blocks.push(tc.draw(recipe(digit, usize::MAX, OrigClass::OutOfRange)));
+    Spec { digit, blocks }
+}
+
+/// Zero to two valid blocks, then one of one to three rows more than the
+/// digit allows.
 #[hegel::composite]
 pub fn oversize_block(tc: &TestCase) -> Spec {
     let digit = digit(tc);
-    let mut r = tc.draw(recipe(digit, 1, OrigClass::InRange));
-    r.n = max_rows(digit) + 1 + below(tc, 3);
-    if r.shape == Shape::Text {
-        r.shape = Shape::Runs;
+    let mut blocks: Vec<Recipe> = (0..below(tc, 3))
+        .map(|_| tc.draw(recipe(digit, 3000, OrigClass::InRange)))
+        .collect();
+    let mut last = tc.draw(recipe(digit, 1, OrigClass::InRange));
+    last.n = max_rows(digit) + 1 + below(tc, 3);
+    if last.shape == Shape::Text {
+        last.shape = Shape::Runs;
     }
-    Spec {
-        digit,
-        blocks: vec![r],
-    }
+    blocks.push(last);
+    Spec { digit, blocks }
 }

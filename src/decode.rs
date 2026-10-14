@@ -4,11 +4,12 @@
 
 use fearless_simd::{Select, Simd, SimdBase, SimdFrom, u8x16};
 
-use crate::Error;
 use crate::bits::Bits;
 use crate::bwt::{self, BYTES, Bwt, ROW_MASK};
+use crate::error::{self, Fail};
 use crate::huffman::{HTable, MAX_ALPHA};
 use crate::unrle;
+use crate::{Corruption, Error};
 
 /// libbz2 1.0.8 keeps this many selectors and reads and ignores the rest.
 const MAX_SELECTORS: usize = 18002;
@@ -64,22 +65,23 @@ impl Scratch {
     }
 }
 
-/// The error for a failure at the reader's current position: a stream that
-/// has run out of input is truncated rather than corrupt. Inlined, so the
+/// The failure for a problem at the reader's current position: a stream that
+/// has run out of input is truncated rather than `why`. Inlined, so the
 /// reader's address does not escape.
 #[inline(always)]
-fn fail(br: &Bits) -> Error {
-    if br.overrun() {
-        Error::UnexpectedEof
-    } else {
-        Error::Corrupt
-    }
+fn fail(br: &Bits, why: Fail) -> Fail {
+    if br.overrun() { Fail::Eof } else { why }
 }
 
-fn expect(br: &mut Bits, bytes: &[u8]) -> Result<(), Error> {
+#[inline(always)]
+fn corrupt(br: &Bits, kind: Corruption) -> Fail {
+    fail(br, Fail::Corrupt(kind))
+}
+
+fn expect(br: &mut Bits, bytes: &[u8], why: Fail) -> Result<(), Fail> {
     for &b in bytes {
         if br.get(8) != u32::from(b) {
-            return Err(fail(br));
+            return Err(fail(br, why));
         }
     }
     Ok(())
@@ -94,10 +96,32 @@ pub(crate) fn decode_stream<S: Simd>(
     sc: &mut Scratch,
 ) -> Result<usize, Error> {
     let mut br = Bits::new(src);
-    expect(&mut br, b"BZh")?;
+    let mut block = 0u32;
+    // Returns the public error for a `Fail`, from scalars read off the reader
+    // on the cold path.
+    macro_rules! bail {
+        ($f:expr) => {
+            return Err(error::raise(
+                $f,
+                block,
+                br.consumed(),
+                br.len_bits(),
+                out.len(),
+            ))
+        };
+    }
+    macro_rules! check {
+        ($r:expr) => {
+            match $r {
+                Ok(v) => v,
+                Err(f) => bail!(f),
+            }
+        };
+    }
+    check!(expect(&mut br, b"BZh", Fail::NotBzip2));
     let digit = br.get(8).wrapping_sub(u32::from(b'0'));
     if !(1..=9).contains(&digit) {
-        return Err(fail(&br));
+        bail!(fail(&br, Fail::NotBzip2));
     }
     let nmax = 100_000 * digit;
     let mut o = 0usize;
@@ -105,45 +129,66 @@ pub(crate) fn decode_stream<S: Simd>(
     loop {
         let b = br.get(8);
         if b == 0x17 {
-            expect(&mut br, &[0x72, 0x45, 0x38, 0x50, 0x90])?;
+            check!(expect(
+                &mut br,
+                &[0x72, 0x45, 0x38, 0x50, 0x90],
+                Fail::Corrupt(Corruption::BlockMagic)
+            ));
             let stored = br.get(32);
             if br.overrun() {
-                return Err(Error::UnexpectedEof);
+                bail!(Fail::Eof);
             }
             return if stored == combined {
                 Ok(o)
             } else {
-                Err(Error::CrcMismatch)
+                Err(Error::StreamCrc {
+                    stored,
+                    computed: combined,
+                })
             };
         }
         if b != 0x31 {
-            return Err(fail(&br));
+            bail!(corrupt(&br, Corruption::BlockMagic));
         }
-        expect(&mut br, &[0x41, 0x59, 0x26, 0x53, 0x59])?;
+        check!(expect(
+            &mut br,
+            &[0x41, 0x59, 0x26, 0x53, 0x59],
+            Fail::Corrupt(Corruption::BlockMagic)
+        ));
         let stored_crc = br.get(32);
         let randomised = br.get(1) != 0;
         let orig_ptr = br.get(24);
         if orig_ptr > 10 + nmax {
-            return Err(fail(&br));
+            bail!(corrupt(&br, Corruption::OrigPtr));
         }
-        let (eob, n_selectors) = block_tables(simd, &mut br, sc)?;
-        let n = symbols(simd, &mut br, sc, eob, n_selectors, nmax)?;
+        let (eob, n_selectors) = check!(block_tables(simd, &mut br, sc));
+        let n = check!(symbols(simd, &mut br, sc, eob, n_selectors, nmax));
         if orig_ptr >= n {
-            return Err(Error::Corrupt);
+            bail!(Fail::Corrupt(Corruption::OrigPtr));
         }
 
         bwt::inverse(&mut sc.bwt, &mut sc.ll, n, orig_ptr, &mut sc.text);
-        let text = sc.text.get_mut(..n as usize).ok_or(Error::Corrupt)?;
+        // Cannot fail: `symbols` bounds `n` by `nmax`, which is within `BYTES`.
+        let text = check!(
+            sc.text
+                .get_mut(..n as usize)
+                .ok_or(Fail::Corrupt(Corruption::BlockTooLong))
+        );
         if randomised {
             unrle::derandomise(text);
         }
-        let o2 = unrle::unrle(simd, text, out, o)?;
+        let o2 = check!(unrle::unrle(simd, text, out, o));
         let crc = !crate::crc::update(!0, out.get(o..o2).unwrap_or_default());
         if crc != stored_crc {
-            return Err(Error::CrcMismatch);
+            return Err(Error::BlockCrc {
+                block,
+                stored: stored_crc,
+                computed: crc,
+            });
         }
         combined = combined.rotate_left(1) ^ crc;
         o = o2;
+        block = block.saturating_add(1);
     }
 }
 
@@ -151,7 +196,7 @@ pub(crate) fn decode_stream<S: Simd>(
 /// Huffman tables and the MTF list. Returns the EOB symbol and the number of
 /// selectors kept.
 #[inline(always)]
-fn block_tables<S: Simd>(simd: S, br: &mut Bits, sc: &mut Scratch) -> Result<(u32, usize), Error> {
+fn block_tables<S: Simd>(simd: S, br: &mut Bits, sc: &mut Scratch) -> Result<(u32, usize), Fail> {
     let in_use16 = br.get(16);
     let mut n_in_use = 0usize;
     for i in 0..16 {
@@ -166,17 +211,17 @@ fn block_tables<S: Simd>(simd: S, br: &mut Bits, sc: &mut Scratch) -> Result<(u3
         }
     }
     if n_in_use == 0 {
-        return Err(fail(br));
+        return Err(corrupt(br, Corruption::NoSymbols));
     }
     let alpha_size = n_in_use + 2;
 
     let n_groups = br.get(3) as usize;
     if !(2..=6).contains(&n_groups) {
-        return Err(fail(br));
+        return Err(corrupt(br, Corruption::GroupCount));
     }
     let n_selectors = br.get(15) as usize;
     if n_selectors < 1 {
-        return Err(fail(br));
+        return Err(corrupt(br, Corruption::SelectorCount));
     }
     // Selector MTF values are undone as they arrive. A unary code is a count
     // of leading ones.
@@ -188,7 +233,7 @@ fn block_tables<S: Simd>(simd: S, br: &mut Bits, sc: &mut Scratch) -> Result<(u3
         let j = (!br.buf).leading_zeros() as usize;
         if j >= n_groups {
             br.consume(n_groups as u32);
-            return Err(fail(br));
+            return Err(corrupt(br, Corruption::Selector));
         }
         br.consume(j as u32 + 1);
         if i < MAX_SELECTORS {
@@ -207,7 +252,7 @@ fn block_tables<S: Simd>(simd: S, br: &mut Bits, sc: &mut Scratch) -> Result<(u3
         for i in 0..alpha_size {
             loop {
                 if !(1..=20).contains(&curr) {
-                    return Err(fail(br));
+                    return Err(corrupt(br, Corruption::CodeLength));
                 }
                 if br.cnt < 2 {
                     br.refill();
@@ -273,7 +318,7 @@ fn symbols<S: Simd>(
     eob: u32,
     n_selectors: usize,
     nmax: u32,
-) -> Result<u32, Error> {
+) -> Result<u32, Fail> {
     let Scratch { ll, small, .. } = sc;
     let Small {
         tables,
@@ -319,35 +364,39 @@ fn symbols<S: Simd>(
                 CONT => {}
                 EOB => {
                     return if br.overrun() {
-                        Err(Error::UnexpectedEof)
+                        Err(Fail::Eof)
                     } else {
                         Ok(st.nb)
                     };
                 }
                 _ => {
                     // libbz2 stops right after this symbol: truncated only if
-                    // its bits are not all in the input.
-                    if br.overrun() {
-                        br.reset(start);
-                        for _ in 0..=i {
-                            br.refill();
-                            br.consume(t.decode(br.buf) & 31);
-                        }
+                    // its bits are not all in the input. Rewinding to it also
+                    // gives the error its position.
+                    br.reset(start);
+                    for _ in 0..=i {
+                        br.refill();
+                        br.consume(t.decode(br.buf) & 31);
                     }
-                    return Err(fail(br));
+                    let kind = if sym < 2 && st.rshift >= 21 {
+                        Corruption::RunTooLong
+                    } else {
+                        Corruption::BlockTooLong
+                    };
+                    return Err(corrupt(br, kind));
                 }
             }
         }
         if bad {
             // libbz2 rejects a pattern once 21 of its bits are in.
             return Err(if br.overrun_by(21) {
-                Error::UnexpectedEof
+                Fail::Eof
             } else {
-                Error::Corrupt
+                Fail::Corrupt(Corruption::HuffmanCode)
             });
         }
     }
-    Err(fail(br))
+    Err(corrupt(br, Corruption::NoEndOfBlock))
 }
 
 /// One symbol (`kern_template.h` SYMBOL_STEP): run and literal symbols take

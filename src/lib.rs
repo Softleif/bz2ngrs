@@ -31,6 +31,7 @@ mod crc;
     reason = "values bounded by the format"
 )]
 mod decode;
+mod error;
 #[allow(
     clippy::cast_possible_truncation,
     clippy::cast_possible_wrap,
@@ -40,38 +41,10 @@ mod huffman;
 mod unrle;
 
 use core::cell::Cell;
-use core::fmt;
+
+pub use error::{Corruption, Error, Position};
 
 use decode::Scratch;
-
-/// Why a stream could not be decompressed.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[non_exhaustive]
-pub enum Error {
-    /// The input is not a bzip2 stream or is corrupt (bad magic, bad block
-    /// header, invalid Huffman tables or selectors, `origPtr` out of range,
-    /// a run that overflows the block).
-    Corrupt,
-    /// A block's CRC or the stream's combined CRC does not match the data.
-    CrcMismatch,
-    /// The input ends before the end-of-stream marker.
-    UnexpectedEof,
-    /// The stream decodes to more bytes than `out` holds.
-    OutputTooSmall,
-}
-
-impl fmt::Display for Error {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(match self {
-            Error::Corrupt => "corrupt bzip2 stream",
-            Error::CrcMismatch => "bzip2 CRC mismatch",
-            Error::UnexpectedEof => "bzip2 stream ends early",
-            Error::OutputTooSmall => "bzip2 stream decodes past the output buffer",
-        })
-    }
-}
-
-impl std::error::Error for Error {}
 
 /// Decompresses the single bzip2 stream at the start of `src` into `out` and
 /// returns how many bytes it wrote. Bytes after the end-of-stream marker are
