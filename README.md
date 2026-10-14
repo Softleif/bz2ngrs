@@ -56,24 +56,24 @@ A result never depends on earlier calls: a `Decoder` that has decoded other stre
 
 ## Performance
 
-Decode speed in MB/s of uncompressed data (MB = 10^6 bytes), median of 5 rounds, single thread, each chunk an independent stream written at level 9, on the 1000 Genomes NA12878 MC, XA and QUAL tag data. "bzip2" is the `bzip2` 0.6.1 crate (libbz2-rs-sys); "C" is bz2-ng's C library, linked into the same process.
+Decode speed in MB/s of uncompressed data (MB = 10^6 bytes), median of 7 rounds, single thread, each chunk an independent stream written at level 9, on the 1000 Genomes NA12878 MC, XA and QUAL tag data. "bzip2" is the `bzip2` 0.6.1 crate (libbz2-rs-sys); "C" is bz2-ng's C library, linked into the same process.
 
 | set | chunk | bz2ngrs | bzip2 crate | bz2-ng C | ours / C |
 |---|---|---:|---:|---:|---:|
-| MC | 16 KiB | 400.7 | 156.8 | 355.4 | 1.13 |
-| MC | 64 KiB | 409.6 | 154.0 | 406.6 | 1.01 |
-| MC | 1 MiB | 428.6 | 101.2 | 441.0 | 0.97 |
-| XA | 16 KiB | 242.1 | 73.5 | 222.9 | 1.09 |
-| XA | 64 KiB | 257.5 | 72.9 | 255.0 | 1.01 |
-| XA | 1 MiB | 267.3 | 63.3 | 272.4 | 0.98 |
-| QUAL | 16 KiB | 927.1 | 205.2 | 798.4 | 1.16 |
-| QUAL | 64 KiB | 1107.5 | 262.2 | 987.9 | 1.12 |
-| QUAL | 1 MiB | 1268.3 | 283.0 | 1188.1 | 1.07 |
+| MC | 16 KiB | 452 | 156 | 355 | 1.27 |
+| MC | 64 KiB | 476 | 154 | 411 | 1.16 |
+| MC | 1 MiB | 502 | 101 | 435 | 1.15 |
+| XA | 16 KiB | 263 | 74 | 225 | 1.17 |
+| XA | 64 KiB | 281 | 72 | 251 | 1.12 |
+| XA | 1 MiB | 292 | 62 | 269 | 1.08 |
+| QUAL | 16 KiB | 933 | 206 | 798 | 1.17 |
+| QUAL | 64 KiB | 1134 | 262 | 994 | 1.14 |
+| QUAL | 1 MiB | 1365 | 283 | 1186 | 1.15 |
 
-On 11 sets of real bzip2 blocks extracted from CRAM files, the ratio to bz2-ng C was 0.99 to 1.08 in one run and 0.97 to 1.09 in a repeat (`notes/06-perf-log.md`).
+On 11 sets of real bzip2 blocks extracted from CRAM files (htslib levels 1, 6 and 9 and CRAM 3.1 profiles; 73 B to 1.9 MB per block), bz2ngrs runs at 1.07 to 1.19 times bz2-ng C and 2.1 to 4.4 times the `bzip2` crate.
 
-- **Machine.** Apple M4 Pro (aarch64, NEON). The machine was shared with other jobs, so expect a few percent of noise between runs. **x86 speed has not been measured.** The x86 code paths (SSE4.2, AVX2, PCLMULQDQ) are tested for correctness in CI but not benchmarked.
-- **Per-call cost.** The "bz2ngrs" column is one `Decoder` reused for every stream, as a reader would use it. Decoding an empty 14-byte stream with a reused `Decoder` takes about 16 ns here, against about 394 ns for the C library and about 15.5 us for the `bzip2` crate, because the working memory is kept between calls (see Memory).
+- **Machine.** Apple M4 Pro (aarch64, NEON), with desktop applications running, so expect a few percent of noise between runs. **x86 speed has not been measured.** The x86 code paths (SSE4.2, AVX2, PCLMULQDQ) are tested for correctness in CI but not benchmarked.
+- **Per-call cost.** The "bz2ngrs" column is one `Decoder` reused for every stream, as a reader would use it. Decoding an empty 14-byte stream with a reused `Decoder` takes about 16 ns here, against about 150 ns for the C library and about 15 µs for the `bzip2` crate, because the working memory is kept between calls (see Memory).
 - **Reproduce.** The `bench` crate links bz2-ng's C sources, which are not in this repository. Point `BZ2NG_C_DIR` at the `c/` directory of a bz2-ng checkout and the `--data` flag at its `data/corpora/1kg` corpora, then run `cargo run --release -p bz2ngrs-bench`. See `bench/README.md` for flags, and `notes/05-baseline-bench.md` and `notes/06-perf-log.md` for method and history.
 
 ## How it works
