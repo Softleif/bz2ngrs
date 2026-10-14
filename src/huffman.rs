@@ -15,8 +15,6 @@ pub(crate) const MAX_CODE: u32 = 20;
 /// Most symbols in an alphabet (256 bytes + RUNA/RUNB, minus one, plus EOB).
 pub(crate) const MAX_ALPHA: usize = 258;
 
-/// Part of [`crate::decode::Scratch`], so it must hold only integers (all-zero
-/// bytes must be a valid value).
 #[derive(Clone)]
 pub(crate) struct HTable {
     /// `symbol << 5 | length`; length 0 means longer than `K` bits, or no code.
@@ -31,6 +29,15 @@ pub(crate) struct HTable {
 }
 
 impl HTable {
+    pub(crate) const ZERO: HTable = HTable {
+        prim: [0; 1 << K],
+        limit_lj: [0; MAX_CODE as usize + 2],
+        first_code: [0; MAX_CODE as usize + 2],
+        first_idx: [0; MAX_CODE as usize + 2],
+        perm: [0; MAX_ALPHA],
+        maxlen: 0,
+    };
+
     /// Builds the table for `lengths` (each 1..=20, at most 258 of them).
     #[inline(always)]
     pub(crate) fn build<S: Simd>(&mut self, simd: S, lengths: &[u8]) {
