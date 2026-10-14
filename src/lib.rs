@@ -2,6 +2,14 @@
 //! bz2-ng, the fast libbz2 replacement in C, for callers that hold a whole
 //! compressed stream in memory and know its uncompressed size (CRAM blocks).
 
+// The decoder's casts narrow row indices, symbols and code lengths, which
+// the format bounds far below the target types (rows < 2^20, symbols < 258,
+// lengths <= 20); the hot loops rely on them being plain casts.
+#[allow(
+    clippy::cast_possible_truncation,
+    reason = "values bounded by the format"
+)]
+mod bits;
 mod crc;
 
 use core::fmt;
