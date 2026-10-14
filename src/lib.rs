@@ -77,12 +77,14 @@ impl std::error::Error for Error {}
 /// returns how many bytes it wrote. Bytes after the end-of-stream marker are
 /// ignored, as `bzip2::read::BzDecoder` and libbz2's `BZ2_bzDecompress` do.
 ///
-/// Accepts and rejects exactly the streams libbz2 1.0.8 does. Returns
-/// [`Error::OutputTooSmall`] as soon as the output would pass `out.len()`.
+/// Accepts and rejects exactly the streams libbz2 1.0.8 does. For a stream
+/// libbz2 accepts, returns [`Error::OutputTooSmall`] as soon as the output
+/// would pass `out.len()`; a corrupt stream may report its corruption first.
 ///
-/// Never panics, whatever `src` holds. On success the bytes of `out` past the
-/// returned length are untouched. On error the contents of `out` are
-/// unspecified.
+/// Never panics, whatever `src` holds (a failure to allocate the per-thread
+/// memory aborts, as Rust's allocation failures do). On success the bytes of
+/// `out` past the returned length are untouched. On error the contents of
+/// `out` are unspecified.
 pub fn decompress(src: &[u8], out: &mut [u8]) -> Result<usize, Error> {
     __decompress_at(fearless_simd::Level::new(), src, out)
 }

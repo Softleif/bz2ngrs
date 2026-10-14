@@ -15,6 +15,8 @@ pub(crate) const MAX_CODE: u32 = 20;
 /// Most symbols in an alphabet (256 bytes + RUNA/RUNB, minus one, plus EOB).
 pub(crate) const MAX_ALPHA: usize = 258;
 
+/// Part of [`crate::decode::Scratch`], so it must hold only integers (all-zero
+/// bytes must be a valid value).
 #[derive(Clone)]
 pub(crate) struct HTable {
     /// `symbol << 5 | length`; length 0 means longer than `K` bits, or no code.
