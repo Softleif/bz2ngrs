@@ -5,6 +5,9 @@ edition = "2024"
 rust-version = "1.98.1"
 license = "MIT"
 description = "Fast one-shot bzip2 decompression, a Rust port of bz2-ng's decoder"
+readme = "README.md"
+keywords = ["bzip2", "decompression", "simd", "cram"]
+categories = ["compression"]
 publish = false
 
 [workspace]
