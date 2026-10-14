@@ -20,7 +20,13 @@ fuzz_target!(|input: Input| {
     let level = u32::from(input.level % 9) + 1;
     let times = 1 + usize::from(input.repeat) % 2048;
     // 8 MB at most: a handful of level-1 blocks.
-    let data: Vec<u8> = input.data.iter().copied().cycle().take((input.data.len() * times).min(8 << 20)).collect();
+    let data: Vec<u8> = input
+        .data
+        .iter()
+        .copied()
+        .cycle()
+        .take((input.data.len() * times).min(8 << 20))
+        .collect();
     let stream = compress(&data, level);
     for decoder in all_decoders() {
         check_exact(decoder, &stream, &data);

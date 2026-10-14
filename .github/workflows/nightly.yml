@@ -1,0 +1,82 @@
+name: Nightly
+
+on:
+  schedule:
+    # Run nightly at 03:00 UTC
+    - cron: "0 3 * * *"
+  workflow_dispatch:
+    inputs:
+      duration:
+        description: "Seconds per fuzz target"
+        required: false
+        default: "600"
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+# Both architectures: each has its own SIMD levels and CRC paths.
+jobs:
+  fuzz:
+    name: Fuzz all targets (${{ matrix.runner }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-latest, ubuntu-24.04-arm]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f # v2.0.0
+        with:
+          components: llvm-tools-preview
+
+      - uses: taiki-e/install-action@4cef1412cce204788f482e778a0b9187f9626a29 # v2.87.21
+        with:
+          tool: cargo-fuzz
+
+      # Via env, not `${{ }}` in the script: the input is free text.
+      - name: Run all fuzz targets
+        env:
+          DURATION: ${{ inputs.duration || '600' }}
+        run: ./fuzz/run_all.sh "$DURATION"
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: failure()
+        with:
+          name: fuzzing-artifacts-${{ matrix.runner }}--${{ github.sha }}
+          path: fuzz/artifacts
+
+  thorough:
+    name: Property tests (thorough, ${{ matrix.runner }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-latest, ubuntu-24.04-arm]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f # v2.0.0
+        with:
+          cache-key: release
+
+      - uses: taiki-e/install-action@4cef1412cce204788f482e778a0b9187f9626a29 # v2.87.21
+        with:
+          tool: cargo-nextest
+
+      # Release, because this many multi-block cases are too slow unoptimised.
+      # `BZ2NGRS_PINNED_CASES` is the only thing that overrides the counts the
+      # slow properties pin themselves.
+      - name: Test
+        env:
+          HEGEL_DEFAULT_PROFILE: thorough
+          BZ2NGRS_PINNED_CASES: "500"
+        run: cargo nextest run --locked --release --workspace --exclude bz2ngrs-bench

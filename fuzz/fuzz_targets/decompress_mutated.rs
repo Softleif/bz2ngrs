@@ -63,7 +63,13 @@ fn apply(stream: &mut Vec<u8>, edit: &Edit) {
 fuzz_target!(|input: Input| {
     let level = u32::from(input.level % 9) + 1;
     let times = 1 + usize::from(input.repeat) % 64;
-    let data: Vec<u8> = input.data.iter().copied().cycle().take((input.data.len() * times).min(1 << 20)).collect();
+    let data: Vec<u8> = input
+        .data
+        .iter()
+        .copied()
+        .cycle()
+        .take((input.data.len() * times).min(1 << 20))
+        .collect();
     let mut stream = compress(&data, level);
     for edit in input.edits.iter().take(8) {
         apply(&mut stream, edit);
