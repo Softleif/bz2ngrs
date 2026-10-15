@@ -1,22 +1,34 @@
 # bz2ngrs-bench
 
-Decode benchmark. Compares, on identical independent streams:
+Decode and encode benchmark. Compares, on identical independent streams:
 
-1. `bz2ngrs::Decoder::decompress` on one `Decoder` reused for the whole run (`ours`)
+1. `bz2ngrs::Decoder::decompress` (or `Encoder::compress`) on one `Decoder` (`Encoder`) reused for the whole run (`ours`)
 2. the `bzip2` 0.6.1 crate, i.e. libbz2-rs-sys (`bzip2`)
 3. bz2-ng C (`C`), the target, linked in-process
 
-Each stream is decoded in one call into a buffer of the known size. For C that is
+Decoding (`--op decode`, the default): each stream is decoded in one call into a buffer of the known size. For C that is
 `BZ2_bzDecompressInit`, one `BZ2_bzDecompress`, `BZ2_bzDecompressEnd`, as bz2-ng's `bench.c` does.
+
+Encoding (`--op encode`): each chunk is compressed in one call at `--level`. For C that is
+`BZ2_bzBuffToBuffCompress`, for `bzip2` a new `Compress` and one `compress_vec` with `Action::Finish`; both
+allocate their block arrays per call, where ours keeps them in the reused `Encoder`.
 
 ## Run
 
-```sh
-# everything (about a minute and a half of compressing, then timing)
-cargo run --release -p bz2ngrs-bench
+Every run stops within `--time-limit` seconds (default 60): no set starts after three quarters of it, and no
+round after nine tenths, so on a slow machine the later sets are skipped (each skip is noted on stderr).
 
-# quick (seconds): first 4 MB of MC and QUAL, 16 KiB and 64 KiB chunks, 3 rounds
-cargo run --release -p bz2ngrs-bench -- --sets MC,QUAL --chunks 16k,64k --max-bytes 4000000 --rounds 3
+```sh
+# the defaults: the first 4 MB of each corpus file, within a minute
+cargo run --release -p bz2ngrs-bench
+cargo run --release -p bz2ngrs-bench -- --op encode
+
+# everything, on a dedicated machine
+cargo run --release -p bz2ngrs-bench -- --max-bytes 0 --time-limit 0
+cargo run --release -p bz2ngrs-bench -- --op encode --max-bytes 0 --time-limit 0
+
+# quick (seconds): MC and QUAL, 16 KiB and 64 KiB chunks, 3 rounds
+cargo run --release -p bz2ngrs-bench -- --sets MC,QUAL --chunks 16k,64k --rounds 3
 
 # level 6 (what htslib writes), TSV output
 cargo run --release -p bz2ngrs-bench -- --level 6 --tsv out.tsv
@@ -26,17 +38,19 @@ Flags (all take a value):
 
 | flag | default | meaning |
 |---|---|---|
+| `--op` | `decode` | `decode` or `encode` |
+| `--time-limit` | 60 | seconds the whole run may take; 0 for no limit |
 | `--sets` | `MC,XA,QUAL,cram` | substring filter on set names (`NA12878/MC`, `cram/<dir>`) |
 | `--chunks` | `16k,64k,1m,whole,slices,blocks` | `slices` cuts at the `*.slices-10k.txt` sidecar; `blocks` is the CRAM manifest sets |
 | `--samples` | `NA12878` | 1000 Genomes samples to load, e.g. `NA12878,NA19141` |
 | `--rounds`, `-r` | 5 | rounds; the decoder order rotates each round |
-| `--level`, `-l` | 9 | bzip2 level used to compress the corpus chunks |
+| `--level`, `-l` | 9 | bzip2 level used to compress the corpus chunks (and the level timed with `--op encode`) |
 | `--min-ms` | 30 | a pass repeats until it ran this long (keeps small sets out of timer noise) |
-| `--max-bytes` | 0 (all) | truncate each corpus file |
+| `--max-bytes` | 4000000 | truncate each corpus file; 0 for all of it |
 | `--data` | `/Users/pascal/code/tfenne/bz2-ng/data/corpora/1kg` | corpus directory |
 | `--manifest` | `/Users/pascal/Code/softleif/bz2ngrs/corpus/cram-bzip2/manifest.tsv` | real CRAM bzip2 blocks, one set per source directory; skipped if absent |
 | `--tsv` | none | also write a TSV |
-| `--decoders` | `ours,bzip2,C` | decoders to time (one alone, for a profile) |
+| `--decoders` | `ours,bzip2,C` | decoders (encoders) to time (one alone, for a profile) |
 | `--stat` | `median` | `max` reports the best round instead (on a loaded machine the slow rounds are interference) |
 
 Chunks are compressed once, in parallel, before timing, with the `bzip2` crate. CRAM
@@ -48,11 +62,15 @@ blocks are used as stored; the expected bytes are the `bzip2` crate's output
 - Every decoder's output is compared to the original bytes first. A decoder that
   fails is reported as `FAILED` (`FAILED/stub` for ours, which errors until the real
   decoder exists) and is not timed; a note with the first error goes to stderr.
+- Every encoder's stream is decoded by libbz2 first and must give back the original
+  bytes, or the encoder is reported as `FAILED`. A note on stderr counts our streams that
+  are not byte-identical to libbz2's (they differ in the origPtr of exactly periodic
+  blocks).
 - Reported: median (or best, `--stat max`) over rounds of MB/s of uncompressed data (MB = 10^6 bytes) over a
   whole-set pass, plus ratios `ours/C` and `ours/bzip2`.
 - Per-call cost: ns per call on the 16 KiB sets, and the cost of decoding an empty
-  stream (14 bytes), which is init plus teardown with nothing to decode (best of
-  several runs of 20,000 calls).
+  stream (14 bytes) or encoding an empty input, which is init plus teardown with
+  nothing to do (best of several runs of 20,000 calls, 1,000 when encoding).
 - Release profile only; the root `Cargo.toml` profile (fat LTO, one codegen unit) applies
   to this workspace member.
 
