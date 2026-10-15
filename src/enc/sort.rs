@@ -29,12 +29,19 @@
 use super::sais_top as top;
 
 /// Ints of work array [`bwt`] uses for a block of `n` bytes: the suffix
-/// array and free space of more than `n / 2`. The top level names its `m <=
-/// n / 2` LMS substrings in the `n / 2` slots after them and gathers the
-/// reduced string into the last `m`; every level below has an alphabet below
-/// `n / 2` and at least that free space, so its buckets fit beside it.
+/// array and free space of more than `n / 2` ([`free_len`]), then the top
+/// level's LMS positions (at most `n / 2`), kept for after the recursion
+/// rather than found again as libsais does.
 pub(crate) fn work_len(n: usize) -> usize {
-    n + n / 2 + 2048
+    n + free_len(n) + n / 2
+}
+
+/// The free space after the suffix array. The top level names its `m <= n /
+/// 2` LMS substrings in the `n / 2` slots after them and gathers the reduced
+/// string into the last `m`; every level below has an alphabet below `n / 2`
+/// and at least that free space, so its buckets fit beside it.
+fn free_len(n: usize) -> usize {
+    n / 2 + 2048
 }
 
 /// The cyclic BWT of the Lyndon word `t`, written over `t`; the byte
@@ -53,10 +60,11 @@ pub(crate) fn bwt(t: &mut [u8], q: usize, freq: &mut [i32; 256], work: &mut Vec<
     if work.len() < work_len(n) {
         work.resize(work_len(n), 0);
     }
-    let fs = work_len(n) - n;
-    let sa = &mut work[..n + fs];
+    let fs = free_len(n);
+    let (sa, lms) = work.split_at_mut(n + fs);
     let mut bk = top::Buckets::new();
     let m = top::count_and_gather(t, sa, &mut bk);
+    lms[..m].copy_from_slice(&sa[n - m..n]);
     top::start_and_end(&mut bk, freq);
     let mut mode = false;
     if m > 0 {
@@ -73,8 +81,9 @@ pub(crate) fn bwt(t: &mut [u8], q: usize, freq: &mut [i32; 256], work: &mut Vec<
             } else {
                 sort_main::<false>(rest, rec, fs + n - 2 * m, names);
             }
-            top::gather_lms(t, sa);
-            top::reconstruct(sa, n, m);
+            for v in &mut sa[..m] {
+                *v = lms[*v as usize];
+            }
         }
         top::place_lms(sa, n, m, &bk);
     } else {
