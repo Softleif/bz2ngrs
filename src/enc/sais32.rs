@@ -1,9 +1,8 @@
 //! The block sorter's recursion on a reduced string of names: libsais's
-//! `libsais_main_32s_recursion`, its first (6k) form, which every level of
-//! CRAM-like data takes. Levels whose free space is short of six ints per
-//! symbol go to the older recursion in `sort.rs`, and so does everything
-//! below a repetitive top level (`REG`), where that recursion's register
-//! cursor measured faster on Zen 2.
+//! `libsais_main_32s_recursion`, its first (6k) form, for levels with free
+//! space of six ints per symbol. Other levels go to the older recursion in
+//! `sort.rs`, and so does everything below a repetitive top level (`REG`),
+//! where that recursion's register cursor measured faster on Zen 2.
 //!
 //! Ported from libsais, Copyright (c) 2021-2025 Ilya Grebnov, under the
 //! Apache License 2.0 with LLVM Exceptions (`LICENSE-libsais`), from the copy
@@ -45,15 +44,18 @@ fn l_type(c0: i32, c1: i32, f1: usize) -> usize {
     usize::from(c0 > c1 - f1 as i32)
 }
 
-/// The suffix array of `t` (symbols below `k`) into `sa[..t.len()]`; `sa`
-/// has `t.len() + fs` ints. `t` is used as scratch and restored. `REG` and
-/// `P` pick the form of `sort.rs`'s recursion where that one runs.
+/// The suffix array of `t` (symbols below `k <= t.len()`) into
+/// `sa[..t.len()]`; `sa` has `t.len() + fs` ints, with `fs >= t.len()`, which
+/// every level below the top has (`sort.rs`'s `free_len`) and hands down.
+/// `t` is used as scratch and restored. `REG` and `P` pick the form of
+/// `sort.rs`'s recursion where that one runs.
 pub(super) fn sort<const REG: bool, const P: bool>(
     t: &mut [i32],
     sa: &mut [i32],
     fs: usize,
     k: usize,
 ) {
+    debug_assert!(k <= t.len() && t.len() <= fs, "too little free space");
     if REG || k == 0 || fs / k < 6 {
         super::sort::sort_main::<REG, P>(t, sa, fs, k);
         return;
@@ -179,7 +181,8 @@ fn count_and_gather_2k(t: &[i32], sa: &mut [i32], bk: &mut [i32]) {
 /// [`count_and_gather_2k`] for a string whose unique LMS positions carry the
 /// sign bit: they are counted but not gathered. Types are read off the raw
 /// symbols as libsais does; a marked symbol starts an LMS suffix, so it
-/// compares the same way unmarked.
+/// compares the same way unmarked, and being S-type it never meets the
+/// `c1 - f1` of an L-type successor in [`l_type`], which could overflow.
 fn count_and_gather_compacted_2k(t: &[i32], sa: &mut [i32], bk: &mut [i32]) {
     bk.fill(0);
     let n = t.len();
