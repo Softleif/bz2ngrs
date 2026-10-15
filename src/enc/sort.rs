@@ -1,39 +1,46 @@
 //! The block sorter: the cyclic BWT of a Lyndon word by induced sorting
 //! (SA-IS, Nong, Zhang and Chan).
 //!
-//! A port of the sorter bz2-ng used before it adopted libsais (`sort.c` and
-//! `sort_template.h` of bz2-ng's history, MIT), which derives from Yuta
-//! Mori's sais-lite 2.4.1 (MIT, `LICENSE-sais-lite`).
+//! The top level, on the block's bytes, is libsais's (`sais_top.rs`). The
+//! recursion on the reduced string and the final induction, which writes the
+//! BWT directly, are a port of the sorter bz2-ng used before it adopted
+//! libsais (`sort.c` and `sort_template.h` of bz2-ng's history, MIT), which
+//! derives from Yuta Mori's sais-lite 2.4.1 (MIT, `LICENSE-sais-lite`).
+//! Measured on CRAM tag data, libsais's top level is the faster one, and
+//! these two are as fast as libsais's own.
 //!
 //! For a Lyndon word (strictly smaller than each of its proper rotations)
 //! suffix order equals rotation order, so a suffix sorter with an implicit
 //! sentinel yields bzip2's rotation order directly; the encoder rotates every
 //! block to such a word first (`rotate.rs`).
 //!
-//! All scratch lives in one work array, as in bz2-ng: the suffix array at its
-//! start, then free space holding the LMS list and the reduced string of the
-//! recursion, and the bucket arrays at its end. Those regions are disjoint at
-//! every step, so each phase splits the array instead of aliasing it. Where
-//! bz2-ng would fail a level whose buckets do not fit (it may not allocate),
-//! this allocates them; with the work size of [`work_len`] that never happens.
+//! The suffix array and the recursion's scratch live in one work array, as
+//! in bz2-ng: the suffix array at its start, then free space holding names,
+//! the LMS list and the reduced string, and a level's bucket arrays at its
+//! end. Those regions are disjoint at every step, so each phase splits the
+//! array instead of aliasing it. Where bz2-ng would fail a level whose
+//! buckets do not fit (it may not allocate), this allocates them; with the
+//! work size of [`work_len`] that never happens.
 //!
 //! Kernel forms are bz2-ng's choices for clang on the server cores
 //! (`SORT_SUFFIX0_APART` on; branchy naming, branchy selects and no
 //! empty-slot skipping), since rustc's backend is LLVM.
 
+use super::sais_top as top;
+
 /// Ints of work array [`bwt`] uses for a block of `n` bytes: the suffix
-/// array, at least `n / 2 + 1024` of free space for the recursion (every
-/// level below the top has an alphabet below `n / 2` and at least the top
-/// level's free space minus its 256 counters), and 1024 more so that the top
-/// level's list of LMS positions (at most `n / 2 + 1` slots) fits beside its
-/// bucket counters.
+/// array and free space of more than `n / 2`. The top level names its `m <=
+/// n / 2` LMS substrings in the `n / 2` slots after them and gathers the
+/// reduced string into the last `m`; every level below has an alphabet below
+/// `n / 2` and at least that free space, so its buckets fit beside it.
 pub(crate) fn work_len(n: usize) -> usize {
     n + n / 2 + 2048
 }
 
 /// The cyclic BWT of the Lyndon word `t`, written over `t`; the byte
 /// histogram of `t` into `freq`; returns the row of rotation `q < t.len()`.
-/// `work` is grown to [`work_len`] if it is shorter.
+/// `work` is grown to [`work_len`] if it is shorter. The top level's
+/// left-to-right scan picks the bucket-cursor mode of everything after it.
 pub(crate) fn bwt(t: &mut [u8], q: usize, freq: &mut [i32; 256], work: &mut Vec<i32>) -> usize {
     let n = t.len();
     if n <= 1 {
@@ -48,18 +55,40 @@ pub(crate) fn bwt(t: &mut [u8], q: usize, freq: &mut [i32; 256], work: &mut Vec<
     }
     let fs = work_len(n) - n;
     let sa = &mut work[..n + fs];
+    let mut bk = top::Buckets::new();
+    let m = top::count_and_gather(t, sa, &mut bk);
+    top::start_and_end(&mut bk, freq);
     let mut mode = false;
-    let mut r = sais_reduce::<u8, true, false>(t, sa, fs, 256, Some(freq), &mut mode);
-    let (main, tail) = split_tail(sa, &mut r.ext, if r.one { 256 } else { 512 });
-    let (_, mut bk) = layout(tail, 256, r.one);
-    let (pidx, qrank) = if mode {
-        compute_bwt::<true>(t, &mut main[..n], &mut bk, q)
+    if m > 0 {
+        let first_lms = sa[n - m] as usize;
+        let left_count = top::buckets_for_radix_sort(t, &mut bk, first_lms);
+        top::radix_sort_lms(t, sa, &mut bk, n - m + 1, n);
+        top::buckets_for_partial_sorting(t, &mut bk, first_lms, left_count);
+        mode = top::induce_partial_order(t, sa, &mut bk, first_lms, left_count);
+        let names = top::renumber_and_gather(sa, n, m, fs);
+        if names < m {
+            let (rec, rest) = sa.split_at_mut(n + fs - m);
+            if mode {
+                sort_main::<true>(rest, rec, fs + n - 2 * m, names);
+            } else {
+                sort_main::<false>(rest, rec, fs + n - 2 * m, names);
+            }
+            top::gather_lms(t, sa);
+            top::reconstruct(sa, n, m);
+        }
+        top::place_lms(sa, n, m, &bk);
     } else {
-        compute_bwt::<false>(t, &mut main[..n], &mut bk, q)
+        sa[..n].fill(0);
+    }
+    let (mut start, mut end) = (bk.start, bk.end);
+    let (pidx, qrank) = if mode {
+        compute_bwt::<true>(t, &mut sa[..n], &mut start, &mut end, q)
+    } else {
+        compute_bwt::<false>(t, &mut sa[..n], &mut start, &mut end, q)
     };
     debug_assert_eq!(pidx, 0, "the block is not a Lyndon word");
     t[0] = t[n - 1];
-    for (l, &s) in t[1..].iter_mut().zip(&main[1..n]) {
+    for (l, &s) in t[1..].iter_mut().zip(&sa[1..n]) {
         *l = s as u8;
     }
     if q == 0 { 0 } else { qrank }
@@ -74,32 +103,6 @@ trait Sym: Copy {
         c.fill(0);
         for &x in t {
             c[x.get()] += 1;
-        }
-    }
-}
-
-impl Sym for u8 {
-    #[inline(always)]
-    fn get(self) -> usize {
-        usize::from(self)
-    }
-
-    /// Four interleaved histograms, so that runs of one byte do not serialise
-    /// on a single counter.
-    fn counts(t: &[u8], c: &mut [i32]) {
-        let mut h = [[0i32; 256]; 4];
-        let (quads, rest) = t.as_chunks::<4>();
-        for q in quads {
-            h[0][usize::from(q[0])] += 1;
-            h[1][usize::from(q[1])] += 1;
-            h[2][usize::from(q[2])] += 1;
-            h[3][usize::from(q[3])] += 1;
-        }
-        for &b in rest {
-            h[0][usize::from(b)] += 1;
-        }
-        for (s, c) in c.iter_mut().enumerate().take(256) {
-            *c = h[0][s] + h[1][s] + h[2][s] + h[3][s];
         }
     }
 }
@@ -261,15 +264,14 @@ fn mark_if(cond: bool, v: i32) -> i32 {
 /// holds the pass counter of the last suffix written to bucket `c` from a
 /// source of type `t`, and an entry gets `+n` when it starts a new name
 /// group. Seeds must be in place with the group starts marked. Returns the
-/// pass counter for the S-scan, and whether fewer than 1 in 10 induced steps
-/// changed bucket (counted at the top level only).
-fn lms_sort2_l<S: Sym, const TOP: bool, const REG: bool>(
+/// pass counter for the S-scan.
+fn lms_sort2_l<S: Sym, const REG: bool>(
     t: &[S],
     sa: &mut [i32],
     c: &[i32],
     b: &mut [i32],
     d: &mut [i32],
-) -> (i32, bool) {
+) -> i32 {
     let n = t.len();
     let ni = n as i32;
     get_buckets(c, b, false);
@@ -279,7 +281,6 @@ fn lms_sort2_l<S: Sym, const TOP: bool, const REG: bool>(
     let jv = (j + n) as i32;
     cur.put_inc(sa, b, mark_if(t[j].get() < c1, jv));
     let mut dd = 0;
-    let (mut changes, mut induced, mut cprev) = (0u64, 0u64, usize::MAX);
     for i in 0..n {
         let mut j = sa[i];
         if 0 < j {
@@ -288,11 +289,6 @@ fn lms_sort2_l<S: Sym, const TOP: bool, const REG: bool>(
                 j -= ni;
             }
             let c0 = t[j as usize].get();
-            if TOP {
-                changes += u64::from(c0 != cprev);
-                cprev = c0;
-                induced += 1;
-            }
             cur.switch(c0, b);
             j -= 1;
             let ty = (c0 << 1) | usize::from(t[j as usize].get() < c0);
@@ -320,7 +316,7 @@ fn lms_sort2_l<S: Sym, const TOP: bool, const REG: bool>(
         }
         i -= 1;
     }
-    (dd, 10 * changes < induced)
+    dd
 }
 
 /// The S-scan of the LMS-substring sort, continuing the naming of
@@ -558,13 +554,13 @@ fn induce_sa<S: Sym, const REG: bool>(t: &[S], sa: &mut [i32], bk: &mut Buckets<
 fn compute_bwt<const REG: bool>(
     t: &[u8],
     sa: &mut [i32],
-    bk: &mut Buckets<'_>,
+    start: &mut [i32; 256],
+    end: &mut [i32; 256],
     q: usize,
 ) -> (usize, usize) {
     let n = t.len();
     let mut qr = usize::MAX;
-    bk.set(t, false);
-    let b = &mut *bk.b;
+    let b = &mut start[..];
     let j = n - 1;
     let c1 = usize::from(t[j]);
     let mut cur = Cur::<REG>::new(c1, b);
@@ -590,8 +586,7 @@ fn compute_bwt<const REG: bool>(
             sa[i] = !e;
         }
     }
-    bk.set(t, true);
-    let b = &mut *bk.b;
+    let b = &mut end[..];
     let mut cur = Cur::<REG>::new(0, b);
     let mut pidx = usize::MAX;
     for i in (0..n).rev() {
@@ -632,23 +627,13 @@ struct Reduced {
     ext: Vec<i32>,
 }
 
-/// Stages 1 and 2 of SA-IS, then the sorted LMS suffixes placed at the ends
-/// of their buckets (stage 3 seeding); the caller runs the final induction
-/// with the buckets this leaves. `sa` has `n + fs` ints, and the bucket
-/// arrays come from its last ones. Levels below the top recount their
-/// buckets after recursing rather than reserving them, so each level's free
-/// space is at least its parent's. `mode` is the bucket-cursor mode for
-/// everything after stage 1: chosen here at the top level from the L-scan's
-/// bucket changes, passed down below it. `freq` (top level only) receives
-/// the symbol counts.
-fn sais_reduce<S: Sym, const TOP: bool, const REG: bool>(
-    t: &[S],
-    sa: &mut [i32],
-    fs: usize,
-    k: usize,
-    freq: Option<&mut [i32; 256]>,
-    mode: &mut bool,
-) -> Reduced {
+/// Stages 1 and 2 of SA-IS on a reduced problem, then its sorted LMS
+/// suffixes placed at the ends of their buckets (stage 3 seeding); the
+/// caller runs the final induction with the buckets this leaves. `sa` has
+/// `n + fs` ints, and the bucket arrays come from its last ones. A level
+/// recounts its buckets after recursing rather than reserving them, so each
+/// level's free space is at least its parent's.
+fn sais_reduce<S: Sym, const REG: bool>(t: &[S], sa: &mut [i32], fs: usize, k: usize) -> Reduced {
     let n = t.len();
     let mut ext = Vec::new();
     let (one, mut recount) = if 2 * k <= fs {
@@ -678,9 +663,6 @@ fn sais_reduce<S: Sym, const TOP: bool, const REG: bool>(
         let (main, tail) = split_tail(sa, &mut ext, used_tail);
         let (d, mut bk) = layout(tail, k, one);
         S::counts(t, bk.counts());
-        if let Some(f) = freq {
-            f.copy_from_slice(&bk.counts()[..256]);
-        }
         bk.heads_from_counts(true);
         main[..n].fill(0);
         // Each LMS position p reserves the next slot from the end of bucket
@@ -749,17 +731,8 @@ fn sais_reduce<S: Sym, const TOP: bool, const REG: bool>(
                     d[i] = 0;
                     d[i + k] = 0;
                 }
-                let (dd, repetitive) = lms_sort2_l::<S, TOP, REG>(t, &mut main[..n], c, b, d);
-                if TOP {
-                    *mode = repetitive;
-                    if repetitive {
-                        lms_sort2_s::<S, true>(t, &mut main[..n], c, b, d, dd);
-                    } else {
-                        lms_sort2_s::<S, false>(t, &mut main[..n], c, b, d, dd);
-                    }
-                } else {
-                    lms_sort2_s::<S, REG>(t, &mut main[..n], c, b, d, dd);
-                }
+                let dd = lms_sort2_l::<S, REG>(t, &mut main[..n], c, b, d);
+                lms_sort2_s::<S, REG>(t, &mut main[..n], c, b, d, dd);
                 lms_postproc2(main, n, m)
             } else {
                 lms_sort1::<S, REG>(t, &mut main[..n], &mut bk);
@@ -786,14 +759,10 @@ fn sais_reduce<S: Sym, const TOP: bool, const REG: bool>(
             // [0, m + newfs) recursion | reduced string | LMS list | buckets
             n + fs - used_tail - 3 * m
         } else {
-            let mut f = n + fs - 2 * m;
-            if !ext.is_empty() {
-            } else if recount == 0 && TOP && k + name <= f {
-                f -= k;
-            } else {
+            if ext.is_empty() {
                 recount = 2;
             }
-            f
+            n + fs - 2 * m
         };
         let ra = m + newfs;
         // Unconditional stores: a slot is rewritten until a name lands in it.
@@ -806,11 +775,7 @@ fn sais_reduce<S: Sym, const TOP: bool, const REG: bool>(
         }
         {
             let (rec, rest) = sa.split_at_mut(ra);
-            if *mode {
-                sort_main::<true>(&rest[..m], rec, newfs, name);
-            } else {
-                sort_main::<false>(&rest[..m], rec, newfs, name);
-            }
+            sort_main::<REG>(&rest[..m], rec, newfs, name);
         }
         if keep_list {
             let list = n + fs - used_tail - m;
@@ -884,8 +849,7 @@ fn sais_reduce<S: Sym, const TOP: bool, const REG: bool>(
 /// into `sa[..t.len()]` (`sa` has `t.len() + fs` ints).
 fn sort_main<const REG: bool>(t: &[i32], sa: &mut [i32], fs: usize, k: usize) {
     let n = t.len();
-    let mut mode = REG;
-    let mut r = sais_reduce::<i32, false, REG>(t, sa, fs, k, None, &mut mode);
+    let mut r = sais_reduce::<i32, REG>(t, sa, fs, k);
     let (main, tail) = split_tail(sa, &mut r.ext, if r.one { k } else { 2 * k });
     let (_, mut bk) = layout(tail, k, r.one);
     induce_sa::<i32, REG>(t, &mut main[..n], &mut bk);
