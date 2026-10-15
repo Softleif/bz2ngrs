@@ -2,7 +2,7 @@
 
 Fast bzip2 in Rust, one call per stream: a decoder that decodes a whole stream from a byte slice into a buffer, and an encoder that compresses a whole input into one stream.
 
-Ported from the decoder and the encoder of [bz2-ng](https://github.com/tfenne/bz2-ng). The encoder writes the same bytes as libbz2 1.0.8, except for the origPtr of blocks that are exactly periodic (see [`Encoder`]). Its block sorter is induced sorting (SA-IS) in safe Rust: libsais's top level, with the recursion and the final induction of the sorter that bz2-ng used before it switched to libsais.
+Ported from the decoder and the encoder of [bz2-ng](https://github.com/tfenne/bz2-ng). The encoder writes the same bytes as libbz2 1.0.8, except for the origPtr of blocks that are exactly periodic (see [`Encoder`]). Its block sorter is induced sorting (SA-IS), in safe Rust apart from a prefetch hint on x86: libsais's top level, with the recursion and the final induction of the sorter that bz2-ng used before it switched to libsais.
 
 ```rust
 use bz2ngrs::{Compression, Decoder, Encoder};

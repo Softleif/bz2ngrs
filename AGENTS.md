@@ -18,7 +18,7 @@ bz2ngrs is a one-shot bzip2 decoder and encoder, ported from the C library of bz
   - For every property, ask: is it tautological? An oracle that shares the implementation's code or assumptions proves nothing. Neither does an expected value derived the way the code derives it.
 - **SIMD.**
   - Write kernels once, generic over `fearless_simd::Simd`, reached via `dispatch!`. Helpers are `#[inline(always)]`, with no vector ops in closures.
-  - `core::arch` is allowed only where fearless_simd lacks the operation (the CRC's carry-less multiply). It must be feature-detected and tested against the portable path.
+  - `core::arch` is allowed only where fearless_simd lacks the operation: the CRC's carry-less multiply, which must be feature-detected and tested against the portable path, and the sorter's x86 prefetch hint, which is baseline x86-64 and changes no result.
 - **`unsafe`.** Only with a measured win, and every block needs a `// SAFETY:` comment.
 - **Speed.**
   - Every optimisation carries before and after numbers from `bench/`, compared against bz2-ng C in the same run, in its commit message.
