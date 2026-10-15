@@ -20,6 +20,10 @@
 //! partial sort is done, and the buckets are counted again afterwards.
 
 use super::sais_top::renumber_and_gather;
+use super::sort::{PF, prefetch};
+
+/// Levels shorter than this do not prefetch: their arrays stay in L2.
+const PF_MIN: usize = 1 << 15;
 
 const MIN: i32 = i32::MIN;
 const MAX: i32 = i32::MAX;
@@ -54,6 +58,7 @@ pub(super) fn sort<const REG: bool, const P: bool>(
         return;
     }
     let n = t.len();
+    let pf = P && n >= PF_MIN;
     let bk_at = n + fs - 6 * k;
     let m = {
         let (s, bk) = sa.split_at_mut(bk_at);
@@ -66,7 +71,7 @@ pub(super) fn sort<const REG: bool, const P: bool>(
         start_and_end_6k(k, bk);
         place_lms_histogram(s, k, m, bk, 4, 5 * k);
         let (start, end) = bk[4 * k..6 * k].split_at_mut(k);
-        induce_final_order(t, s, start, end);
+        induce_final_order(t, s, start, end, pf);
         return;
     }
     // libsais renumbers with group markers and compacts away the unique
@@ -85,7 +90,7 @@ pub(super) fn sort<const REG: bool, const P: bool>(
             }
         }
         buckets_for_partial_sorting_6k(t, k, bk, first_lms, left);
-        induce_partial_order_6k(t, s, k, bk, first_lms, left);
+        induce_partial_order_6k(t, s, k, bk, first_lms, left, pf);
     }
     let names = if big {
         renumber_and_mark_distinct_4k(sa, n, m)
@@ -126,7 +131,7 @@ pub(super) fn sort<const REG: bool, const P: bool>(
     start_and_end_4k(k, bk);
     place_lms_histogram(s, k, m, bk, 2, 3 * k);
     let (start, end) = bk[2 * k..4 * k].split_at_mut(k);
-    induce_final_order(t, s, start, end);
+    induce_final_order(t, s, start, end, pf);
 }
 
 /// Counts the suffixes by symbol and the types of the suffix and its
@@ -281,6 +286,7 @@ fn induce_partial_order_6k(
     bk: &mut [i32],
     first_lms: usize,
     left: usize,
+    pf: bool,
 ) {
     let n = t.len();
     let mut d = 1;
@@ -288,16 +294,13 @@ fn induce_partial_order_6k(
     sa[bk[v] as usize] = (n - 1) as i32 | MIN;
     bk[v] += 1;
     bk[v + 2] = d;
-    for i in 0..left {
-        let mut p = sa[i];
-        d += i32::from(p < 0);
-        p &= MAX;
-        let p = p as usize;
-        let v = i4(t[p - 1], usize::from(t[p - 2] >= t[p - 1]));
-        let h = bk[v];
-        sa[h as usize] = (p - 1) as i32 | (i32::from(bk[v + 2] != d) << 31);
-        bk[v] = h + 1;
-        bk[v + 2] = d;
+    let split = if pf { left.saturating_sub(3 * PF) } else { 0 };
+    for i in 0..split {
+        prefetch_partial(t, sa, bk, i + PF, i + 2 * PF, i + 3 * PF);
+        d = partial_step::<true>(t, sa, bk, i, d);
+    }
+    for i in split..left {
+        d = partial_step::<true>(t, sa, bk, i, d);
     }
 
     // The marks move from the start of each group of an L-type bucket to
@@ -323,17 +326,54 @@ fn induce_partial_order_6k(
         h[1] = tb[1];
     }
 
-    for i in (left + 1..n - first_lms).rev() {
-        let mut p = sa[i];
-        d += i32::from(p < 0);
-        p &= MAX;
-        let p = p as usize;
-        let v = i4(t[p - 1], usize::from(t[p - 2] > t[p - 1]));
-        let h = bk[v] - 1;
-        bk[v] = h;
-        sa[h as usize] = (p - 1) as i32 | (i32::from(bk[v + 2] != d) << 31);
-        bk[v + 2] = d;
+    let (from, to) = (left + 1, n - first_lms);
+    let split = if pf {
+        (3 * PF).clamp(from, to.max(from))
+    } else {
+        to.max(from)
+    };
+    for i in (split..to).rev() {
+        prefetch_partial(t, sa, bk, i - PF, i - 2 * PF, i - 3 * PF);
+        d = partial_step::<false>(t, sa, bk, i, d);
     }
+    for i in (from..split).rev() {
+        d = partial_step::<false>(t, sa, bk, i, d);
+    }
+}
+
+/// libsais's prefetches for the partial-order scans: the entry at `far`,
+/// the symbols before the one at `mid`, and the bucket group of the one at
+/// `near`.
+#[inline(always)]
+fn prefetch_partial(t: &[i32], sa: &[i32], bk: &[i32], near: usize, mid: usize, far: usize) {
+    prefetch(sa, far);
+    prefetch(t, ((sa[mid] & MAX) as usize).wrapping_sub(2));
+    let p = (sa[near] & MAX) as usize;
+    if let Some(&c) = t.get(p.saturating_sub(1)) {
+        prefetch(bk, 4 * c as usize);
+    }
+}
+
+/// One step of the partial-order scans at entry `i`, left to right (`LTR`)
+/// or right to left; returns the group counter.
+#[inline(always)]
+fn partial_step<const LTR: bool>(
+    t: &[i32],
+    sa: &mut [i32],
+    bk: &mut [i32],
+    i: usize,
+    d: i32,
+) -> i32 {
+    let p = sa[i];
+    let d = d + i32::from(p < 0);
+    let p = (p & MAX) as usize;
+    let (c, pc) = (t[p - 1], t[p - 2]);
+    let v = i4(c, usize::from(if LTR { pc >= c } else { pc > c }));
+    let h = if LTR { bk[v] } else { bk[v] - 1 };
+    sa[h as usize] = (p - 1) as i32 | (i32::from(bk[v + 2] != d) << 31);
+    bk[v] = if LTR { h + 1 } else { h };
+    bk[v + 2] = d;
+    d
 }
 
 /// Names the sorted LMS substrings `sa[..m]` (a sign bit where a group
@@ -506,31 +546,64 @@ fn place_lms_histogram(
 /// The final induction: L-type suffixes left to right from the bucket
 /// starts, then S-type ones right to left from the ends. A seed or induced
 /// entry carries the sign bit while its predecessor is for the other scan.
-fn induce_final_order(t: &[i32], sa: &mut [i32], start: &mut [i32], end: &mut [i32]) {
+/// With `pf`, libsais's prefetches: the entry `3 * PF` ahead, the symbol of
+/// the one `2 * PF` ahead, and the bucket head and preceding symbol of the
+/// one `PF` ahead (whose symbol is cached by then).
+fn induce_final_order(t: &[i32], sa: &mut [i32], start: &mut [i32], end: &mut [i32], pf: bool) {
     let n = t.len();
     let c = t[n - 1] as usize;
     sa[start[c] as usize] = (n - 1) as i32 | (i32::from(t[n - 2] < t[n - 1]) << 31);
     start[c] += 1;
-    for i in 0..n {
-        let p = sa[i];
-        sa[i] = p ^ MIN;
-        if p > 0 {
-            let p = (p - 1) as usize;
-            let c = t[p];
-            let h = &mut start[c as usize];
-            sa[*h as usize] = p as i32 | (i32::from(t[p.saturating_sub(1)] < c) << 31);
-            *h += 1;
-        }
+    let split = if pf { n.saturating_sub(3 * PF) } else { 0 };
+    for i in 0..split {
+        prefetch_ahead(t, sa, start, i + PF, i + 2 * PF, i + 3 * PF);
+        final_step::<true>(t, sa, start, i);
     }
-    for i in (0..n).rev() {
-        let p = sa[i];
-        sa[i] = p & MAX;
-        if p > 0 {
-            let p = (p - 1) as usize;
-            let c = t[p];
-            let h = &mut end[c as usize];
+    for i in split..n {
+        final_step::<true>(t, sa, start, i);
+    }
+    let split = if pf { (3 * PF).min(n) } else { n };
+    for i in (split..n).rev() {
+        prefetch_ahead(t, sa, end, i - PF, i - 2 * PF, i - 3 * PF);
+        final_step::<false>(t, sa, end, i);
+    }
+    for i in (0..split).rev() {
+        final_step::<false>(t, sa, end, i);
+    }
+}
+
+/// The prefetches of [`induce_final_order`] for the entries at `near`,
+/// `mid` and `far`.
+#[inline(always)]
+fn prefetch_ahead(t: &[i32], sa: &[i32], heads: &[i32], near: usize, mid: usize, far: usize) {
+    prefetch(sa, far);
+    prefetch(t, (sa[mid].max(1) - 1) as usize);
+    let s = sa[near];
+    if s > 0 {
+        if let Some(&c) = t.get(s as usize - 1) {
+            prefetch(heads, c as usize);
+        }
+        prefetch(t, (s.max(2) - 2) as usize);
+    }
+}
+
+/// One step of [`induce_final_order`] at entry `i`, left to right (`LTR`,
+/// `heads` the starts) or right to left (the ends).
+#[inline(always)]
+fn final_step<const LTR: bool>(t: &[i32], sa: &mut [i32], heads: &mut [i32], i: usize) {
+    let p = sa[i];
+    sa[i] = if LTR { p ^ MIN } else { p & MAX };
+    if p > 0 {
+        let p = (p - 1) as usize;
+        let c = t[p];
+        let pc = t[p.saturating_sub(1)];
+        let h = &mut heads[c as usize];
+        if LTR {
+            sa[*h as usize] = p as i32 | (i32::from(pc < c) << 31);
+            *h += 1;
+        } else {
             *h -= 1;
-            sa[*h as usize] = p as i32 | (i32::from(t[p.saturating_sub(1)] > c) << 31);
+            sa[*h as usize] = p as i32 | (i32::from(pc > c) << 31);
         }
     }
 }
