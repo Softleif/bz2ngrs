@@ -7,7 +7,7 @@
 use hegel::TestCase;
 use hegel::generators as gs;
 
-use super::{huff, mtf, rle, rotate, sort};
+use super::{huff, mtf, rle, rotate, sais32, sort};
 
 /// SplitMix64, for the large inputs.
 struct Rng(u64);
@@ -238,6 +238,79 @@ fn bwt_matches_divsufsort_on_drawn_bytes(tc: TestCase) {
     let want: Vec<u8> = sa.iter().map(|&s| t[(s as usize + n - 1) % n]).collect();
     assert!(l == want, "BWT differs from divsufsort's (n = {n})");
     assert_eq!(row, sa.iter().position(|&s| s as usize == n - 1).unwrap());
+}
+
+/// The suffix array of `t` by direct comparison (a proper prefix sorts
+/// first, as under the implicit sentinel).
+fn naive_suffix_array(t: &[i32]) -> Vec<i32> {
+    let mut sa: Vec<i32> = (0..t.len() as i32).collect();
+    sa.sort_by(|&a, &b| t[a as usize..].cmp(&t[b as usize..]));
+    sa
+}
+
+/// The recursion on a string of names, at every work-array size: from none
+/// (the older recursion, its buckets allocated) to six ints per symbol and
+/// more (libsais's 6k form), on random strings, on periodic strings with
+/// edits, and on long strings over 1 to 4 symbols (where libsais renumbers
+/// without compacting).
+#[hegel::test(test_cases = 1000)]
+fn recursion_matches_naive_suffix_sort(tc: TestCase) {
+    let shape = tc.draw(gs::integers::<u8>().max_value(2));
+    // A periodic string makes every naive comparison long, so it stays
+    // short.
+    let (n, k) = match shape {
+        0 | 1 => {
+            let n = tc.draw(
+                gs::integers::<usize>()
+                    .min_value(2)
+                    .max_value(if shape == 1 { 3_000 } else { 40_000 }),
+            );
+            (
+                n,
+                tc.draw(gs::integers::<usize>().min_value(1).max_value(n.min(5_000))),
+            )
+        }
+        _ => {
+            let k = tc.draw(gs::integers::<usize>().min_value(1).max_value(4));
+            (
+                tc.draw(
+                    gs::integers::<usize>()
+                        .min_value(8192 * k)
+                        .max_value(40_000),
+                ),
+                k,
+            )
+        }
+    };
+    let period = if shape == 1 {
+        tc.draw(gs::integers::<usize>().min_value(1).max_value(n))
+    } else {
+        n
+    };
+    let mut rng = Rng(tc.draw(gs::integers::<u64>()));
+    let base: Vec<i32> = (0..period)
+        .map(|_| (rng.next() % k as u64) as i32)
+        .collect();
+    let mut t: Vec<i32> = (0..n).map(|i| base[i % period]).collect();
+    for _ in 0..tc.draw(gs::integers::<usize>().max_value(20)) {
+        let i = rng.next() as usize % n;
+        t[i] = (rng.next() % k as u64) as i32;
+    }
+    let fs = tc.draw(gs::integers::<usize>().max_value(8 * k + 64));
+    let mut work = vec![0x5A5A_5A5A; n + fs];
+    let want = naive_suffix_array(&t);
+    let orig = t.clone();
+    match tc.draw(gs::integers::<u8>().max_value(3)) {
+        0 => sais32::sort::<false, false>(&mut t, &mut work, fs, k),
+        1 => sais32::sort::<false, true>(&mut t, &mut work, fs, k),
+        2 => sais32::sort::<true, false>(&mut t, &mut work, fs, k),
+        _ => sais32::sort::<true, true>(&mut t, &mut work, fs, k),
+    }
+    assert_eq!(t, orig, "the string is not restored");
+    assert!(
+        work[..n] == want[..],
+        "suffix array differs (n = {n}, k = {k}, fs = {fs})"
+    );
 }
 
 /// `t` followed by its copy and the padding, as the encoder lays it out.

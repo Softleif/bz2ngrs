@@ -13,6 +13,7 @@ mod huff;
 mod mtf;
 mod rle;
 mod rotate;
+mod sais32;
 mod sais_top;
 mod sort;
 #[cfg(test)]
