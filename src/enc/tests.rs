@@ -313,11 +313,10 @@ fn recursion_matches_naive_suffix_sort(tc: TestCase) {
     );
 }
 
-/// `t` followed by its copy and the padding, as the encoder lays it out.
+/// `t` followed by its copy, as the encoder lays it out, and nothing after
+/// them, so that a read past the copy fails.
 fn doubled(t: &[u8]) -> Vec<u8> {
-    let mut tt = t.repeat(2);
-    tt.resize(2 * t.len() + rotate::PAD, 0);
-    tt
+    t.repeat(2)
 }
 
 #[hegel::test(test_cases = 3000)]
@@ -348,14 +347,14 @@ fn least_rotation_matches_booth(tc: TestCase) {
 }
 
 /// `sort_block` at every SIMD level on the block `t`, in a buffer and with a
-/// work array that an earlier block left behind (the padding and the copy
-/// are the sorter's to write): the BWT, the origPtr and the histogram.
+/// work array that an earlier block left behind (the copy is the sorter's to
+/// write): the BWT, the origPtr and the histogram.
 fn check_sort_block(tc: &TestCase, t: &[u8], want_bwt: &[u8], want_orig: usize) {
     let n = t.len();
     let mut rng = Rng(tc.draw(gs::integers::<u64>()));
     let spare = tc.draw(gs::integers::<usize>().max_value(16));
     let mut start = t.to_vec();
-    start.extend((0..n + rotate::PAD + spare).map(|_| rng.next() as u8));
+    start.extend((0..n + spare).map(|_| rng.next() as u8));
     let work = dirty_work(tc, n);
     for level in crate::tests::levels() {
         let (mut tt, mut work) = (start.clone(), work.clone());

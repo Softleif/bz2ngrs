@@ -25,7 +25,7 @@ mod sort;
 )]
 mod tests;
 
-use fearless_simd::Simd;
+use fearless_simd::{Simd, SimdFrom, u8x16, u8x64};
 
 use mtf::MAX_ALPHA;
 
@@ -33,8 +33,8 @@ use mtf::MAX_ALPHA;
 /// largest block met so far. Every byte that is read is written first in
 /// each block, so it is never cleared.
 pub(crate) struct Scratch {
-    /// The block in `tt[..n]`, its copy in `tt[n..2n]` for the least
-    /// rotation, then padding; the BWT is written over the rotated block.
+    /// The block in `tt[..n]` and its copy in `tt[n..2n]` for the least
+    /// rotation; the BWT is written over the rotated block.
     tt: Vec<u8>,
     /// The least rotation's candidates, then the sorter's work array.
     work: Vec<i32>,
@@ -79,9 +79,10 @@ impl<'a> BitWriter<'a> {
         }
     }
 
-    /// Makes room for `bytes` more bytes of output.
+    /// Makes room for `bytes` more bytes of output on top of the bits
+    /// pending.
     fn reserve(&mut self, bytes: usize) {
-        let need = self.pos + bytes + SLACK;
+        let need = self.pos + self.n.div_ceil(8) as usize + bytes + SLACK;
         if self.out.len() < need {
             self.out.resize(need, 0);
         }
@@ -129,12 +130,30 @@ impl<'a> BitWriter<'a> {
     }
 }
 
+// The loads and the store below never panic, so that a wrong bound costs a
+// wrong stream rather than a panic; the assertions catch one in tests.
+
 /// The 8 bytes of `v`, most significant first, at `out[pos..]`.
 #[inline(always)]
 pub(crate) fn store(out: &mut [u8], pos: usize, v: u64) {
+    debug_assert!(pos + 8 <= out.len(), "store past the reserved output");
     if let Some(d) = out.get_mut(pos..pos + 8) {
         d.copy_from_slice(&v.to_be_bytes());
     }
+}
+
+/// `p[i..i + 16]`.
+#[inline(always)]
+pub(crate) fn load16<S: Simd>(simd: S, p: &[u8], i: usize) -> u8x16<S> {
+    debug_assert!(i + 16 <= p.len(), "load past the buffer");
+    u8x16::simd_from(simd, *p[i..].first_chunk::<16>().unwrap_or(&[0; 16]))
+}
+
+/// `p[i..i + 64]`.
+#[inline(always)]
+pub(crate) fn load64<S: Simd>(simd: S, p: &[u8], i: usize) -> u8x64<S> {
+    debug_assert!(i + 64 <= p.len(), "load past the buffer");
+    u8x64::simd_from(simd, *p[i..].first_chunk::<64>().unwrap_or(&[0; 64]))
 }
 
 /// The most bytes a block of `n` RLE1 bytes adds to the stream: its header
@@ -167,9 +186,8 @@ pub(crate) fn compress_stream<S: Simd>(
     // RLE1 grows input by at most 5/4 (four equal bytes become five), so a
     // short input never needs a full-size block.
     let biggest = nblock_max.min(src.len() + src.len() / 4) + rle::SLACK;
-    let tt_len = 2 * biggest + rotate::PAD;
-    if sc.tt.len() < tt_len {
-        sc.tt.resize(tt_len, 0);
+    if sc.tt.len() < 2 * biggest {
+        sc.tt.resize(2 * biggest, 0);
     }
     if sc.mtfv.len() < biggest + 1 + mtf::SLACK {
         sc.mtfv.resize(biggest + 1 + mtf::SLACK, 0);

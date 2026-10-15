@@ -15,7 +15,7 @@
 
 use fearless_simd::{Select, Simd, SimdBase, SimdFrom, u8x16, u16x8};
 
-use super::rle::load64;
+use super::load64;
 
 /// The highest MTF symbol plus one (RUNA, RUNB, ranks 1 to 255, EOB).
 pub(crate) const MAX_ALPHA: usize = 258;

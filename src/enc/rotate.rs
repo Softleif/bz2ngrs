@@ -10,13 +10,9 @@
 //! and returns the row of the rotation that is the original block, which is
 //! origPtr.
 
-use fearless_simd::{Select, Simd, SimdBase, SimdFrom, u8x16};
+use fearless_simd::{Select, Simd, SimdBase, u8x16};
 
-use super::sort;
-
-/// Bytes of zeros after the block's copy, so that the 8-byte prefix
-/// comparisons may read past it.
-pub(crate) const PAD: usize = 64;
+use super::{load16, sort};
 
 /// Candidate-list refinement stops below `n / SPARSE_DIV` candidates, after
 /// `KMAX` bytes, or when it stalls.
@@ -25,7 +21,7 @@ const KMAX: usize = 64;
 
 /// Sorts the block `tt[..n]`: writes its BWT to `tt[r..r + n]` and its byte
 /// frequencies to `freq`, and returns `(origPtr, r)`. `tt` holds at least
-/// `2 * n + PAD` bytes; `work` is the sorter's scratch, which also holds the
+/// `2 * n` bytes; `work` is the sorter's scratch, which also holds the
 /// least rotation's candidates.
 #[inline(always)]
 pub(crate) fn sort_block<S: Simd>(
@@ -36,14 +32,11 @@ pub(crate) fn sort_block<S: Simd>(
     work: &mut Vec<i32>,
 ) -> (usize, usize) {
     tt.copy_within(..n, n);
-    tt[2 * n..2 * n + PAD].fill(0);
     if work.len() < sort::work_len(n) {
         work.resize(sort::work_len(n), 0);
     }
     let (r, periodic) = least_rotation(simd, tt, n, work);
-    // A least rotation of a periodic block is a power of a Lyndon word, so
-    // the root is found; the fallback only keeps a broken invariant from
-    // reaching an index out of bounds.
+    // A least rotation is a power of a Lyndon word, so the root is found.
     let p = if periodic {
         lyndon_root_len(&tt[r..r + n]).unwrap_or(n)
     } else {
@@ -102,12 +95,11 @@ pub(super) fn least_rotation<S: Simd>(
     if n <= 1 {
         return (0, false);
     }
-    let at = |x: usize| u8x16::simd_from(simd, *tt[x..].first_chunk::<16>().unwrap_or(&[0; 16]));
     let (chunks, end) = (n / 16, n / 16 * 16);
 
     let mut least = u8x16::splat(simd, 255);
     for k in 0..chunks {
-        least = least.min(at(16 * k));
+        least = least.min(load16(simd, tt, 16 * k));
     }
     let c0 = tt[end..n]
         .iter()
@@ -118,8 +110,8 @@ pub(super) fn least_rotation<S: Simd>(
     let (v0, none) = (u8x16::splat(simd, c0), u8x16::splat(simd, 255));
     let mut least = none;
     for k in 0..chunks {
-        let hit = at(16 * k).simd_eq(v0);
-        least = least.min(hit.select(at(16 * k + 1), none));
+        let hit = load16(simd, tt, 16 * k).simd_eq(v0);
+        least = least.min(hit.select(load16(simd, tt, 16 * k + 1), none));
     }
     let c1 = (end..n)
         .filter(|&x| tt[x] == c0)
@@ -136,7 +128,7 @@ pub(super) fn least_rotation<S: Simd>(
     };
     for k in 0..chunks {
         let x = 16 * k;
-        let hit = at(x).simd_eq(v0) & at(x + 1).simd_eq(v1);
+        let hit = load16(simd, tt, x).simd_eq(v0) & load16(simd, tt, x + 1).simd_eq(v1);
         let mut bits = simd.to_bitmask_mask8x16(hit);
         while bits != 0 {
             take(x + bits.trailing_zeros() as usize, &mut m);
@@ -151,8 +143,8 @@ pub(super) fn least_rotation<S: Simd>(
     refine(tt, n, cand, m, 2, cm)
 }
 
-/// Length of the common prefix of `tt[a..]` and `tt[b..]`, starting the
-/// comparison at `k` and capped at `n` (bytes beyond `tt[2n]` are padding).
+/// Length of the common prefix of the rotations at `a` and `b` (both below
+/// `n`), starting the comparison at `k` and capped at `n`.
 #[inline(always)]
 fn common_prefix(tt: &[u8], a: usize, b: usize, mut k: usize, n: usize) -> usize {
     while k + 8 <= n {
@@ -178,6 +170,8 @@ fn load(tt: &[u8], i: usize) -> u64 {
 /// Refines a sorted candidate list `cand[..m]` whose members all share their
 /// first `k` bytes, and whose next byte has minimum `cm`, then runs the
 /// two-pointer search over the list (list indices only move forward).
+/// Refinement stops before `k` reaches `n`, which keeps its reads of
+/// `tt[pos + k + 1]` inside the copy, where they continue the rotation.
 fn refine(
     tt: &[u8],
     n: usize,
@@ -188,7 +182,7 @@ fn refine(
 ) -> (usize, bool) {
     let mut stalled = 0;
     let mut budget = 2 * n as i64 - m as i64;
-    while m > n / SPARSE_DIV && k < KMAX && budget > 0 {
+    while m > n / SPARSE_DIV && k < KMAX.min(n) && budget > 0 {
         let (mut w, mut next) = (0, 255u8);
         for i in 0..m {
             let pos = cand[i] as usize;

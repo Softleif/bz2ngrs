@@ -14,8 +14,9 @@
 //! covers one contiguous input range per call plus the pending unit carried
 //! in from the previous call (whose bytes are added as copies of its byte).
 
-use fearless_simd::{Simd, SimdBase, SimdFrom, u8x16, u8x64};
+use fearless_simd::{Simd, SimdBase, u8x16};
 
+use super::{load16, load64};
 use crate::crc;
 
 /// The fast phase keeps the block this far below `nblock_max`, so that the
@@ -72,18 +73,6 @@ fn put_unit(blk: &mut [u8], nb: usize, c: u8, len: usize) -> usize {
     let x = if len >= 4 { (len - 4) as u8 } else { c };
     blk[nb..nb + 8].copy_from_slice(&[c, c, c, c, x, 0, 0, 0]);
     nb + if len >= 4 { 5 } else { len }
-}
-
-/// `p[i..i + 16]`.
-#[inline(always)]
-fn load16<S: Simd>(simd: S, p: &[u8], i: usize) -> u8x16<S> {
-    u8x16::simd_from(simd, *p[i..].first_chunk::<16>().unwrap_or(&[0; 16]))
-}
-
-/// `p[i..i + 64]`.
-#[inline(always)]
-pub(super) fn load64<S: Simd>(simd: S, p: &[u8], i: usize) -> u8x64<S> {
-    u8x64::simd_from(simd, *p[i..].first_chunk::<64>().unwrap_or(&[0; 64]))
 }
 
 /// Bit `k` is set iff `p[i + k] != p[i + k + 1]`, for `k` in `0..64`; reads
