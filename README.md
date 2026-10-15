@@ -15,4 +15,4 @@ assert_eq!(back, data);
 
 ## License
 
-MIT, except `src/enc/sais_top.rs`, which is ported from libsais and under its licence, Apache-2.0 WITH LLVM-exception (`LICENSE-libsais`). Contains code from bz2-ng (MIT, `LICENSE-bz2-ng`), libbz2 (BSD-style, `LICENSE-bzip2`) and sais-lite (MIT, `LICENSE-sais-lite`).
+Apache-2.0 WITH LLVM-exception (`LICENSE`). Contains code ported from libsais (the same licence, `LICENSE-libsais`), bz2-ng (MIT, `LICENSE-bz2-ng`), libbz2 (BSD-style, `LICENSE-bzip2`) and sais-lite (MIT, `LICENSE-sais-lite`), whose notices it keeps.
