@@ -837,7 +837,11 @@ fn code_lengths_match_the_straight_port_of_libbz2(tc: TestCase) {
     let n_tables = tc.draw(gs::integers::<usize>().min_value(1).max_value(6));
     let mut tables: Vec<Vec<i32>> = Vec::new();
     for _ in 0..n_tables {
-        let spread = tc.draw(gs::sampled_from(vec![2u32, 4, 20, 1000, 100_000]));
+        // A table's counts total at most a block's MTF values, which keeps the
+        // reference's `freq << 8` weights within i32 (it loops on overflow).
+        let spread = tc
+            .draw(gs::sampled_from(vec![2u32, 4, 20, 1000, 100_000]))
+            .min(1_000_000 / alpha as u32);
         let raw = tc.draw(
             gs::vecs(gs::integers::<u32>())
                 .min_size(alpha)
