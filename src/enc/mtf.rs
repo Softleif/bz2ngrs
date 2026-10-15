@@ -13,7 +13,7 @@
 //! - Positions 8 to 255 live in an array, searched and shifted 16 bytes at a
 //!   time.
 
-use fearless_simd::{Select, Simd, SimdBase, SimdFrom, u8x16};
+use fearless_simd::{Select, Simd, SimdBase, SimdFrom, u8x16, u8x64, u16x8};
 
 use super::rle::zero_bytes;
 
@@ -21,6 +21,9 @@ use super::rle::zero_bytes;
 pub(crate) const MAX_ALPHA: usize = 258;
 const RUNA: usize = 0;
 const RUNB: usize = 1;
+/// Values past the last one that [`mtf`] may write to: a zero run's digits
+/// go out as one 8-value store.
+pub(crate) const SLACK: usize = 8;
 
 /// The MTF list: entries 0 to 7 in `head` (entry 0 in the low byte), 8 to
 /// 255 in `tail`, padded with a byte that never matches.
@@ -77,26 +80,33 @@ impl List {
 /// `l[i - 1..i + 64]`.
 #[inline(always)]
 fn change_mask64<S: Simd>(simd: S, l: &[u8], i: usize) -> u64 {
-    let w = &l[i - 1..i + 64];
-    let mut equal = 0u64;
-    for k in 0..4 {
-        let at = |o: usize| u8x16::simd_from(simd, *w[o..].first_chunk::<16>().unwrap_or(&[0; 16]));
-        let m = at(16 * k + 1).simd_eq(at(16 * k));
-        equal |= simd.to_bitmask_mask8x16(m) << (16 * k);
-    }
-    !equal
+    let at = |o: usize| u8x64::simd_from(simd, *l[o..].first_chunk::<64>().unwrap_or(&[0; 64]));
+    !simd.to_bitmask_mask8x64(at(i).simd_eq(at(i - 1)))
 }
 
 /// Writes the digits of a zero run of length `z` at `mtfv[wr..]` and counts
 /// them; returns the new write position. The RUNA/RUNB digits of a run of
 /// `z` are the bits of `z + 1` below its leading one, least significant
-/// first.
+/// first. Up to 8 digits go out as one store, so it writes up to
+/// [`SLACK`] values past the new write position.
 #[inline(always)]
-fn put_zero_run(mtfv: &mut [u16], wr: usize, freq: &mut [i32; MAX_ALPHA], z: u32) -> usize {
+fn put_zero_run<S: Simd>(
+    simd: S,
+    mtfv: &mut [u16],
+    wr: usize,
+    freq: &mut [i32; MAX_ALPHA],
+    z: u32,
+) -> usize {
     let x = z + 1;
     let k = 31 - x.leading_zeros();
-    for i in 0..k {
-        mtfv[wr + i as usize] = ((x >> i) & 1) as u16;
+    if k <= 8 {
+        const BIT: [u16; 8] = [1, 2, 4, 8, 16, 32, 64, 128];
+        let d = u16x8::splat(simd, x as u16) & u16x8::simd_from(simd, BIT);
+        d.min(u16x8::splat(simd, 1)).store_slice(&mut mtfv[wr..wr + 8]);
+    } else {
+        for i in 0..k {
+            mtfv[wr + i as usize] = ((x >> i) & 1) as u16;
+        }
     }
     let ones = (x & ((1 << k) - 1)).count_ones();
     freq[RUNB] += ones as i32;
@@ -121,7 +131,7 @@ fn put_symbol<S: Simd>(
 }
 
 /// MTF and zero-run coding of the BWT `l`, whose bytes are those marked in
-/// `in_use`: the values to `mtfv` (at least `l.len() + 1` long) and their
+/// `in_use`: the values to `mtfv` (at least `l.len() + 1 + SLACK` long) and their
 /// counts to `freq`. Returns the number of values.
 #[inline(always)]
 pub(crate) fn mtf<S: Simd>(
@@ -172,7 +182,7 @@ pub(crate) fn mtf<S: Simd>(
             while m != 0 {
                 let pos = i + m.trailing_zeros() as usize;
                 m &= m - 1;
-                wr = put_zero_run(mtfv, wr, freq, z_pend + (pos - cur) as u32);
+                wr = put_zero_run(simd, mtfv, wr, freq, z_pend + (pos - cur) as u32);
                 z_pend = 0;
                 wr = put_symbol(simd, &mut lst, l[pos], mtfv, wr, freq);
                 cur = pos + 1;
@@ -185,11 +195,11 @@ pub(crate) fn mtf<S: Simd>(
                 z_pend += 1;
                 continue;
             }
-            wr = put_zero_run(mtfv, wr, freq, z_pend);
+            wr = put_zero_run(simd, mtfv, wr, freq, z_pend);
             z_pend = 0;
             wr = put_symbol(simd, &mut lst, l[pos], mtfv, wr, freq);
         }
-        wr = put_zero_run(mtfv, wr, freq, z_pend);
+        wr = put_zero_run(simd, mtfv, wr, freq, z_pend);
     }
     mtfv[wr] = eob as u16;
     freq[eob] += 1;
