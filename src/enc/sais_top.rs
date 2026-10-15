@@ -160,6 +160,11 @@ pub(super) fn buckets_for_partial_sorting(
 /// bit when it starts a new name group. Returns whether the left-to-right
 /// scan changed bucket on fewer than one step in ten, which picks the
 /// bucket-cursor mode of the steps after it.
+///
+/// Every suffix `p` the scans meet has `p >= 2`, so `t[p - 2]` is in bounds:
+/// the radix sort leaves the first LMS suffix out, so nothing before it is
+/// induced, and in a Lyndon word that suffix starts at 2 or later (suffix 0
+/// is the least, so S-type, and neither 0 nor 1 is LMS).
 pub(super) fn induce_partial_order<const P: bool>(
     t: &[u8],
     sa: &mut [i32],
@@ -170,10 +175,7 @@ pub(super) fn induce_partial_order<const P: bool>(
     let n = t.len();
     bk.b4[512..].fill(0);
     let temp = &mut bk.temp;
-    let (ind, distinct) = {
-        let (lo, hi) = bk.b4.split_at_mut(512);
-        (lo, hi)
-    };
+    let (ind, distinct) = bk.b4.split_at_mut(512);
 
     // Left to right over the L-type part.
     let mut d = 0;
@@ -199,7 +201,7 @@ pub(super) fn induce_partial_order<const P: bool>(
         *h += 1;
         distinct[v] = d;
     }
-    let repetitive = 10 * u64::from(changes) < u64::try_from(left_count).unwrap_or(0);
+    let repetitive = 10 * i64::from(changes) < i64::from(left_count);
 
     // The marks move from the start of each group of an L-type bucket to
     // its end.

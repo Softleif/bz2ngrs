@@ -6,8 +6,6 @@
 //! BWT directly, are a port of the sorter bz2-ng used before it adopted
 //! libsais (`sort.c` and `sort_template.h` of bz2-ng's history, MIT), which
 //! derives from Yuta Mori's sais-lite 2.4.1 (MIT, `LICENSE-sais-lite`).
-//! Measured on CRAM tag data, libsais's top level is the faster one, and
-//! these two are as fast as libsais's own.
 //!
 //! For a Lyndon word (strictly smaller than each of its proper rotations)
 //! suffix order equals rotation order, so a suffix sorter with an implicit
@@ -18,9 +16,9 @@
 //! in bz2-ng: the suffix array at its start, then free space holding names,
 //! the LMS list and the reduced string, and a level's bucket arrays at its
 //! end. Those regions are disjoint at every step, so each phase splits the
-//! array instead of aliasing it. Where bz2-ng would fail a level whose
-//! buckets do not fit (it may not allocate), this allocates them; with the
-//! work size of [`work_len`] that never happens.
+//! array instead of aliasing it. Every level below the top has free space
+//! of at least its length, hence its alphabet (see [`free_len`]), so its
+//! buckets always fit.
 //!
 //! Kernel forms are bz2-ng's choices for clang on the server cores
 //! (`SORT_SUFFIX0_APART` on; branchy naming, branchy selects and no
@@ -33,10 +31,11 @@ use super::sais32;
 /// (libsais's distance).
 pub(super) const PF: usize = 64;
 
-/// Scans of strings shorter than this do not prefetch: their suffix array
-/// fits in a 512 KiB L2, and the prefetches cost more than they save. Nor do
-/// the scans after a repetitive top level (`REG`), whose reads mostly hit
-/// lines that the previous steps brought in.
+/// Blocks, and levels of this file's recursion, shorter than this do not
+/// prefetch: their suffix array fits in a 512 KiB L2, and the prefetches
+/// cost more than they save (`sais32.rs` has its own threshold). Nor do the
+/// scans after a repetitive top level (`REG`), whose reads mostly hit lines
+/// that the previous steps brought in.
 pub(super) const FAR: usize = 1 << 17;
 
 /// A hint to fetch the cache line of `s[i]`; any `i` is fine, since a
@@ -71,8 +70,9 @@ pub(crate) fn work_len(n: usize) -> usize {
 
 /// The free space after the suffix array. The top level names its `m <= n /
 /// 2` LMS substrings in the `n / 2` slots after them and gathers the reduced
-/// string into the last `m`; every level below has an alphabet below `n / 2`
-/// and at least that free space, so its buckets fit beside it.
+/// string into the last `m`. The level below it, of length `m`, gets free
+/// space `fs + n - 2m >= fs > m`, and every level hands its child (of at
+/// most half its length) free space of at least the child's length.
 fn free_len(n: usize) -> usize {
     n / 2 + 2048
 }
@@ -217,19 +217,10 @@ impl Buckets<'_> {
     }
 }
 
-/// The part of `sa` before its last `tail_len` ints, and those ints; or all
-/// of `sa` and `ext` when the buckets did not fit in `sa`.
-fn split_tail<'a>(
-    sa: &'a mut [i32],
-    ext: &'a mut [i32],
-    tail_len: usize,
-) -> (&'a mut [i32], &'a mut [i32]) {
-    if ext.is_empty() {
-        let at = sa.len() - tail_len;
-        sa.split_at_mut(at)
-    } else {
-        (sa, ext)
-    }
+/// The part of `sa` before its last `tail_len` ints, and those ints.
+fn split_tail(sa: &mut [i32], tail_len: usize) -> (&mut [i32], &mut [i32]) {
+    let at = sa.len() - tail_len;
+    sa.split_at_mut(at)
 }
 
 /// The bucket arrays at the end of `tail` (`[.. | B | C]`, or `[.. | B]` when
@@ -712,40 +703,24 @@ fn compute_bwt<const REG: bool, const P: bool>(
     (pidx, qr)
 }
 
-/// Where [`sais_reduce`] left a level's buckets: `one` when counts and heads
-/// share one array, and `ext` holding them when they did not fit in the
-/// work array (empty otherwise).
-struct Reduced {
-    one: bool,
-    ext: Vec<i32>,
-}
-
 /// Stages 1 and 2 of SA-IS on a reduced problem, then its sorted LMS
 /// suffixes placed at the ends of their buckets (stage 3 seeding); the
 /// caller runs the final induction with the buckets this leaves. `sa` has
-/// `n + fs` ints, and the bucket arrays come from its last ones. A level
-/// recounts its buckets after recursing rather than reserving them, so each
-/// level's free space is at least its parent's.
+/// `n + fs` ints with `k <= fs` ([`free_len`]), and the bucket arrays come
+/// from its last ones. A level recounts its buckets after recursing rather
+/// than reserving them, so each level's free space is at least its
+/// parent's. Returns whether counts and heads share one array.
 fn sais_reduce<S: Sym, const REG: bool, const P: bool>(
     t: &[S],
     sa: &mut [i32],
     fs: usize,
     k: usize,
-) -> Reduced {
+) -> bool {
     let n = t.len();
-    let mut ext = Vec::new();
-    let (one, mut recount) = if 2 * k <= fs {
-        (false, 0)
-    } else if k <= fs {
-        (true, 1)
-    } else {
-        ext = vec![0; 2 * k];
-        (false, 0)
-    };
-    let lmssort2 = recount == 0 && ext.is_empty() && 2 <= n / k && 4 * k < fs;
-    let used_tail = if !ext.is_empty() {
-        0
-    } else if lmssort2 {
+    let one = 2 * k > fs;
+    let mut recount = one;
+    let lmssort2 = !one && 2 <= n / k && 4 * k < fs;
+    let used_tail = if lmssort2 {
         4 * k
     } else if one {
         k
@@ -758,7 +733,7 @@ fn sais_reduce<S: Sym, const REG: bool, const P: bool>(
     let m;
     let name;
     {
-        let (main, tail) = split_tail(sa, &mut ext, used_tail);
+        let (main, tail) = split_tail(sa, used_tail);
         let (d, mut bk) = layout(tail, k, one);
         S::counts(t, bk.counts());
         bk.heads_from_counts(true);
@@ -857,9 +832,7 @@ fn sais_reduce<S: Sym, const REG: bool, const P: bool>(
             // [0, m + newfs) recursion | reduced string | LMS list | buckets
             n + fs - used_tail - 3 * m
         } else {
-            if ext.is_empty() {
-                recount = 2;
-            }
+            recount = true;
             n + fs - 2 * m
         };
         let ra = m + newfs;
@@ -901,9 +874,9 @@ fn sais_reduce<S: Sym, const REG: bool, const P: bool>(
     }
 
     {
-        let (main, tail) = split_tail(sa, &mut ext, if one { k } else { 2 * k });
+        let (main, tail) = split_tail(sa, if one { k } else { 2 * k });
         let (_, mut bk) = layout(tail, k, one);
-        if recount != 0 {
+        if recount {
             S::counts(t, bk.counts());
         }
         if 1 < m {
@@ -940,7 +913,7 @@ fn sais_reduce<S: Sym, const REG: bool, const P: bool>(
             main[..j].fill(0);
         }
     }
-    Reduced { one, ext }
+    one
 }
 
 /// The suffix array of the name string `t` over `0..k`, for the recursion,
@@ -952,8 +925,8 @@ pub(super) fn sort_main<const REG: bool, const P: bool>(
     k: usize,
 ) {
     let n = t.len();
-    let mut r = sais_reduce::<i32, REG, P>(t, sa, fs, k);
-    let (main, tail) = split_tail(sa, &mut r.ext, if r.one { k } else { 2 * k });
-    let (_, mut bk) = layout(tail, k, r.one);
+    let one = sais_reduce::<i32, REG, P>(t, sa, fs, k);
+    let (main, tail) = split_tail(sa, if one { k } else { 2 * k });
+    let (_, mut bk) = layout(tail, k, one);
     induce_sa::<i32, REG, P>(t, &mut main[..n], &mut bk);
 }

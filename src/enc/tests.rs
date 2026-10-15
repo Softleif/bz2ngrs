@@ -248,9 +248,10 @@ fn naive_suffix_array(t: &[i32]) -> Vec<i32> {
     sa
 }
 
-/// The recursion on a string of names, at every work-array size: from none
-/// (the older recursion, its buckets allocated) to six ints per symbol and
-/// more (libsais's 6k form), on random strings, on periodic strings with
+/// The recursion on a string of names, at every work-array size it can be
+/// given (free space of at least the string's length): from the older
+/// recursion's (buckets sharing one array or not) to six ints per symbol
+/// and more (libsais's 6k form), on random strings, on periodic strings with
 /// edits, and on long strings over 1 to 4 symbols (where libsais renumbers
 /// without compacting).
 #[hegel::test(test_cases = 1000)]
@@ -296,7 +297,7 @@ fn recursion_matches_naive_suffix_sort(tc: TestCase) {
         let i = rng.next() as usize % n;
         t[i] = (rng.next() % k as u64) as i32;
     }
-    let fs = tc.draw(gs::integers::<usize>().max_value(8 * k + 64));
+    let fs = n + tc.draw(gs::integers::<usize>().max_value(8 * k + 64));
     let mut work = vec![0x5A5A_5A5A; n + fs];
     let want = naive_suffix_array(&t);
     let orig = t.clone();
