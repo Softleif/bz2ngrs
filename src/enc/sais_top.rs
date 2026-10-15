@@ -118,7 +118,13 @@ pub(super) fn buckets_for_radix_sort(t: &[u8], bk: &mut Buckets, first_lms: usiz
 
 /// Moves the LMS suffixes `sa[from..to]` to the ends of their buckets
 /// (in the radix sort's bucket heads), right to left.
-pub(super) fn radix_sort_lms<const P: bool>(t: &[u8], sa: &mut [i32], bk: &mut Buckets, from: usize, to: usize) {
+pub(super) fn radix_sort_lms<const P: bool>(
+    t: &[u8],
+    sa: &mut [i32],
+    bk: &mut Buckets,
+    from: usize,
+    to: usize,
+) {
     for i in (from..to).rev() {
         if P && i >= PF {
             prefetch(t, sa[i - PF] as usize);
