@@ -27,6 +27,7 @@
 //! empty-slot skipping), since rustc's backend is LLVM.
 
 use super::sais_top as top;
+use super::sais32;
 
 /// How many entries ahead of an induction scan the text is prefetched
 /// (libsais's distance).
@@ -119,10 +120,10 @@ pub(crate) fn bwt(t: &mut [u8], q: usize, freq: &mut [i32; 256], work: &mut Vec<
             let (rec, rest) = sa.split_at_mut(n + fs - m);
             let fs = fs + n - 2 * m;
             match (mode, far && !mode) {
-                (true, true) => sort_main::<true, true>(rest, rec, fs, names),
-                (true, false) => sort_main::<true, false>(rest, rec, fs, names),
-                (false, true) => sort_main::<false, true>(rest, rec, fs, names),
-                (false, false) => sort_main::<false, false>(rest, rec, fs, names),
+                (true, true) => sais32::sort::<true, true>(rest, rec, fs, names),
+                (true, false) => sais32::sort::<true, false>(rest, rec, fs, names),
+                (false, true) => sais32::sort::<false, true>(rest, rec, fs, names),
+                (false, false) => sais32::sort::<false, false>(rest, rec, fs, names),
             }
             for v in &mut sa[..m] {
                 *v = lms[*v as usize];
@@ -872,7 +873,7 @@ fn sais_reduce<S: Sym, const REG: bool, const P: bool>(
         }
         {
             let (rec, rest) = sa.split_at_mut(ra);
-            sort_main::<REG, P>(&rest[..m], rec, newfs, name);
+            sais32::sort::<REG, P>(&mut rest[..m], rec, newfs, name);
         }
         if keep_list {
             let list = n + fs - used_tail - m;
@@ -944,7 +945,12 @@ fn sais_reduce<S: Sym, const REG: bool, const P: bool>(
 
 /// The suffix array of the name string `t` over `0..k`, for the recursion,
 /// into `sa[..t.len()]` (`sa` has `t.len() + fs` ints).
-fn sort_main<const REG: bool, const P: bool>(t: &[i32], sa: &mut [i32], fs: usize, k: usize) {
+pub(super) fn sort_main<const REG: bool, const P: bool>(
+    t: &[i32],
+    sa: &mut [i32],
+    fs: usize,
+    k: usize,
+) {
     let n = t.len();
     let mut r = sais_reduce::<i32, REG, P>(t, sa, fs, k);
     let (main, tail) = split_tail(sa, &mut r.ext, if r.one { k } else { 2 * k });
