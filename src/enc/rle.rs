@@ -1,5 +1,6 @@
 //! The encoder's input stage: libbz2's RLE1 with its exact block-boundary
-//! behaviour (bz2-ng's `rle_fill`, vector tier, of `kern_template.h`).
+//! behaviour (bz2-ng's `rle_fill`, vector tier, of `kern_template.h`, with
+//! the bulk phase done by 64-byte window masks).
 //!
 //! Input is cut into units, maximal runs of one byte cut at 255. A unit of 1
 //! to 3 bytes is stored as is, a longer one as 4 bytes and a count byte. A
@@ -13,7 +14,7 @@
 //! covers one contiguous input range per call plus the pending unit carried
 //! in from the previous call (whose bytes are added as copies of its byte).
 
-use fearless_simd::{Simd, SimdBase, SimdFrom, u8x16};
+use fearless_simd::{Simd, SimdBase, SimdFrom, u8x16, u8x64};
 
 use crate::crc;
 
@@ -22,10 +23,12 @@ use crate::crc;
 const GUARD: usize = 8;
 /// Calls with fewer input bytes than this take libbz2's byte loop.
 const SMALL: usize = 16;
-/// Bytes the fast phase examines and copies per step.
-const STEP: usize = 16;
+/// Bytes the bulk phase needs from the start of a 64-byte window: the
+/// window, the next window's mask and the byte after it.
+const LOOKAHEAD: usize = 130;
 /// Bytes the block buffer needs past `nblock_max`: the last unit (5 bytes)
-/// written with one 8-byte store.
+/// written with one 8-byte store, and a 16-byte copy of literal bytes that
+/// ends at `nblock_max - GUARD` at the latest.
 pub(crate) const SLACK: usize = 16;
 
 /// The RLE1 state carried between calls and blocks.
@@ -77,17 +80,21 @@ fn load16<S: Simd>(simd: S, p: &[u8], i: usize) -> u8x16<S> {
     u8x16::simd_from(simd, *p[i..].first_chunk::<16>().unwrap_or(&[0; 16]))
 }
 
-/// Bit `k` is set iff `p[i + k..i + k + 4]` are equal (k = 0..16); reads
-/// `p[i..i + 19]`.
+/// Bit `k` is set iff `p[i + k] != p[i + k + 1]`, for `k` in `0..64`; reads
+/// `p[i..i + 65]`.
 #[inline(always)]
-fn run4_mask<S: Simd>(simd: S, p: &[u8], i: usize) -> u64 {
-    let (a, b, c, d) = (
-        load16(simd, p, i),
-        load16(simd, p, i + 1),
-        load16(simd, p, i + 2),
-        load16(simd, p, i + 3),
-    );
-    simd.to_bitmask_mask8x16(a.simd_eq(b) & b.simd_eq(c) & c.simd_eq(d))
+fn diff_mask64<S: Simd>(simd: S, p: &[u8], i: usize) -> u64 {
+    let at = |o: usize| u8x64::simd_from(simd, *p[o..].first_chunk::<64>().unwrap_or(&[0; 64]));
+    !simd.to_bitmask_mask8x64(at(i).simd_eq(at(i + 1)))
+}
+
+/// Whether a run of 4 equal bytes starts in `p[i..i + 64]`; reads
+/// `p[i..i + 67]`.
+#[inline(always)]
+fn has_run4<S: Simd>(simd: S, p: &[u8], i: usize) -> bool {
+    let at = |o: usize| u8x64::simd_from(simd, *p[o..].first_chunk::<64>().unwrap_or(&[0; 64]));
+    let (a, b, c, d) = (at(i), at(i + 1), at(i + 2), at(i + 3));
+    simd.any_true_mask8x64(a.simd_eq(b) & b.simd_eq(c) & c.simd_eq(d))
 }
 
 /// Number of bytes equal to `c` at `p[..avail]`.
@@ -106,6 +113,111 @@ fn run_length<S: Simd>(simd: S, p: &[u8], avail: usize, c: u8) -> usize {
         l += 1;
     }
     l
+}
+
+/// The bulk phase of [`fill`]: from the unit boundary `p`, whole 64-byte
+/// windows of `input` while the block has room (output at most `limit`).
+/// Returns the unit boundary it stopped at and the block length.
+///
+/// A window's mask of positions that differ from their successor gives the
+/// runs: a run of 4 or more starts where three successive bits are clear, and
+/// ends at the next set bit. The bytes between runs are literal units and
+/// are copied, in one piece, when the next run or the end comes. It stops at
+/// a unit boundary, or inside a literal unit of at most 3 bytes that ends
+/// within the input (which writes the same bytes however it is split).
+#[inline(always)]
+fn bulk<S: Simd>(
+    simd: S,
+    input: &[u8],
+    blk: &mut [u8],
+    p: usize,
+    mut nb: usize,
+    limit: usize,
+) -> (usize, usize) {
+    const NONE: usize = usize::MAX;
+    let avail = input.len();
+    if p + LOOKAHEAD > avail {
+        return (p, nb);
+    }
+    // `lit`: start of the literal bytes not yet copied; `run`: start of a run
+    // whose end is in a later window.
+    let (mut lit, mut base, mut run) = (p, p, NONE);
+    // `dn`: the mask of the window at `dn_at`, if it was computed.
+    let (mut dn, mut dn_at) = (0, NONE);
+    let stop = 'win: {
+        while base + LOOKAHEAD <= avail {
+            let end = if run == NONE { base + 64 } else { run };
+            if nb + (end - lit) > limit {
+                break 'win end.min(base);
+            }
+            if run == NONE && !has_run4(simd, input, base) {
+                base += 64;
+                continue;
+            }
+            let dw = if dn_at == base {
+                dn
+            } else {
+                diff_mask64(simd, input, base)
+            };
+            dn = diff_mask64(simd, input, base + 64);
+            dn_at = base + 64;
+            let r4 = !(dw | (dw >> 1 | dn << 63) | (dw >> 2 | dn << 62));
+            let mut from = 0;
+            loop {
+                let (j, k) = if run == NONE {
+                    let m = r4 & (!0u64 << from);
+                    if m == 0 {
+                        break;
+                    }
+                    let k = m.trailing_zeros();
+                    (base + k as usize, k)
+                } else {
+                    (run, 0)
+                };
+                let ends = dw & (!0u64 << k);
+                if ends == 0 {
+                    run = j;
+                    break;
+                }
+                let last = ends.trailing_zeros();
+                let len = base + last as usize + 1 - j;
+                if nb + (j - lit) + 5 * (len / 255 + 1) > limit {
+                    break 'win lit;
+                }
+                if j - lit <= 16 {
+                    // One fixed-size copy, which may write past the bytes
+                    // that count (`SLACK`).
+                    blk[nb..nb + 16].copy_from_slice(&input[lit..lit + 16]);
+                } else {
+                    blk[nb..nb + j - lit].copy_from_slice(&input[lit..j]);
+                }
+                nb += j - lit;
+                let c = input[j];
+                let mut l = len;
+                while l >= 255 {
+                    nb = put_unit(blk, nb, c, 255);
+                    l -= 255;
+                }
+                if l > 0 {
+                    nb = put_unit(blk, nb, c, l);
+                }
+                lit = j + len;
+                run = NONE;
+                from = last + 1;
+                if from == 64 {
+                    break;
+                }
+            }
+            base += 64;
+        }
+        if run == NONE { base } else { run }
+    };
+    if stop > lit && nb + (stop - lit) <= limit {
+        blk[nb..nb + stop - lit].copy_from_slice(&input[lit..stop]);
+        nb += stop - lit;
+        lit = stop;
+    }
+    (lit, nb)
 }
 
 /// Feeds `input` to the block `blk` until it runs out or the block is full;
@@ -188,44 +300,9 @@ pub(crate) fn fill<S: Simd>(
     let u = p;
     let limit = nblock_max.saturating_sub(GUARD);
 
-    // Fast phase: whole literal spans and runs while the block has room for
-    // a whole step and the input for the loads. It stops only at a unit
-    // boundary or inside a literal unit of at most 3 bytes that ends within
-    // this call (which writes the same bytes however it is split).
-    'fast: while nb + STEP <= limit && p + 2 * STEP <= avail {
-        let m = run4_mask(simd, input, p);
-        blk[nb..nb + STEP].copy_from_slice(&input[p..p + STEP]);
-        if m == 0 {
-            nb += STEP;
-            p += STEP;
-            continue;
-        }
-        let j = m.trailing_zeros() as usize;
-        nb += j;
-        p += j;
-        // A maximal run of 4 or more starts at p.
-        let c = input[p];
-        let mut l = run_length(simd, &input[p..], avail - p, c);
-        if p + l == avail {
-            // It may continue in the next call.
-            break;
-        }
-        while l >= 255 {
-            if nb + 5 > limit {
-                break 'fast;
-            }
-            nb = put_unit(blk, nb, c, 255);
-            p += 255;
-            l -= 255;
-        }
-        if l > 0 {
-            if nb + 5 > limit {
-                break 'fast;
-            }
-            nb = put_unit(blk, nb, c, l);
-            p += l;
-        }
-    }
+    let (p2, nb2) = bulk(simd, input, blk, p, nb, limit);
+    p = p2;
+    nb = nb2;
 
     // Exact unit-by-unit tail: libbz2's block-full decision, and the pending
     // unit at the end of the call.
