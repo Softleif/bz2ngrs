@@ -28,6 +28,38 @@
 
 use super::sais_top as top;
 
+/// How many entries ahead of an induction scan the text is prefetched
+/// (libsais's distance).
+pub(super) const PF: usize = 64;
+
+/// Scans of strings shorter than this do not prefetch: their suffix array
+/// fits in a 512 KiB L2, and the prefetches cost more than they save. Nor do
+/// the scans after a repetitive top level (`REG`), whose reads mostly hit
+/// lines that the previous steps brought in.
+pub(super) const FAR: usize = 1 << 17;
+
+/// A hint to fetch the cache line of `s[i]`; any `i` is fine, since a
+/// prefetch never faults. The induction scans read the text at the
+/// positions they find in the suffix array, which miss the cache once a
+/// block outgrows L2, and the hardware prefetchers of x86 cores do not follow
+/// them (libsais prefetches the same reads). A no-op elsewhere: aarch64's
+/// prefetch intrinsic is unstable, and Apple's cores gained nothing from it
+/// in bz2-ng's measurements.
+#[inline(always)]
+#[allow(unsafe_code, reason = "a prefetch hint, see the SAFETY comment")]
+pub(super) fn prefetch<T>(s: &[T], i: usize) {
+    #[cfg(target_arch = "x86_64")]
+    // SAFETY: SSE, the one feature `_mm_prefetch` needs, is part of the
+    // x86-64 baseline; the pointer is never dereferenced.
+    unsafe {
+        core::arch::x86_64::_mm_prefetch::<{ core::arch::x86_64::_MM_HINT_T0 }>(
+            s.as_ptr().wrapping_add(i).cast(),
+        );
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    let _ = (s, i);
+}
+
 /// Ints of work array [`bwt`] uses for a block of `n` bytes: the suffix
 /// array and free space of more than `n / 2` ([`free_len`]), then the top
 /// level's LMS positions (at most `n / 2`), kept for after the recursion
@@ -67,19 +99,30 @@ pub(crate) fn bwt(t: &mut [u8], q: usize, freq: &mut [i32; 256], work: &mut Vec<
     lms[..m].copy_from_slice(&sa[n - m..n]);
     top::start_and_end(&mut bk, freq);
     let mut mode = false;
+    let far = n >= FAR;
     if m > 0 {
         let first_lms = sa[n - m] as usize;
         let left_count = top::buckets_for_radix_sort(t, &mut bk, first_lms);
-        top::radix_sort_lms(t, sa, &mut bk, n - m + 1, n);
+        if far {
+            top::radix_sort_lms::<true>(t, sa, &mut bk, n - m + 1, n);
+        } else {
+            top::radix_sort_lms::<false>(t, sa, &mut bk, n - m + 1, n);
+        }
         top::buckets_for_partial_sorting(t, &mut bk, first_lms, left_count);
-        mode = top::induce_partial_order(t, sa, &mut bk, first_lms, left_count);
+        mode = if far {
+            top::induce_partial_order::<true>(t, sa, &mut bk, first_lms, left_count)
+        } else {
+            top::induce_partial_order::<false>(t, sa, &mut bk, first_lms, left_count)
+        };
         let names = top::renumber_and_gather(sa, n, m, fs);
         if names < m {
             let (rec, rest) = sa.split_at_mut(n + fs - m);
-            if mode {
-                sort_main::<true>(rest, rec, fs + n - 2 * m, names);
-            } else {
-                sort_main::<false>(rest, rec, fs + n - 2 * m, names);
+            let fs = fs + n - 2 * m;
+            match (mode, far && !mode) {
+                (true, true) => sort_main::<true, true>(rest, rec, fs, names),
+                (true, false) => sort_main::<true, false>(rest, rec, fs, names),
+                (false, true) => sort_main::<false, true>(rest, rec, fs, names),
+                (false, false) => sort_main::<false, false>(rest, rec, fs, names),
             }
             for v in &mut sa[..m] {
                 *v = lms[*v as usize];
@@ -90,10 +133,12 @@ pub(crate) fn bwt(t: &mut [u8], q: usize, freq: &mut [i32; 256], work: &mut Vec<
         sa[..n].fill(0);
     }
     let (mut start, mut end) = (bk.start, bk.end);
-    let (pidx, qrank) = if mode {
-        compute_bwt::<true>(t, &mut sa[..n], &mut start, &mut end, q)
-    } else {
-        compute_bwt::<false>(t, &mut sa[..n], &mut start, &mut end, q)
+    let (sa, s, e) = (&mut sa[..n], &mut start, &mut end);
+    let (pidx, qrank) = match (mode, far && !mode) {
+        (true, true) => compute_bwt::<true, true>(t, sa, s, e, q),
+        (true, false) => compute_bwt::<true, false>(t, sa, s, e, q),
+        (false, true) => compute_bwt::<false, true>(t, sa, s, e, q),
+        (false, false) => compute_bwt::<false, false>(t, sa, s, e, q),
     };
     debug_assert_eq!(pidx, 0, "the block is not a Lyndon word");
     t[0] = t[n - 1];
@@ -274,7 +319,7 @@ fn mark_if(cond: bool, v: i32) -> i32 {
 /// source of type `t`, and an entry gets `+n` when it starts a new name
 /// group. Seeds must be in place with the group starts marked. Returns the
 /// pass counter for the S-scan.
-fn lms_sort2_l<S: Sym, const REG: bool>(
+fn lms_sort2_l<S: Sym, const REG: bool, const P: bool>(
     t: &[S],
     sa: &mut [i32],
     c: &[i32],
@@ -290,7 +335,11 @@ fn lms_sort2_l<S: Sym, const REG: bool>(
     let jv = (j + n) as i32;
     cur.put_inc(sa, b, mark_if(t[j].get() < c1, jv));
     let mut dd = 0;
+    let far = P && n >= FAR;
     for i in 0..n {
+        if far && let Some(&f) = sa.get(i + PF) {
+            prefetch(t, (f - if f >= ni { ni } else { 0 }).max(1) as usize - 1);
+        }
         let mut j = sa[i];
         if 0 < j {
             if ni <= j {
@@ -330,7 +379,7 @@ fn lms_sort2_l<S: Sym, const REG: bool>(
 
 /// The S-scan of the LMS-substring sort, continuing the naming of
 /// [`lms_sort2_l`] from its pass counter `dd`.
-fn lms_sort2_s<S: Sym, const REG: bool>(
+fn lms_sort2_s<S: Sym, const REG: bool, const P: bool>(
     t: &[S],
     sa: &mut [i32],
     c: &[i32],
@@ -343,7 +392,12 @@ fn lms_sort2_s<S: Sym, const REG: bool>(
     get_buckets(c, b, true);
     let mut cur = Cur::<REG>::new(0, b);
     let mut dd = dd + 1;
+    let far = P && n >= FAR;
     for i in (0..n).rev() {
+        if far && i >= PF {
+            let f = sa[i - PF];
+            prefetch(t, (f - if f >= ni { ni } else { 0 }).max(1) as usize - 1);
+        }
         let mut j = sa[i];
         if 0 < j {
             if ni <= j {
@@ -404,7 +458,7 @@ fn lms_postproc2(sa: &mut [i32], n: usize, m: usize) -> usize {
 
 /// Sorts the LMS substrings by induction without naming them, for levels
 /// whose free space has no room for the naming counters.
-fn lms_sort1<S: Sym, const REG: bool>(t: &[S], sa: &mut [i32], bk: &mut Buckets<'_>) {
+fn lms_sort1<S: Sym, const REG: bool, const P: bool>(t: &[S], sa: &mut [i32], bk: &mut Buckets<'_>) {
     let n = t.len();
     bk.set(t, false);
     let b = &mut *bk.b;
@@ -412,7 +466,11 @@ fn lms_sort1<S: Sym, const REG: bool>(t: &[S], sa: &mut [i32], bk: &mut Buckets<
     let mut cur = Cur::<REG>::new(c1, b);
     let j = (n - 2) as i32;
     cur.put_inc(sa, b, mark_if(t[n - 2].get() < c1, j));
+    let far = P && n >= FAR;
     for i in 0..n {
+        if far && let Some(&f) = sa.get(i + PF) {
+            prefetch(t, f.max(1) as usize - 1);
+        }
         let mut j = sa[i];
         if 0 < j {
             let c0 = t[j as usize].get();
@@ -428,6 +486,9 @@ fn lms_sort1<S: Sym, const REG: bool>(t: &[S], sa: &mut [i32], bk: &mut Buckets<
     let b = &mut *bk.b;
     let mut cur = Cur::<REG>::new(0, b);
     for i in (0..n).rev() {
+        if far && i >= PF {
+            prefetch(t, sa[i - PF].max(1) as usize - 1);
+        }
         let mut j = sa[i];
         if 0 < j {
             let c0 = t[j as usize].get();
@@ -514,7 +575,7 @@ fn lms_postproc1<S: Sym>(t: &[S], sa: &mut [i32], m: usize) -> usize {
 
 /// Final induction of a reduced problem: its suffix array from the sorted
 /// LMS suffixes seeded at the ends of their buckets.
-fn induce_sa<S: Sym, const REG: bool>(t: &[S], sa: &mut [i32], bk: &mut Buckets<'_>) {
+fn induce_sa<S: Sym, const REG: bool, const P: bool>(t: &[S], sa: &mut [i32], bk: &mut Buckets<'_>) {
     let n = t.len();
     bk.set(t, false);
     let b = &mut *bk.b;
@@ -522,7 +583,11 @@ fn induce_sa<S: Sym, const REG: bool>(t: &[S], sa: &mut [i32], bk: &mut Buckets<
     let c1 = t[j].get();
     let mut cur = Cur::<REG>::new(c1, b);
     cur.put_inc(sa, b, mark_if(j > 0 && t[j - 1].get() < c1, j as i32));
+    let far = P && n >= FAR;
     for i in 0..n {
+        if far && let Some(&f) = sa.get(i + PF) {
+            prefetch(t, f.max(2) as usize - 2);
+        }
         let j = sa[i];
         sa[i] = !j;
         // Entry 1 induces suffix 0, which has no predecessor; every other
@@ -541,6 +606,9 @@ fn induce_sa<S: Sym, const REG: bool>(t: &[S], sa: &mut [i32], bk: &mut Buckets<
     let b = &mut *bk.b;
     let mut cur = Cur::<REG>::new(0, b);
     for i in (0..n).rev() {
+        if far && i >= PF {
+            prefetch(t, sa[i - PF].max(2) as usize - 2);
+        }
         let j = sa[i];
         if 1 < j {
             let j = (j - 1) as usize;
@@ -560,7 +628,7 @@ fn induce_sa<S: Sym, const REG: bool>(t: &[S], sa: &mut [i32], bk: &mut Buckets<
 /// and returns the row of suffix 0 (which holds 0) and that of suffix `q`
 /// (`1 <= q < n`, recorded when the suffix is written; `usize::MAX` for
 /// `q = 0`). Every suffix but 0 is written to its final row exactly once.
-fn compute_bwt<const REG: bool>(
+fn compute_bwt<const REG: bool, const P: bool>(
     t: &[u8],
     sa: &mut [i32],
     start: &mut [i32; 256],
@@ -577,7 +645,11 @@ fn compute_bwt<const REG: bool>(
         qr = cur.pos_inc(b);
     }
     cur.put_inc(sa, b, mark_if(usize::from(t[j - 1]) < c1, j as i32));
+    let far = P && n >= FAR;
     for i in 0..n {
+        if far && let Some(&f) = sa.get(i + PF) {
+            prefetch(t, (f.max(2) - 2) as usize);
+        }
         let e = sa[i];
         if 0 < e {
             let j = (e - 1) as usize;
@@ -599,6 +671,9 @@ fn compute_bwt<const REG: bool>(
     let mut cur = Cur::<REG>::new(0, b);
     let mut pidx = usize::MAX;
     for i in (0..n).rev() {
+        if far && i >= PF {
+            prefetch(t, (sa[i - PF].max(2) - 2) as usize);
+        }
         let e = sa[i];
         // Only the entry of suffix 1 induces suffix 0, and it is left out:
         // suffix 0 is the smallest, so its row is 0, and sa[0] still holds
@@ -642,7 +717,7 @@ struct Reduced {
 /// `n + fs` ints, and the bucket arrays come from its last ones. A level
 /// recounts its buckets after recursing rather than reserving them, so each
 /// level's free space is at least its parent's.
-fn sais_reduce<S: Sym, const REG: bool>(t: &[S], sa: &mut [i32], fs: usize, k: usize) -> Reduced {
+fn sais_reduce<S: Sym, const REG: bool, const P: bool>(t: &[S], sa: &mut [i32], fs: usize, k: usize) -> Reduced {
     let n = t.len();
     let mut ext = Vec::new();
     let (one, mut recount) = if 2 * k <= fs {
@@ -740,11 +815,11 @@ fn sais_reduce<S: Sym, const REG: bool>(t: &[S], sa: &mut [i32], fs: usize, k: u
                     d[i] = 0;
                     d[i + k] = 0;
                 }
-                let dd = lms_sort2_l::<S, REG>(t, &mut main[..n], c, b, d);
-                lms_sort2_s::<S, REG>(t, &mut main[..n], c, b, d, dd);
+                let dd = lms_sort2_l::<S, REG, P>(t, &mut main[..n], c, b, d);
+                lms_sort2_s::<S, REG, P>(t, &mut main[..n], c, b, d, dd);
                 lms_postproc2(main, n, m)
             } else {
-                lms_sort1::<S, REG>(t, &mut main[..n], &mut bk);
+                lms_sort1::<S, REG, P>(t, &mut main[..n], &mut bk);
                 lms_postproc1(t, main, m)
             }
         } else if m == 1 {
@@ -784,7 +859,7 @@ fn sais_reduce<S: Sym, const REG: bool>(t: &[S], sa: &mut [i32], fs: usize, k: u
         }
         {
             let (rec, rest) = sa.split_at_mut(ra);
-            sort_main::<REG>(&rest[..m], rec, newfs, name);
+            sort_main::<REG, P>(&rest[..m], rec, newfs, name);
         }
         if keep_list {
             let list = n + fs - used_tail - m;
@@ -856,10 +931,10 @@ fn sais_reduce<S: Sym, const REG: bool>(t: &[S], sa: &mut [i32], fs: usize, k: u
 
 /// The suffix array of the name string `t` over `0..k`, for the recursion,
 /// into `sa[..t.len()]` (`sa` has `t.len() + fs` ints).
-fn sort_main<const REG: bool>(t: &[i32], sa: &mut [i32], fs: usize, k: usize) {
+fn sort_main<const REG: bool, const P: bool>(t: &[i32], sa: &mut [i32], fs: usize, k: usize) {
     let n = t.len();
-    let mut r = sais_reduce::<i32, REG>(t, sa, fs, k);
+    let mut r = sais_reduce::<i32, REG, P>(t, sa, fs, k);
     let (main, tail) = split_tail(sa, &mut r.ext, if r.one { k } else { 2 * k });
     let (_, mut bk) = layout(tail, k, r.one);
-    induce_sa::<i32, REG>(t, &mut main[..n], &mut bk);
+    induce_sa::<i32, REG, P>(t, &mut main[..n], &mut bk);
 }
