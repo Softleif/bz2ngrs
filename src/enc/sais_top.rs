@@ -1,9 +1,10 @@
 //! The block sorter's top level: SA-IS stages 1 and 2 on the block's bytes,
 //! and the placement of the sorted LMS suffixes for the final induction.
 //!
-//! Ported from libsais (Ilya Grebnov, Apache-2.0 WITH LLVM-exception,
-//! `LICENSE-libsais`; the copy at commit 1a696e6 that bz2-ng vendors), the
-//! single-threaded path of `libsais_main_8u` up to the final induction:
+//! Ported from libsais, Copyright (c) 2021-2025 Ilya Grebnov, under the
+//! Apache License 2.0 with LLVM Exceptions (`LICENSE-libsais`), from the copy
+//! at commit 1a696e6 that bz2-ng vendors: the single-threaded path of
+//! `libsais_main_8u` up to the final induction:
 //! `count_and_gather_lms_suffixes_8u`, the LMS radix sort, the partial-order
 //! scans with their 2-symbol buckets and sign-bit name marks, renumbering and
 //! gathering, and `place_lms_suffixes_interval_8u`. Altered: written in Rust,
