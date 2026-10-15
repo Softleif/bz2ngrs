@@ -346,7 +346,11 @@ pub(crate) fn encode(
     for iter in 0..N_ITERS {
         let recount = iter == 0;
         if recount {
-            h.rfreq = [[[0; MAX_ALPHA]; N_GROUPS]; 2];
+            for copy in &mut h.rfreq {
+                for row in &mut copy[..n_groups] {
+                    row[..alpha].fill(0);
+                }
+            }
         }
         // A table whose counts no group moved into or out of keeps its
         // lengths, so only the others are rebuilt.
