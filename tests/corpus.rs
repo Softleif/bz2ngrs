@@ -1,6 +1,7 @@
 //! Real CRAM bzip2 blocks (`corpus/cram-bzip2/`, git-ignored, produced
 //! separately): each one decoded into an `out` of its declared size, at every
-//! level, and compared with the oracle.
+//! level, and compared with the oracle; and some of their contents compressed
+//! by every encoder and compared with libbz2.
 //!
 //! The corpus is found as `$BZ2NGRS_CORPUS`, or `corpus/cram-bzip2` in the
 //! crate directory or any directory above it (so a git worktree finds the
@@ -14,6 +15,7 @@ mod common;
 
 use std::path::{Path, PathBuf};
 
+use common::enc_oracle::{all_encoders, check_all};
 use common::oracle::{Reference, all_decoders, reference};
 
 fn corpus_dir() -> Option<PathBuf> {
@@ -24,6 +26,25 @@ fn corpus_dir() -> Option<PathBuf> {
         .ancestors()
         .map(|dir| dir.join("corpus/cram-bzip2"))
         .find(|dir| dir.join("manifest.tsv").is_file())
+}
+
+/// The manifest's blocks, or `None` (after saying so) without a corpus.
+fn corpus_blocks() -> Option<Vec<(PathBuf, usize)>> {
+    let Some(dir) = corpus_dir() else {
+        assert!(
+            std::env::var_os("BZ2NGRS_CORPUS_REQUIRED").is_none_or(|v| v.is_empty()),
+            "BZ2NGRS_CORPUS_REQUIRED is set but corpus/cram-bzip2 was not found"
+        );
+        eprintln!("note: corpus/cram-bzip2 not found, nothing to check (set BZ2NGRS_CORPUS)");
+        return None;
+    };
+    let blocks = manifest(&dir);
+    assert!(
+        !blocks.is_empty(),
+        "{}: manifest.tsv lists no usable blocks",
+        dir.display()
+    );
+    Some(blocks)
 }
 
 /// `(path, declared uncompressed length)` for each manifest row; rows that do
@@ -49,20 +70,9 @@ fn manifest(dir: &Path) -> Vec<(PathBuf, usize)> {
 
 #[test]
 fn real_cram_blocks_decode_like_the_reference() {
-    let Some(dir) = corpus_dir() else {
-        assert!(
-            std::env::var_os("BZ2NGRS_CORPUS_REQUIRED").is_none_or(|v| v.is_empty()),
-            "BZ2NGRS_CORPUS_REQUIRED is set but corpus/cram-bzip2 was not found"
-        );
-        eprintln!("note: corpus/cram-bzip2 not found, nothing to check (set BZ2NGRS_CORPUS)");
+    let Some(blocks) = corpus_blocks() else {
         return;
     };
-    let blocks = manifest(&dir);
-    assert!(
-        !blocks.is_empty(),
-        "{}: manifest.tsv lists no usable blocks",
-        dir.display()
-    );
     let decoders = all_decoders();
     let mut failures = Vec::new();
     for (path, declared) in &blocks {
@@ -105,5 +115,44 @@ fn real_cram_blocks_decode_like_the_reference() {
             .cloned()
             .collect::<Vec<_>>()
             .join("\n")
+    );
+}
+
+/// Uncompressed bytes per corpus source that the encoder test compresses.
+const ENCODE_BUDGET: usize = 2 << 20;
+
+/// The contents of real CRAM blocks, each compressed as seqair writes it (one
+/// stream per block) at levels 1 and 9: the first blocks of each source up to
+/// [`ENCODE_BUDGET`] bytes, through [`check_all`].
+#[test]
+fn real_cram_data_compresses_like_libbz2() {
+    let Some(blocks) = corpus_blocks() else {
+        return;
+    };
+    let encoders = all_encoders();
+    let mut spent = std::collections::HashMap::new();
+    let mut failures = Vec::new();
+    for (path, declared) in &blocks {
+        let source = path.parent().unwrap_or(path);
+        let used = spent.entry(source.to_path_buf()).or_insert(0);
+        if *used >= ENCODE_BUDGET {
+            continue;
+        }
+        let src = std::fs::read(path).expect("block listed in the manifest is readable");
+        let Reference::Ok(data) = reference(&src, *declared) else {
+            continue;
+        };
+        *used += data.len();
+        for level in [1, 9] {
+            if std::panic::catch_unwind(|| check_all(&encoders, &data, level)).is_err() {
+                failures.push(format!("{} at level {level}", path.display()));
+            }
+        }
+    }
+    assert!(
+        failures.is_empty(),
+        "{} failed:\n{}",
+        failures.len(),
+        failures.join("\n")
     );
 }

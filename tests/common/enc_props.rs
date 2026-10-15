@@ -7,33 +7,13 @@
 use hegel::TestCase;
 use hegel::generators::{self as gs, PrintableGenerator};
 
-use super::enc_oracle::{Encoder, check_matches_libbz2, compression};
+pub use super::enc_oracle::check_all;
+use super::enc_oracle::{Encoder, check_matches_libbz2, compression, periodic_blocks};
 use super::inputs::{self, Rng, mixed};
-use super::oracle::{Decoder, check_exact};
 
 /// A count in `0..bound` from the whole of `u32`.
 fn below(tc: &TestCase, bound: usize) -> usize {
     tc.draw(gs::integers::<u32>()) as usize % bound
-}
-
-/// Every encoder writes the same stream for `data` at `level`; it is
-/// libbz2's (up to the origPtr of exactly periodic blocks), and our decoder
-/// reads it back.
-pub fn check_all(encoders: &[Encoder], data: &[u8], level: u32) {
-    let Some((first, rest)) = encoders.split_first() else {
-        return;
-    };
-    let stream = first.run(data, level);
-    for e in rest {
-        assert!(
-            e.run(data, level) == stream,
-            "{} and {} write different streams at level {level}",
-            e.name(),
-            first.name()
-        );
-    }
-    check_matches_libbz2(&first.name(), &stream, data, level);
-    check_exact(Decoder::New, &stream, data);
 }
 
 /// Property E1: data of a given shape, at any level.
@@ -159,8 +139,8 @@ pub fn run_free(raw: &[u8]) -> Vec<u8> {
 /// Data at `level` whose RLE1 blocks are exactly periodic. Half the draws
 /// repeat a run-free pattern whose length divides the block size, so that
 /// every full block is the pattern over and over, the last cut anywhere; the
-/// others repeat a few runs and literals (the runs become RLE1 units) within
-/// one block.
+/// others repeat a few runs and literals (the runs become RLE1 units) two
+/// times or more within one block.
 fn exact_periodic_at(tc: &TestCase, level: u32) -> Vec<u8> {
     let nblock_max = 100_000 * level as usize - 19;
     let divisors: Vec<usize> = (2..=20_000)
@@ -173,7 +153,13 @@ fn exact_periodic_at(tc: &TestCase, level: u32) -> Vec<u8> {
         let raw: Vec<u8> = (0..p).map(|_| (rng.next() % alphabet) as u8).collect();
         let pattern = run_free(&raw);
         let blocks = if level <= 3 { 1 + below(tc, 3) } else { 1 };
-        let len = blocks * nblock_max + below(tc, 3 * p + 1);
+        // A single byte past the full blocks joins the last of them (libbz2's
+        // rule at the end of the input), which makes it primitive.
+        let extra = match below(tc, 3 * p + 1) {
+            1 => 0,
+            x => x,
+        };
+        let len = blocks * nblock_max + extra;
         return pattern.into_iter().cycle().take(len).collect();
     }
     let units = 2 + below(tc, 7);
@@ -190,8 +176,9 @@ fn exact_periodic_at(tc: &TestCase, level: u32) -> Vec<u8> {
         };
         unit.extend(std::iter::repeat_n(b, n));
     }
-    let reps = 1 + below(tc, 150_000 / unit.len());
-    unit.repeat(reps)
+    // RLE1 grows the input by at most 5/4, so this many bytes fit one block.
+    let most = nblock_max * 4 / 5 / unit.len();
+    unit.repeat(2 + below(tc, most - 1))
 }
 
 #[hegel::composite]
@@ -208,6 +195,10 @@ pub fn exact_periodic(tc: &TestCase) -> LevelData {
 /// everything else is libbz2's.
 pub fn matches_libbz2_exact_periodic(tc: &TestCase, encoders: &[Encoder]) {
     let case = tc.draw(exact_periodic());
+    assert!(
+        periodic_blocks(&case.data, case.level) > 0,
+        "the generator made no exactly periodic block"
+    );
     check_all(encoders, &case.data, case.level);
 }
 
@@ -242,10 +233,10 @@ fn naive_mtf_values(block: &[u8]) -> usize {
 
 /// Bytes with no four equal in a row (RLE1 leaves them alone) whose block has
 /// exactly `want` MTF values, end of block included, if a search over their
-/// length finds that; else near it. libbz2 picks the number of Huffman tables
-/// from that count: 2 below 200, 3 below 600, 4 below 1200, 5 below 2400, 6
-/// from there.
-fn text_with_mtf_values(rng: &mut Rng, alphabet: u64, want: usize) -> Vec<u8> {
+/// length finds them (for most seeds). libbz2 picks the number of Huffman
+/// tables from that count: 2 below 200, 3 below 600, 4 below 1200, 5 below
+/// 2400, 6 from there.
+fn text_with_mtf_values(rng: &mut Rng, alphabet: u64, want: usize) -> Option<Vec<u8>> {
     let mut t: Vec<u8> = Vec::new();
     let mut len = want;
     for _ in 0..40 {
@@ -263,13 +254,13 @@ fn text_with_mtf_values(rng: &mut Rng, alphabet: u64, want: usize) -> Vec<u8> {
         }
         let got = naive_mtf_values(&t);
         if got == want {
-            break;
+            return Some(t);
         }
         len = len
             .saturating_add_signed(want.cast_signed() - got.cast_signed())
             .clamp(1, 20_000);
     }
-    t
+    None
 }
 
 /// A block with 200, 600, 1200 or 2400 MTF values, give or take 3.
@@ -279,7 +270,10 @@ pub fn near_table_count_threshold(tc: &TestCase) -> Vec<u8> {
     let delta = tc.draw(gs::integers::<isize>().min_value(-3).max_value(3));
     let alphabet = tc.draw(gs::integers::<u64>().min_value(2).max_value(256));
     let mut rng = Rng(tc.draw(gs::integers::<u64>()));
-    text_with_mtf_values(&mut rng, alphabet, threshold.saturating_add_signed(delta))
+    match text_with_mtf_values(&mut rng, alphabet, threshold.saturating_add_signed(delta)) {
+        Some(t) => t,
+        None => tc.reject(),
+    }
 }
 
 /// Property E1 where the number of MTF values is at a table-count threshold.

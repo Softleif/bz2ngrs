@@ -113,3 +113,24 @@ fn reuse_independent_of_earlier_calls(tc: hegel::TestCase) {
 fn compress_appends_to_out(tc: hegel::TestCase) {
     enc_props::compress_appends(&tc, &all_encoders());
 }
+
+#[test]
+fn compression_levels() {
+    use bz2ngrs::{Compression, Encoder};
+    assert_eq!(Compression::new(0), None);
+    assert_eq!(Compression::new(10), None);
+    for level in 1..=9 {
+        let c = Compression::new(level).map(Compression::level);
+        assert_eq!(c, Some(level));
+    }
+    assert_eq!(Compression::FAST.level(), 1);
+    assert_eq!(Compression::BEST.level(), 9);
+    assert_eq!(Compression::default(), Compression::BEST);
+    assert_eq!(
+        Encoder::new(Compression::FAST).compression(),
+        Compression::FAST
+    );
+    // The level digit of the stream header.
+    let stream = Encoder::new(Compression::FAST).compress_to_vec(b"");
+    assert_eq!(&stream[..4], b"BZh1");
+}

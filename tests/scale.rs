@@ -102,6 +102,18 @@ fn encoder_writes_libbz2s_stream_for_three_megabytes_at_level_1() {
     check_encoders_at_scale(&mixed(7, 3_800_000, 256), 1, 33);
 }
 
+/// 3 MB at level 9 in regions of noise, a 4-symbol and a 16-symbol alphabet
+/// with runs: blocks of the full 899 981 bytes, the size CRAM writers use.
+#[test]
+fn encoder_writes_libbz2s_stream_for_three_megabytes_at_level_9() {
+    let data: Vec<u8> = [256, 4, 16]
+        .into_iter()
+        .enumerate()
+        .flat_map(|(i, alphabet)| mixed(40 + i as u64, 1 << 20, alphabet))
+        .collect();
+    check_encoders_at_scale(&data, 9, 3);
+}
+
 /// 34 blocks that are each a 27-byte pattern 3703 times (27 divides the
 /// 99 981 bytes of a level 1 block): 34 exactly periodic blocks.
 #[test]
