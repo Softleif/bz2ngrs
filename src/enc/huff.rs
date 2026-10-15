@@ -37,6 +37,7 @@ pub(crate) struct Huff {
     ce: [[u32; MAX_ALPHA]; N_GROUPS],
     selector: Vec<u8>,
     prev_sel: Vec<u8>,
+    lengths: Box<Lengths>,
 }
 
 impl Huff {
@@ -48,105 +49,197 @@ impl Huff {
             ce: [[0; MAX_ALPHA]; N_GROUPS],
             selector: Vec::new(),
             prev_sel: Vec::new(),
+            lengths: Lengths::new_boxed(),
         })
     }
 }
 
-/// libbz2's `BZ2_hbMakeCodeLengths`: code lengths `len[..alpha]` for the
-/// frequencies `freq`, limited to `max_len` bits by flattening the weights
-/// and rebuilding until they fit.
-#[allow(
-    clippy::needless_range_loop,
-    reason = "libbz2's loops, kept recognisable"
-)]
-pub(super) fn make_code_lengths(len: &mut [u8], freq: &[i32], alpha: usize, max_len: u8) {
-    let mut heap = [0usize; MAX_ALPHA + 2];
-    let mut weight = [0i32; MAX_ALPHA * 2];
-    let mut parent = [0i32; MAX_ALPHA * 2];
+/// A heap entry is `weight << 16 | node`, so a weight is read without a
+/// second load and `a < b & HI` is "a's weight is below b's".
+const HI: u64 = !0xffff;
+const HEAP_LEN: usize = MAX_ALPHA + 3;
 
-    for i in 0..alpha {
-        weight[i + 1] = freq[i].max(1) << 8;
+/// Working memory of [`make_code_lengths_all`].
+pub(crate) struct Lengths {
+    heap: [[u64; HEAP_LEN]; N_GROUPS],
+    parent: [[u16; MAX_ALPHA * 2]; N_GROUPS],
+    /// The weight of each table's leaves (index 1 to `alpha`).
+    leaf: [[u32; MAX_ALPHA + 1]; N_GROUPS],
+}
+
+impl Lengths {
+    pub(crate) fn new_boxed() -> Box<Lengths> {
+        Box::new(Lengths {
+            heap: [[0; HEAP_LEN]; N_GROUPS],
+            parent: [[0; MAX_ALPHA * 2]; N_GROUPS],
+            leaf: [[0; MAX_ALPHA + 1]; N_GROUPS],
+        })
     }
+}
 
-    loop {
-        let mut n_nodes = alpha;
-        let mut n_heap = 0;
-        heap[0] = 0;
-        weight[0] = 0;
-        parent[0] = -2;
+/// Inserts `tmp` as entry `n` of the heap `h`.
+#[inline(always)]
+fn upheap(h: &mut [u64; HEAP_LEN], n: usize, tmp: u64) {
+    let mut zz = n;
+    while tmp < h[zz >> 1] & HI {
+        h[zz] = h[zz >> 1];
+        zz >>= 1;
+    }
+    h[zz] = tmp;
+}
 
-        let upheap = |heap: &mut [usize], weight: &[i32], z: usize| {
-            let mut zz = z;
-            let tmp = heap[zz];
-            while weight[tmp] < weight[heap[zz >> 1]] {
-                heap[zz] = heap[zz >> 1];
-                zz >>= 1;
-            }
-            heap[zz] = tmp;
-        };
-        let downheap = |heap: &mut [usize], weight: &[i32], n_heap: usize, z: usize| {
-            let mut zz = z;
-            let tmp = heap[zz];
-            loop {
-                let mut yy = zz << 1;
-                if yy > n_heap {
-                    break;
-                }
-                if yy < n_heap && weight[heap[yy + 1]] < weight[heap[yy]] {
-                    yy += 1;
-                }
-                if weight[tmp] < weight[heap[yy]] {
-                    break;
-                }
-                heap[zz] = heap[yy];
-                zz = yy;
-            }
-            heap[zz] = tmp;
-        };
-
-        for i in 1..=alpha {
-            parent[i] = -1;
-            n_heap += 1;
-            heap[n_heap] = i;
-            upheap(&mut heap, &weight, n_heap);
+/// Takes the smallest entry off each heap of `m + 1` entries. Each heap's
+/// last entry is cut off and refills it from the root, as libbz2's
+/// `heap[1] = heap[nHeap]; nHeap--; DOWNHEAP(1)`; `m` is the size after.
+///
+/// A sift-down walks down the smaller children to a leaf and the displaced
+/// entry climbs back from there: it ends where libbz2's top-down walk stops,
+/// below every entry of at most its weight. The walk takes the same number
+/// of steps in every heap, so the heaps advance side by side, which hides
+/// the latency of each one's chain of loads. `heap[m + 1]` is an entry no
+/// weight is below, so a missing right child never wins.
+#[inline(always)]
+fn pop<const L: usize>(heap: &mut [[u64; HEAP_LEN]; N_GROUPS], m: usize) -> [u64; L] {
+    let mut top = [0; L];
+    let mut last = [0; L];
+    let mut zz = [1usize; L];
+    for l in 0..L {
+        top[l] = heap[l][1];
+        last[l] = heap[l][m + 1];
+        heap[l][m + 1] = u64::MAX;
+    }
+    // Every node above the last level of the heap has two children.
+    for _ in 1..m.checked_ilog2().unwrap_or(0) {
+        for l in 0..L {
+            let h = &mut heap[l];
+            let y = zz[l] * 2;
+            let y = y + usize::from(h[y + 1] & HI < h[y] & HI);
+            h[zz[l]] = h[y];
+            zz[l] = y;
         }
-        while n_heap > 1 {
-            let n1 = heap[1];
-            heap[1] = heap[n_heap];
-            n_heap -= 1;
-            downheap(&mut heap, &weight, n_heap, 1);
-            let n2 = heap[1];
-            heap[1] = heap[n_heap];
-            n_heap -= 1;
-            downheap(&mut heap, &weight, n_heap, 1);
-            n_nodes += 1;
-            parent[n1] = n_nodes as i32;
-            parent[n2] = n_nodes as i32;
-            let (w1, w2) = (weight[n1], weight[n2]);
-            weight[n_nodes] = ((w1 & !0xff) + (w2 & !0xff)) | (1 + (w1 & 0xff).max(w2 & 0xff));
-            parent[n_nodes] = -1;
-            n_heap += 1;
-            heap[n_heap] = n_nodes;
-            upheap(&mut heap, &weight, n_heap);
+    }
+    for l in 0..L {
+        let h = &mut heap[l];
+        let a = zz[l] * 2;
+        let has = a <= m;
+        let a = if has { a } else { 0 };
+        let y = a + usize::from(h[a + 1] & HI < h[a] & HI);
+        let y = if has { y } else { zz[l] };
+        h[zz[l]] = h[y];
+        zz[l] = y;
+    }
+    for l in 0..L {
+        let h = &mut heap[l];
+        let mut z = zz[l];
+        while last[l] < h[z >> 1] & HI {
+            h[z] = h[z >> 1];
+            z >>= 1;
         }
+        h[z] = last[l];
+    }
+    top
+}
 
+/// One batch of `make_code_lengths_all`: the lengths of the tables `ts`,
+/// into `len`, from the leaf weights in `w.leaf`; returns which exceed
+/// `max_len`.
+#[inline(always)]
+fn build<const L: usize>(
+    w: &mut Lengths,
+    len: &mut [[u8; MAX_ALPHA]; N_GROUPS],
+    ts: [usize; L],
+    alpha: usize,
+    max_len: u8,
+) -> [bool; L] {
+    let mut n = 0;
+    for i in 1..=alpha {
+        n += 1;
+        for (h, &t) in w.heap.iter_mut().zip(&ts) {
+            upheap(h, n, u64::from(w.leaf[t][i]) << 16 | i as u64);
+        }
+    }
+    let mut n_nodes = alpha;
+    while n > 1 {
+        let e1 = pop::<L>(&mut w.heap, n - 1);
+        let e2 = pop::<L>(&mut w.heap, n - 2);
+        n_nodes += 1;
+        for l in 0..L {
+            w.parent[l][(e1[l] & 0xffff) as usize] = n_nodes as u16;
+            w.parent[l][(e2[l] & 0xffff) as usize] = n_nodes as u16;
+            let (w1, w2) = ((e1[l] >> 16) as u32, (e2[l] >> 16) as u32);
+            let sum = ((w1 & !0xff) + (w2 & !0xff)) | (1 + (w1 & 0xff).max(w2 & 0xff));
+            upheap(&mut w.heap[l], n - 1, u64::from(sum) << 16 | n_nodes as u64);
+        }
+        n -= 1;
+    }
+    let mut too_long = [false; L];
+    for l in 0..L {
         // A node's parent is made after it, so one pass down from the root
         // gives every depth (libbz2 walks from each leaf to the root).
         let mut depth = [0u8; MAX_ALPHA * 2];
         for k in (1..n_nodes).rev() {
-            depth[k] = depth[parent[k] as usize] + 1;
+            depth[k] = depth[usize::from(w.parent[l][k])] + 1;
         }
-        let mut too_long = false;
-        for (l, &d) in len[..alpha].iter_mut().zip(&depth[1..=alpha]) {
-            *l = d;
-            too_long |= d > max_len;
+        for (out, &d) in len[ts[l]][..alpha].iter_mut().zip(&depth[1..=alpha]) {
+            *out = d;
+            too_long[l] |= d > max_len;
         }
-        if !too_long {
-            break;
+    }
+    too_long
+}
+
+/// libbz2's `BZ2_hbMakeCodeLengths` for each of the tables `ts`: code
+/// lengths `len[t][..alpha]` for the frequencies `freq[t]`, limited to
+/// `max_len` bits by flattening the weights and rebuilding until they fit.
+///
+/// The heap and its tie-breaking are libbz2's, since which of several equal
+/// weights merges first decides the lengths. The tables are built a few at a
+/// time, in lock step (they all merge `alpha - 1` times).
+pub(super) fn make_code_lengths_all(
+    w: &mut Lengths,
+    len: &mut [[u8; MAX_ALPHA]; N_GROUPS],
+    freq: &[[i32; MAX_ALPHA]; N_GROUPS],
+    ts: &[usize],
+    alpha: usize,
+    max_len: u8,
+) {
+    for &t in ts {
+        for (l, &f) in w.leaf[t][1..=alpha].iter_mut().zip(&freq[t]) {
+            *l = (f.max(1) as u32) << 8;
         }
-        for w in &mut weight[1..=alpha] {
-            *w = (1 + (*w >> 8) / 2) << 8;
+    }
+    let mut todo = [0usize; N_GROUPS];
+    let mut n_todo = ts.len();
+    todo[..n_todo].copy_from_slice(ts);
+    while n_todo > 0 {
+        let mut too_long = [false; N_GROUPS];
+        match todo[..n_todo] {
+            [a] => too_long[..1].copy_from_slice(&build(w, len, [a], alpha, max_len)),
+            [a, b] => too_long[..2].copy_from_slice(&build(w, len, [a, b], alpha, max_len)),
+            [a, b, c] => too_long[..3].copy_from_slice(&build(w, len, [a, b, c], alpha, max_len)),
+            [a, b, c, d] => {
+                too_long[..4].copy_from_slice(&build(w, len, [a, b, c, d], alpha, max_len));
+            }
+            [a, b, c, d, e] => {
+                too_long[..5].copy_from_slice(&build(w, len, [a, b, c, d, e], alpha, max_len));
+            }
+            [a, b, c, d, e, f] => {
+                too_long.copy_from_slice(&build(w, len, [a, b, c, d, e, f], alpha, max_len));
+            }
+            _ => unreachable!("one to N_GROUPS tables"),
         }
+        let mut n_next = 0;
+        for i in 0..n_todo {
+            if too_long[i] {
+                let t = todo[i];
+                for l in &mut w.leaf[t][1..=alpha] {
+                    *l = (1 + (*l >> 8) / 2) << 8;
+                }
+                todo[n_next] = t;
+                n_next += 1;
+            }
+        }
+        n_todo = n_next;
     }
 }
 
@@ -308,6 +401,8 @@ pub(crate) fn encode(
                 }
             }
         }
+        let mut ts = [0usize; N_GROUPS];
+        let mut n_ts = 0;
         for t in 0..n_groups {
             if recount {
                 let [ra, rb] = &mut h.rfreq;
@@ -316,9 +411,18 @@ pub(crate) fn encode(
                 }
             }
             if dirty[t] {
-                make_code_lengths(&mut h.len[t], &h.rfreq[0][t], alpha, MAX_CODE_LEN);
+                ts[n_ts] = t;
+                n_ts += 1;
             }
         }
+        make_code_lengths_all(
+            &mut h.lengths,
+            &mut h.len,
+            &h.rfreq[0],
+            &ts[..n_ts],
+            alpha,
+            MAX_CODE_LEN,
+        );
         h.prev_sel.copy_from_slice(&h.selector);
     }
 

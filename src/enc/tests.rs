@@ -689,8 +689,7 @@ fn code_lengths_are_limited_complete_and_optimal_when_unlimited(tc: TestCase) {
     // to what the alphabet needs and up to libbz2's 20.
     let needed = usize::BITS - (alpha - 1).leading_zeros();
     let max_len = tc.draw(gs::integers::<u32>().min_value(needed).max_value(20)) as u8;
-    let mut len = [0u8; mtf::MAX_ALPHA];
-    huff::make_code_lengths(&mut len, &freq, alpha, max_len);
+    let len = lengths_of(&[&freq], alpha, max_len)[0];
     let len = &len[..alpha];
     assert!(
         len.iter().all(|&l| (1..=max_len).contains(&l)),
@@ -711,5 +710,154 @@ fn code_lengths_are_limited_complete_and_optimal_when_unlimited(tc: TestCase) {
     }
     if w.iter().sum::<u64>() < a {
         assert_eq!(cost, best, "not optimal");
+    }
+}
+
+/// The straight port of libbz2's `BZ2_hbMakeCodeLengths`, top-down heap and all: code lengths `len[..alpha]` for the
+/// frequencies `freq`, limited to `max_len` bits by flattening the weights
+/// and rebuilding until they fit.
+#[allow(
+    clippy::needless_range_loop,
+    reason = "libbz2's loops, kept recognisable"
+)]
+fn reference_code_lengths(len: &mut [u8], freq: &[i32], alpha: usize, max_len: u8) {
+    let mut heap = [0usize; mtf::MAX_ALPHA + 2];
+    let mut weight = [0i32; mtf::MAX_ALPHA * 2];
+    let mut parent = [0i32; mtf::MAX_ALPHA * 2];
+
+    for i in 0..alpha {
+        weight[i + 1] = freq[i].max(1) << 8;
+    }
+
+    loop {
+        let mut n_nodes = alpha;
+        let mut n_heap = 0;
+        heap[0] = 0;
+        weight[0] = 0;
+        parent[0] = -2;
+
+        let upheap = |heap: &mut [usize], weight: &[i32], z: usize| {
+            let mut zz = z;
+            let tmp = heap[zz];
+            while weight[tmp] < weight[heap[zz >> 1]] {
+                heap[zz] = heap[zz >> 1];
+                zz >>= 1;
+            }
+            heap[zz] = tmp;
+        };
+        let downheap = |heap: &mut [usize], weight: &[i32], n_heap: usize, z: usize| {
+            let mut zz = z;
+            let tmp = heap[zz];
+            loop {
+                let mut yy = zz << 1;
+                if yy > n_heap {
+                    break;
+                }
+                if yy < n_heap && weight[heap[yy + 1]] < weight[heap[yy]] {
+                    yy += 1;
+                }
+                if weight[tmp] < weight[heap[yy]] {
+                    break;
+                }
+                heap[zz] = heap[yy];
+                zz = yy;
+            }
+            heap[zz] = tmp;
+        };
+
+        for i in 1..=alpha {
+            parent[i] = -1;
+            n_heap += 1;
+            heap[n_heap] = i;
+            upheap(&mut heap, &weight, n_heap);
+        }
+        while n_heap > 1 {
+            let n1 = heap[1];
+            heap[1] = heap[n_heap];
+            n_heap -= 1;
+            downheap(&mut heap, &weight, n_heap, 1);
+            let n2 = heap[1];
+            heap[1] = heap[n_heap];
+            n_heap -= 1;
+            downheap(&mut heap, &weight, n_heap, 1);
+            n_nodes += 1;
+            parent[n1] = n_nodes as i32;
+            parent[n2] = n_nodes as i32;
+            let (w1, w2) = (weight[n1], weight[n2]);
+            weight[n_nodes] = ((w1 & !0xff) + (w2 & !0xff)) | (1 + (w1 & 0xff).max(w2 & 0xff));
+            parent[n_nodes] = -1;
+            n_heap += 1;
+            heap[n_heap] = n_nodes;
+            upheap(&mut heap, &weight, n_heap);
+        }
+
+        // A node's parent is made after it, so one pass down from the root
+        // gives every depth (libbz2 walks from each leaf to the root).
+        let mut depth = [0u8; mtf::MAX_ALPHA * 2];
+        for k in (1..n_nodes).rev() {
+            depth[k] = depth[parent[k] as usize] + 1;
+        }
+        let mut too_long = false;
+        for (l, &d) in len[..alpha].iter_mut().zip(&depth[1..=alpha]) {
+            *l = d;
+            too_long |= d > max_len;
+        }
+        if !too_long {
+            break;
+        }
+        for w in &mut weight[1..=alpha] {
+            *w = (1 + (*w >> 8) / 2) << 8;
+        }
+    }
+}
+
+/// `make_code_lengths_all` over `freqs` (at most six tables), one array per
+/// table.
+fn lengths_of(freqs: &[&[i32]], alpha: usize, max_len: u8) -> Vec<[u8; mtf::MAX_ALPHA]> {
+    let mut w = huff::Lengths::new_boxed();
+    let mut len = [[0u8; mtf::MAX_ALPHA]; 6];
+    let mut freq = [[0i32; mtf::MAX_ALPHA]; 6];
+    for (dst, src) in freq.iter_mut().zip(freqs) {
+        dst[..alpha].copy_from_slice(src);
+    }
+    let ts: Vec<usize> = (0..freqs.len()).collect();
+    huff::make_code_lengths_all(&mut w, &mut len, &freq, &ts, alpha, max_len);
+    len[..freqs.len()].to_vec()
+}
+
+#[hegel::test(test_cases = 3000)]
+fn code_lengths_match_the_straight_port_of_libbz2(tc: TestCase) {
+    let alpha = tc.draw(
+        gs::integers::<usize>()
+            .min_value(3)
+            .max_value(mtf::MAX_ALPHA),
+    );
+    // Small counts, so that equal weights (whose order the heap decides) are
+    // everywhere; some from doubling chains, which need the length limit.
+    let n_tables = tc.draw(gs::integers::<usize>().min_value(1).max_value(6));
+    let mut tables: Vec<Vec<i32>> = Vec::new();
+    for _ in 0..n_tables {
+        let spread = tc.draw(gs::sampled_from(vec![2u32, 4, 20, 1000, 100_000]));
+        let raw = tc.draw(
+            gs::vecs(gs::integers::<u32>())
+                .min_size(alpha)
+                .max_size(alpha),
+        );
+        tables.push(if tc.draw(gs::booleans()) {
+            raw.iter().map(|&x| (x % spread) as i32).collect()
+        } else {
+            let chain: Vec<u64> = raw.iter().map(|&x| 1 << (x % 20)).collect();
+            let scale = chain.iter().sum::<u64>().div_ceil(1_000_000);
+            chain.iter().map(|&c| (c / scale) as i32).collect()
+        });
+    }
+    let needed = usize::BITS - (alpha - 1).leading_zeros();
+    let max_len = tc.draw(gs::integers::<u32>().min_value(needed).max_value(20)) as u8;
+    let refs: Vec<&[i32]> = tables.iter().map(Vec::as_slice).collect();
+    let got = lengths_of(&refs, alpha, max_len);
+    for (g, f) in got.iter().zip(&tables) {
+        let mut want = [0u8; mtf::MAX_ALPHA];
+        reference_code_lengths(&mut want, f, alpha, max_len);
+        assert_eq!(g[..alpha], want[..alpha]);
     }
 }
