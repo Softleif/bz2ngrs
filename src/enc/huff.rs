@@ -243,17 +243,21 @@ pub(super) fn make_code_lengths_all(
     }
 }
 
-/// libbz2's `BZ2_hbAssignCodes`: canonical codes from the lengths.
-fn assign_codes(code: &mut [u32], length: &[u8], min_len: u8, max_len: u8) {
-    let mut vec = 0;
-    for n in min_len..=max_len {
-        for (c, &l) in code.iter_mut().zip(length) {
-            if l == n {
-                *c = vec;
-                vec += 1;
-            }
-        }
-        vec <<= 1;
+/// The canonical codes of libbz2's `BZ2_hbAssignCodes` (shortest first, then
+/// in symbol order), as `code << 5 | length` per symbol, from the count of
+/// each length instead of a pass over the symbols per length.
+pub(super) fn assign_codes(ce: &mut [u32], length: &[u8]) {
+    let mut count = [0u32; MAX_CODE_LEN as usize + 2];
+    for &l in length {
+        count[usize::from(l)] += 1;
+    }
+    let mut next = [0u32; MAX_CODE_LEN as usize + 2];
+    for n in 1..=MAX_CODE_LEN as usize {
+        next[n + 1] = (next[n] + count[n]) << 1;
+    }
+    for (e, &l) in ce.iter_mut().zip(length) {
+        *e = next[usize::from(l)] << 5 | u32::from(l);
+        next[usize::from(l)] += 1;
     }
 }
 
@@ -304,6 +308,39 @@ fn seed_tables(
         gs = (ge + 1) as usize;
         rem_f -= a_freq;
     }
+}
+
+/// A table's code lengths as bzip2 sends them: the first in 5 bits, then for
+/// each symbol the steps from the previous length (`10` up, `11` down) and a
+/// `0`, the whole change in one write (a change of 16 takes two).
+pub(super) fn put_lengths(bw: &mut BitWriter<'_>, lens: &[u8]) {
+    let mut curr = lens.first().copied().unwrap_or(0);
+    bw.put(5, u64::from(curr));
+    for &target in lens {
+        let mut d = i32::from(target) - i32::from(curr);
+        curr = target;
+        while d.abs() > 15 {
+            let step = if d > 0 { 15 } else { -15 };
+            let (n, v) = delta_bits(step);
+            bw.put(n - 1, v >> 1);
+            d -= step;
+        }
+        let (n, v) = delta_bits(d);
+        bw.put(n, v);
+    }
+}
+
+/// The bits of a change `d` (at most 15 either way) of the code length: its
+/// count and value.
+#[inline(always)]
+fn delta_bits(d: i32) -> (u32, u64) {
+    let k = d.unsigned_abs();
+    let steps = if d > 0 {
+        0xAAAA_AAAA_AAAA_AAAAu64 >> (64 - 2 * k)
+    } else {
+        (1u64 << (2 * k)) - 1
+    };
+    (2 * k + 1, steps << 1)
 }
 
 /// Selector MTF: each selector's position in a move-to-front list of the
@@ -430,15 +467,8 @@ pub(crate) fn encode(
         h.prev_sel.copy_from_slice(&h.selector);
     }
 
-    let mut code = [0u32; MAX_ALPHA];
     for t in 0..n_groups {
-        let lens = &h.len[t][..alpha];
-        let min_len = lens.iter().copied().min().unwrap_or(0);
-        let max_len = lens.iter().copied().max().unwrap_or(0);
-        assign_codes(&mut code[..alpha], lens, min_len, max_len);
-        for i in 0..alpha {
-            h.ce[t][i] = (code[i] << 5) | u32::from(lens[i]);
-        }
+        assign_codes(&mut h.ce[t][..alpha], &h.len[t][..alpha]);
     }
 
     bw.put(3, n_groups as u64);
@@ -450,19 +480,7 @@ pub(crate) fn encode(
         bw.put(j + 1, u64::from(((1u32 << j) - 1) << 1));
     }
     for t in 0..n_groups {
-        let mut curr = h.len[t][0];
-        bw.put(5, u64::from(curr));
-        for &target in &h.len[t][..alpha] {
-            while curr < target {
-                bw.put(2, 2);
-                curr += 1;
-            }
-            while curr > target {
-                bw.put(2, 3);
-                curr -= 1;
-            }
-            bw.put(1, 0);
-        }
+        put_lengths(bw, &h.len[t][..alpha]);
     }
 
     // The coded MTF values: three per flush, which the at most 7 bits a

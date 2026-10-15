@@ -7,7 +7,7 @@
 use hegel::TestCase;
 use hegel::generators as gs;
 
-use super::{huff, mtf, rle, rotate, sais32, sort};
+use super::{BitWriter, huff, mtf, rle, rotate, sais32, sort};
 
 /// SplitMix64, for the large inputs.
 struct Rng(u64);
@@ -864,4 +864,69 @@ fn code_lengths_match_the_straight_port_of_libbz2(tc: TestCase) {
         reference_code_lengths(&mut want, f, alpha, max_len);
         assert_eq!(g[..alpha], want[..alpha]);
     }
+}
+
+/// A table of code lengths, as the encoder makes them: 1 to 17 bits.
+fn code_length_table(tc: &TestCase) -> Vec<u8> {
+    tc.draw(
+        gs::vecs(gs::integers::<u8>().min_value(1).max_value(17))
+            .min_size(3)
+            .max_size(mtf::MAX_ALPHA),
+    )
+}
+
+/// libbz2's `BZ2_hbAssignCodes`: a pass over the symbols for each length.
+#[hegel::test(test_cases = 3000)]
+fn canonical_codes_are_libbz2s(tc: TestCase) {
+    let len = code_length_table(&tc);
+    let (min, max) = (len.iter().min().unwrap(), len.iter().max().unwrap());
+    let mut want = vec![0u32; len.len()];
+    let mut vec = 0;
+    for n in *min..=*max {
+        for (c, &l) in want.iter_mut().zip(&len) {
+            if l == n {
+                *c = vec;
+                vec += 1;
+            }
+        }
+        vec <<= 1;
+    }
+    let mut got = vec![0u32; len.len()];
+    huff::assign_codes(&mut got, &len);
+    for ((g, w), l) in got.iter().zip(&want).zip(&len) {
+        assert_eq!(*g, w << 5 | u32::from(*l));
+    }
+}
+
+/// The length tables as libbz2 sends them, a step at a time.
+#[hegel::test(test_cases = 3000)]
+fn length_tables_are_sent_as_libbz2_sends_them(tc: TestCase) {
+    let len = code_length_table(&tc);
+    let mut want = Vec::new();
+    {
+        let mut bw = BitWriter::new(&mut want);
+        bw.reserve(2000);
+        let mut curr = len[0];
+        bw.put(5, u64::from(curr));
+        for &target in &len {
+            while curr < target {
+                bw.put(2, 2);
+                curr += 1;
+            }
+            while curr > target {
+                bw.put(2, 3);
+                curr -= 1;
+            }
+            bw.put(1, 0);
+        }
+        bw.finish();
+    }
+    let mut got = Vec::new();
+    {
+        let mut bw = BitWriter::new(&mut got);
+        bw.reserve(2000);
+        huff::put_lengths(&mut bw, &len);
+        bw.finish();
+    }
+    assert_eq!(got, want);
 }
