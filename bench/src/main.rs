@@ -337,6 +337,9 @@ fn verify_encode(streams: &[Stream], level: u32) -> ([Result<(), String>; 3], us
     let mut res = [const { Ok(()) }; 3];
     let mut identical = 0;
     let mut out = Vec::new();
+    // Ours, to compare with the `bzip2` crate's stream at the same level
+    // (a CRAM set's stored block may have been written at another one).
+    let mut ours = vec![Vec::new(); streams.len()];
     for (i, enc) in ENCODERS.iter().enumerate() {
         for (k, s) in streams.iter().enumerate() {
             let r = enc(&s.raw, &mut out, level).and_then(|()| {
@@ -351,7 +354,9 @@ fn verify_encode(streams: &[Stream], level: u32) -> ([Result<(), String>; 3], us
                 res[i] = Err(format!("stream {k}: {e}"));
                 break;
             }
-            if i == 0 && out == s.comp {
+            if i == 0 {
+                ours[k] = out.clone();
+            } else if i == 1 && ours[k] == out {
                 identical += 1;
             }
         }
