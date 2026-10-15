@@ -77,7 +77,34 @@ fn matches_libbz2_code_length_limit(tc: hegel::TestCase) {
     enc_props::matches_libbz2_code_length_limit(&tc, &all_encoders());
 }
 
-#[hegel::test]
+#[hegel::test(
+    test_cases = common::pinned::cases(150),
+    suppress_health_check = [hegel::HealthCheck::TooSlow]
+)]
+fn matches_libbz2_exact_periodic(tc: hegel::TestCase) {
+    enc_props::matches_libbz2_exact_periodic(&tc, &all_encoders());
+}
+
+#[hegel::test(
+    test_cases = common::pinned::cases(300),
+    suppress_health_check = [hegel::HealthCheck::TooSlow]
+)]
+fn matches_libbz2_table_count_thresholds(tc: hegel::TestCase) {
+    enc_props::matches_libbz2_table_count_threshold(&tc, &all_encoders());
+}
+
+#[hegel::test(
+    test_cases = common::pinned::cases(300),
+    suppress_health_check = [hegel::HealthCheck::TooSlow]
+)]
+fn matches_libbz2_single_distinct_byte(tc: hegel::TestCase) {
+    enc_props::matches_libbz2_single_byte(&tc, &all_encoders());
+}
+
+#[hegel::test(
+    test_cases = common::pinned::cases(60),
+    suppress_health_check = [hegel::HealthCheck::TooSlow]
+)]
 fn reuse_independent_of_earlier_calls(tc: hegel::TestCase) {
     enc_props::reuse_independent(&tc, &all_encoders());
 }

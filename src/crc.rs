@@ -415,6 +415,21 @@ mod tests {
         gs::binary().max_size(3000)
     }
 
+    /// The encoder's RLE1 runs: `n` copies of a byte, from a short run to a
+    /// run of 100 000, against the bitwise CRC of the bytes themselves.
+    #[hegel::test]
+    fn repeat_matches_bitwise(tc: TestCase) {
+        let init = tc.draw(gs::integers::<u32>());
+        let b = tc.draw(gs::integers::<u8>());
+        let bound = if tc.draw(gs::booleans()) {
+            300
+        } else {
+            100_000
+        };
+        let n = tc.draw(gs::integers::<usize>()) % bound;
+        assert_eq!(repeat(init, b, n), bitwise(init, &vec![b; n]));
+    }
+
     #[hegel::test]
     fn matches_reference(tc: TestCase) {
         let data = tc.draw(any_bytes());
