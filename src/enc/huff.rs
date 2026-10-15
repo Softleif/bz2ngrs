@@ -392,12 +392,11 @@ pub(crate) fn encode(
         // A table whose counts no group moved into or out of keeps its
         // lengths, so only the others are rebuilt.
         let mut dirty = [recount; N_GROUPS];
-        for v in 0..alpha {
-            let mut w = 0u64;
-            for t in 0..n_groups {
-                w |= u64::from(h.len[t][v]) << (10 * t);
+        h.pk[..alpha].fill(0);
+        for (t, row) in h.len[..n_groups].iter().enumerate() {
+            for (p, &l) in h.pk[..alpha].iter_mut().zip(row) {
+                *p |= u64::from(l) << (10 * t);
             }
-            h.pk[v] = w;
         }
         for (grp, g) in mtfv.chunks(G_SIZE).enumerate() {
             let (mut s0, mut s1) = (0u64, 0u64);
