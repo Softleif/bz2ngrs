@@ -13,7 +13,9 @@
 //! - Positions 8 to 255 live in an array, searched and shifted 16 bytes at a
 //!   time.
 
-use fearless_simd::{Select, Simd, SimdBase, SimdFrom, u8x16, u8x64, u16x8};
+use fearless_simd::{Select, Simd, SimdBase, SimdFrom, u8x16, u16x8};
+
+use super::rle::load64;
 
 /// The highest MTF symbol plus one (RUNA, RUNB, ranks 1 to 255, EOB).
 pub(crate) const MAX_ALPHA: usize = 258;
@@ -82,8 +84,7 @@ impl List {
 /// `l[i - 1..i + 64]`.
 #[inline(always)]
 fn change_mask64<S: Simd>(simd: S, l: &[u8], i: usize) -> u64 {
-    let at = |o: usize| u8x64::simd_from(simd, *l[o..].first_chunk::<64>().unwrap_or(&[0; 64]));
-    !simd.to_bitmask_mask8x64(at(i).simd_eq(at(i - 1)))
+    !simd.to_bitmask_mask8x64(load64(simd, l, i).simd_eq(load64(simd, l, i - 1)))
 }
 
 /// Writes the digits of a zero run of length `z` at `mtfv[wr..]` and counts
