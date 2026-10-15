@@ -20,6 +20,14 @@ mod crc;
     reason = "values bounded by the format"
 )]
 mod decode;
+// The encoder's casts narrow sizes and positions bounded by the block size
+// (< 2^20) and symbols bounded by the alphabet (< 258).
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_possible_wrap,
+    reason = "values bounded by the format"
+)]
+mod enc;
 mod error;
 #[allow(
     clippy::cast_possible_truncation,
@@ -154,6 +162,128 @@ impl Decoder {
         let n = self.decompress(src, &mut out)?;
         out.truncate(n);
         Ok(out)
+    }
+}
+
+/// A bzip2 compression level, 1 to 9: the block size in units of 100,000
+/// bytes. A larger block usually compresses better and needs more memory;
+/// the speed per byte barely depends on it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct Compression(u8);
+
+impl Compression {
+    /// Level 9 (900,000-byte blocks), what the `bzip2` program and htslib
+    /// use by default.
+    pub const BEST: Compression = Compression(9);
+    /// Level 1 (100,000-byte blocks).
+    pub const FAST: Compression = Compression(1);
+
+    /// The level `level`, or `None` outside 1 to 9.
+    #[allow(clippy::cast_possible_truncation, reason = "the level is below 10")]
+    pub const fn new(level: u32) -> Option<Compression> {
+        match level {
+            1..=9 => Some(Compression(level as u8)),
+            _ => None,
+        }
+    }
+
+    /// The level, 1 to 9.
+    pub const fn level(self) -> u32 {
+        self.0 as u32
+    }
+}
+
+impl Default for Compression {
+    fn default() -> Self {
+        Compression::BEST
+    }
+}
+
+/// Reusable encoder state. Keep one per writer or thread and reuse it for
+/// every stream: it owns the working memory a compression needs, about 10
+/// bytes per byte of the largest block it has met (9 MB at level 9; a short
+/// input needs a block only as large as itself).
+///
+/// Nothing is allocated until the first call, and the memory then lives
+/// until the `Encoder` is dropped. The SIMD level is chosen once, in
+/// [`Encoder::new`]. A result never depends on earlier calls.
+///
+/// The output is byte-identical to what libbz2 1.0.8 writes for the same
+/// input and level in one call (`BZ2_bzBuffToBuffCompress`, or one
+/// `BZ_FINISH`), with one exception. A block that is exactly periodic after
+/// libbz2's first run-length stage (a string repeated a whole number of
+/// times, such as all zeros) has several valid BWT origins, and libbz2's
+/// choice depends on which of its sorters ran. This always writes the last
+/// of the tied rows, as bz2-ng does. Such streams differ in those 24 bits
+/// only and decode identically.
+///
+/// # Examples
+///
+/// ```
+/// use bz2ngrs::{Compression, Decoder, Encoder};
+///
+/// let data = b"hello hello hello hello";
+/// let mut encoder = Encoder::new(Compression::BEST);
+/// let stream = encoder.compress_to_vec(data);
+/// assert_eq!(Decoder::new().decompress_to_vec(&stream, data.len()).unwrap(), data);
+///
+/// // Later streams reuse the same memory, and can go to the end of a buffer.
+/// let mut block = b"header".to_vec();
+/// encoder.compress(data, &mut block);
+/// assert_eq!(&block[6..], stream);
+/// ```
+pub struct Encoder {
+    level: fearless_simd::Level,
+    compression: Compression,
+    scratch: Option<Box<enc::Scratch>>,
+}
+
+impl Encoder {
+    /// An encoder at `compression` that has allocated nothing yet.
+    pub fn new(compression: Compression) -> Self {
+        Self::__with_level(compression, fearless_simd::Level::new())
+    }
+
+    /// [`Encoder::new`] with the SIMD level fixed, so tests and fuzz targets
+    /// can run every kernel at every level the CPU supports,
+    /// `Level::fallback()` included. Not part of the stable API.
+    #[doc(hidden)]
+    pub fn __with_level(compression: Compression, level: fearless_simd::Level) -> Self {
+        Encoder {
+            level,
+            compression,
+            scratch: None,
+        }
+    }
+
+    /// The level this encoder compresses at.
+    pub fn compression(&self) -> Compression {
+        self.compression
+    }
+
+    /// Compresses all of `src` as one bzip2 stream and appends it to `out`.
+    /// Never fails: any input, empty included, has a stream.
+    pub fn compress(&mut self, src: &[u8], out: &mut Vec<u8>) {
+        let sc = self.scratch.get_or_insert_with(enc::Scratch::new_boxed);
+        let level = self.compression.0;
+        fearless_simd::dispatch!(self.level, simd => enc::compress_stream(simd, src, level, out, sc));
+    }
+
+    /// Compresses all of `src` as one bzip2 stream into a new `Vec`.
+    pub fn compress_to_vec(&mut self, src: &[u8]) -> Vec<u8> {
+        let mut out = Vec::new();
+        self.compress(src, &mut out);
+        out
+    }
+}
+
+impl fmt::Debug for Encoder {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Encoder")
+            .field("level", &self.level)
+            .field("compression", &self.compression)
+            .field("allocated", &self.scratch.is_some())
+            .finish()
     }
 }
 

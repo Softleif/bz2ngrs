@@ -1,5 +1,6 @@
-//! `Decoder` allocates on first use only, and moves between threads. Its own
-//! test binary, because it installs a counting global allocator.
+//! `Decoder` and `Encoder` allocate on first use only, and move between
+//! threads. Their own test binary, because it installs a counting global
+//! allocator.
 
 #![allow(unsafe_code, reason = "a counting GlobalAlloc has no safe form")]
 
@@ -7,7 +8,7 @@ use std::alloc::{GlobalAlloc, Layout, System};
 use std::io::Write;
 use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
 
-use bz2ngrs::Decoder;
+use bz2ngrs::{Compression, Decoder, Encoder};
 
 struct Counting;
 
@@ -51,6 +52,44 @@ fn assert_send<T: Send>() {}
 // One test function: the counter is global, so tests running in parallel
 // threads would count each other's allocations.
 #[test]
+fn allocates_on_first_use_only() {
+    decoder_allocates_on_first_decode_only();
+    encoder_allocates_on_first_compress_only();
+}
+
+fn encoder_allocates_on_first_compress_only() {
+    assert_send::<Encoder>();
+
+    // Not periodic, so that the whole sorter (its recursion included) runs.
+    let mut x = 1u32;
+    let data: Vec<u8> = (0..200_000)
+        .map(|_| {
+            x = x.wrapping_mul(1_103_515_245).wrapping_add(12_345);
+            b"ACGT"[(x >> 29) as usize & 3]
+        })
+        .collect();
+    let (n, mut encoder) = allocations_during(|| Encoder::new(Compression::BEST));
+    assert_eq!(n, 0, "Encoder::new allocated");
+
+    let mut out = Vec::with_capacity(1 << 20);
+    let (n, ()) = allocations_during(|| encoder.compress(&data, &mut out));
+    assert!(
+        n > 0,
+        "the first compress allocated nothing, so this test counts nothing"
+    );
+    let first = out.clone();
+    // Once its memory has grown to an input, the encoder allocates nothing
+    // for it or a shorter one; the caller's `out` has room.
+    for input in [&data[..], &data[..1000], &[][..]] {
+        out.clear();
+        let (n, ()) = allocations_during(|| encoder.compress(input, &mut out));
+        assert_eq!(n, 0, "a later compress of {} bytes allocated", input.len());
+    }
+    out.clear();
+    encoder.compress(&data, &mut out);
+    assert!(out == first, "a reused encoder wrote another stream");
+}
+
 fn decoder_allocates_on_first_decode_only() {
     assert_send::<Decoder>();
 
