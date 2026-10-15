@@ -102,7 +102,8 @@ fn put_zero_run<S: Simd>(
     if k <= 8 {
         const BIT: [u16; 8] = [1, 2, 4, 8, 16, 32, 64, 128];
         let d = u16x8::splat(simd, x as u16) & u16x8::simd_from(simd, BIT);
-        d.min(u16x8::splat(simd, 1)).store_slice(&mut mtfv[wr..wr + 8]);
+        d.min(u16x8::splat(simd, 1))
+            .store_slice(&mut mtfv[wr..wr + 8]);
     } else {
         for i in 0..k {
             mtfv[wr + i as usize] = ((x >> i) & 1) as u16;

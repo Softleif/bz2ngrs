@@ -458,7 +458,11 @@ fn lms_postproc2(sa: &mut [i32], n: usize, m: usize) -> usize {
 
 /// Sorts the LMS substrings by induction without naming them, for levels
 /// whose free space has no room for the naming counters.
-fn lms_sort1<S: Sym, const REG: bool, const P: bool>(t: &[S], sa: &mut [i32], bk: &mut Buckets<'_>) {
+fn lms_sort1<S: Sym, const REG: bool, const P: bool>(
+    t: &[S],
+    sa: &mut [i32],
+    bk: &mut Buckets<'_>,
+) {
     let n = t.len();
     bk.set(t, false);
     let b = &mut *bk.b;
@@ -575,7 +579,11 @@ fn lms_postproc1<S: Sym>(t: &[S], sa: &mut [i32], m: usize) -> usize {
 
 /// Final induction of a reduced problem: its suffix array from the sorted
 /// LMS suffixes seeded at the ends of their buckets.
-fn induce_sa<S: Sym, const REG: bool, const P: bool>(t: &[S], sa: &mut [i32], bk: &mut Buckets<'_>) {
+fn induce_sa<S: Sym, const REG: bool, const P: bool>(
+    t: &[S],
+    sa: &mut [i32],
+    bk: &mut Buckets<'_>,
+) {
     let n = t.len();
     bk.set(t, false);
     let b = &mut *bk.b;
@@ -717,7 +725,12 @@ struct Reduced {
 /// `n + fs` ints, and the bucket arrays come from its last ones. A level
 /// recounts its buckets after recursing rather than reserving them, so each
 /// level's free space is at least its parent's.
-fn sais_reduce<S: Sym, const REG: bool, const P: bool>(t: &[S], sa: &mut [i32], fs: usize, k: usize) -> Reduced {
+fn sais_reduce<S: Sym, const REG: bool, const P: bool>(
+    t: &[S],
+    sa: &mut [i32],
+    fs: usize,
+    k: usize,
+) -> Reduced {
     let n = t.len();
     let mut ext = Vec::new();
     let (one, mut recount) = if 2 * k <= fs {
