@@ -253,13 +253,16 @@ fn least_rotation_matches_booth(tc: TestCase) {
         }
     };
     tc.assume(!t.is_empty());
-    let mut cand = vec![0; t.len()];
-    let (r, periodic) = rotate::least_rotation(&doubled(&t), t.len(), &mut cand);
-    assert!(
-        rotation(&t, r) == rotation(&t, booth(&t)),
-        "not the least rotation"
-    );
-    assert_eq!(periodic, root_len(&t) < t.len(), "periodicity");
+    let tt = doubled(&t);
+    for level in crate::tests::levels() {
+        let mut cand = vec![0; t.len()];
+        let (r, periodic) = fearless_simd::dispatch!(level, simd => rotate::least_rotation(simd, &tt, t.len(), &mut cand));
+        assert!(
+            rotation(&t, r) == rotation(&t, booth(&t)),
+            "not the least rotation at {level:?}"
+        );
+        assert_eq!(periodic, root_len(&t) < t.len(), "periodicity at {level:?}");
+    }
 }
 
 #[hegel::test(test_cases = 3000)]
@@ -270,7 +273,13 @@ fn sort_block_gives_bwt_and_last_tied_row(tc: TestCase) {
     let mut tt = doubled(&t);
     let mut freq = [0; 256];
     let mut work = Vec::new();
-    let (orig, r) = rotate::sort_block(&mut tt, n, &mut freq, &mut work);
+    let (orig, r) = rotate::sort_block(
+        fearless_simd::Fallback::new(),
+        &mut tt,
+        n,
+        &mut freq,
+        &mut work,
+    );
     let rows = naive_rows(&t);
     let want: Vec<u8> = rows.iter().map(|&s| t[(s + n - 1) % n]).collect();
     assert_eq!(tt[r..r + n], want[..], "BWT");
@@ -340,12 +349,18 @@ fn mtf_matches_naive(tc: TestCase) {
     for &b in &l {
         in_use[usize::from(b)] = true;
     }
-    let mut mtfv = vec![0; l.len() + 1];
-    let mut freq = [0; mtf::MAX_ALPHA];
-    let n = mtf::mtf(&l, &in_use, &mut mtfv, &mut freq);
     let (want, want_freq) = naive_mtf(&l);
-    assert_eq!(mtfv[..n], want[..], "values");
-    assert_eq!(freq[..want_freq.len()], want_freq[..], "counts");
+    for level in crate::tests::levels() {
+        let mut mtfv = vec![0; l.len() + 1];
+        let mut freq = [0; mtf::MAX_ALPHA];
+        let n = fearless_simd::dispatch!(level, simd => mtf::mtf(simd, &l, &in_use, &mut mtfv, &mut freq));
+        assert_eq!(mtfv[..n], want[..], "values at {level:?}");
+        assert_eq!(
+            freq[..want_freq.len()],
+            want_freq[..],
+            "counts at {level:?}"
+        );
+    }
 }
 
 /// CRC-32/BZIP2 one bit at a time, apart from the crate's CRC.
@@ -407,8 +422,14 @@ fn naive_rle(data: &[u8], nblock_max: usize) -> Vec<Block> {
     blocks
 }
 
-/// The same blocks through `rle::fill`, fed in the given chunks.
-fn bulk_rle(data: &[u8], chunks: &[usize], nblock_max: usize) -> Vec<Block> {
+/// The same blocks through `rle::fill` at SIMD level `level`, fed in the
+/// given chunks.
+fn bulk_rle(
+    level: fearless_simd::Level,
+    data: &[u8],
+    chunks: &[usize],
+    nblock_max: usize,
+) -> Vec<Block> {
     let mut blk = vec![0xA5; nblock_max + rle::SLACK];
     let mut st = rle::Rle::new();
     let mut blocks = Vec::new();
@@ -424,7 +445,7 @@ fn bulk_rle(data: &[u8], chunks: &[usize], nblock_max: usize) -> Vec<Block> {
                 st.nblock = 0;
                 st.crc = !0;
             }
-            let used = rle::fill(&mut st, chunk, &mut blk, nblock_max);
+            let used = fearless_simd::dispatch!(level, simd => rle::fill(simd, &mut st, chunk, &mut blk, nblock_max));
             assert!(used > 0, "no progress");
             chunk = &chunk[used..];
         }
@@ -460,10 +481,14 @@ fn rle_fill_matches_byte_loop(tc: TestCase) {
     let data = tc.draw(rle_text());
     let nblock_max = 1 + tc.draw(gs::integers::<usize>()) % 3000;
     let chunks = tc.draw(gs::vecs(gs::integers::<usize>().max_value(5000)).max_size(8));
-    assert_eq!(
-        bulk_rle(&data, &chunks, nblock_max),
-        naive_rle(&data, nblock_max)
-    );
+    let want = naive_rle(&data, nblock_max);
+    for level in crate::tests::levels() {
+        assert_eq!(
+            bulk_rle(level, &data, &chunks, nblock_max),
+            want,
+            "at {level:?}"
+        );
+    }
 }
 
 /// The cost of an optimal prefix code for `w` (Huffman's merge).

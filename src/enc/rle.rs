@@ -1,5 +1,5 @@
 //! The encoder's input stage: libbz2's RLE1 with its exact block-boundary
-//! behaviour (bz2-ng's `rle_fill`, scalar tier, of `kern_template.h`).
+//! behaviour (bz2-ng's `rle_fill`, vector tier, of `kern_template.h`).
 //!
 //! Input is cut into units, maximal runs of one byte cut at 255. A unit of 1
 //! to 3 bytes is stored as is, a longer one as 4 bytes and a count byte. A
@@ -13,6 +13,8 @@
 //! covers one contiguous input range per call plus the pending unit carried
 //! in from the previous call (whose bytes are added as copies of its byte).
 
+use fearless_simd::{Simd, SimdBase, SimdFrom, u8x16};
+
 use crate::crc;
 
 /// The fast phase keeps the block this far below `nblock_max`, so that the
@@ -21,7 +23,7 @@ const GUARD: usize = 8;
 /// Calls with fewer input bytes than this take libbz2's byte loop.
 const SMALL: usize = 16;
 /// Bytes the fast phase examines and copies per step.
-const STEP: usize = 8;
+const STEP: usize = 16;
 /// Bytes the block buffer needs past `nblock_max`: the last unit (5 bytes)
 /// written with one 8-byte store.
 pub(crate) const SLACK: usize = 16;
@@ -69,13 +71,6 @@ fn put_unit(blk: &mut [u8], nb: usize, c: u8, len: usize) -> usize {
     nb + if len >= 4 { 5 } else { len }
 }
 
-#[inline(always)]
-fn load(p: &[u8], i: usize) -> u64 {
-    let mut w = [0; 8];
-    w.copy_from_slice(&p[i..i + 8]);
-    u64::from_le_bytes(w)
-}
-
 /// 0x80 in every zero byte of `v`, exactly (no false positives).
 #[inline(always)]
 pub(crate) fn zero_bytes(v: u64) -> u64 {
@@ -83,25 +78,36 @@ pub(crate) fn zero_bytes(v: u64) -> u64 {
     !(((v & LO7).wrapping_add(LO7)) | v | LO7)
 }
 
-/// Bit `8k + 7` is set iff `p[i + k..i + k + 4]` are equal (k = 0..8);
-/// reads `p[i..i + 11]`.
+/// `p[i..i + 16]`.
 #[inline(always)]
-fn run4_mask(p: &[u8], i: usize) -> u64 {
-    let (a, b, c, d) = (load(p, i), load(p, i + 1), load(p, i + 2), load(p, i + 3));
-    zero_bytes(a ^ b) & zero_bytes(b ^ c) & zero_bytes(c ^ d)
+fn load16<S: Simd>(simd: S, p: &[u8], i: usize) -> u8x16<S> {
+    u8x16::simd_from(simd, *p[i..].first_chunk::<16>().unwrap_or(&[0; 16]))
+}
+
+/// Bit `k` is set iff `p[i + k..i + k + 4]` are equal (k = 0..16); reads
+/// `p[i..i + 19]`.
+#[inline(always)]
+fn run4_mask<S: Simd>(simd: S, p: &[u8], i: usize) -> u64 {
+    let (a, b, c, d) = (
+        load16(simd, p, i),
+        load16(simd, p, i + 1),
+        load16(simd, p, i + 2),
+        load16(simd, p, i + 3),
+    );
+    simd.to_bitmask_mask8x16(a.simd_eq(b) & b.simd_eq(c) & c.simd_eq(d))
 }
 
 /// Number of bytes equal to `c` at `p[..avail]`.
 #[inline(always)]
-fn run_length(p: &[u8], avail: usize, c: u8) -> usize {
-    let vc = 0x0101_0101_0101_0101u64 * u64::from(c);
+fn run_length<S: Simd>(simd: S, p: &[u8], avail: usize, c: u8) -> usize {
+    let vc = u8x16::splat(simd, c);
     let mut l = 0;
-    while l + 8 <= avail {
-        let x = load(p, l) ^ vc;
-        if x != 0 {
-            return l + (x.trailing_zeros() >> 3) as usize;
+    while l + 16 <= avail {
+        let differ = !simd.to_bitmask_mask8x16(load16(simd, p, l).simd_eq(vc)) & 0xffff;
+        if differ != 0 {
+            return l + differ.trailing_zeros() as usize;
         }
-        l += 8;
+        l += 16;
     }
     while l < avail && p[l] == c {
         l += 1;
@@ -112,7 +118,14 @@ fn run_length(p: &[u8], avail: usize, c: u8) -> usize {
 /// Feeds `input` to the block `blk` until it runs out or the block is full;
 /// returns how many bytes it consumed. `blk` holds at least
 /// `nblock_max + SLACK` bytes.
-pub(crate) fn fill(st: &mut Rle, input: &[u8], blk: &mut [u8], nblock_max: usize) -> usize {
+#[inline(always)]
+pub(crate) fn fill<S: Simd>(
+    simd: S,
+    st: &mut Rle,
+    input: &[u8],
+    blk: &mut [u8],
+    nblock_max: usize,
+) -> usize {
     let avail = input.len();
     if avail == 0 {
         return 0;
@@ -161,7 +174,7 @@ pub(crate) fn fill(st: &mut Rle, input: &[u8], blk: &mut [u8], nblock_max: usize
     if st.len > 0 {
         let c = st.ch as u8;
         let room = 255 - st.len;
-        p = run_length(input, avail.min(room), c);
+        p = run_length(simd, input, avail.min(room), c);
         if p == avail {
             st.len += p;
             return avail;
@@ -187,19 +200,19 @@ pub(crate) fn fill(st: &mut Rle, input: &[u8], blk: &mut [u8], nblock_max: usize
     // boundary or inside a literal unit of at most 3 bytes that ends within
     // this call (which writes the same bytes however it is split).
     'fast: while nb + STEP <= limit && p + 2 * STEP <= avail {
-        let m = run4_mask(input, p);
+        let m = run4_mask(simd, input, p);
         blk[nb..nb + STEP].copy_from_slice(&input[p..p + STEP]);
         if m == 0 {
             nb += STEP;
             p += STEP;
             continue;
         }
-        let j = (m.trailing_zeros() >> 3) as usize;
+        let j = m.trailing_zeros() as usize;
         nb += j;
         p += j;
         // A maximal run of 4 or more starts at p.
         let c = input[p];
-        let mut l = run_length(&input[p..], avail - p, c);
+        let mut l = run_length(simd, &input[p..], avail - p, c);
         if p + l == avail {
             // It may continue in the next call.
             break;
