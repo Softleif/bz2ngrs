@@ -82,11 +82,20 @@ fn lyndon(t: &[u8]) -> Vec<u8> {
     r
 }
 
-/// The sorter's results for the Lyndon word `t`: BWT, histogram, row of `q`.
-fn run_bwt(t: &[u8], q: usize) -> (Vec<u8>, [i32; 256], usize) {
+/// The work array an earlier block left behind: up to twice what a block of
+/// `n` bytes needs, of ints of any value. The sorter writes every int it
+/// reads, so what was in it must not matter.
+fn dirty_work(tc: &TestCase, n: usize) -> Vec<i32> {
+    let len = tc.draw(gs::integers::<usize>()) % (2 * sort::work_len(n) + 1);
+    let mut rng = Rng(tc.draw(gs::integers::<u64>()));
+    (0..len).map(|_| rng.next() as i32).collect()
+}
+
+/// The sorter's results for the Lyndon word `t`, with `work` as its work
+/// array: BWT, histogram, row of `q`.
+fn run_bwt(t: &[u8], q: usize, mut work: Vec<i32>) -> (Vec<u8>, [i32; 256], usize) {
     let mut l = t.to_vec();
     let mut freq = [0; 256];
-    let mut work = Vec::new();
     let row = sort::bwt(&mut l, q, &mut freq, &mut work);
     (l, freq, row)
 }
@@ -130,7 +139,7 @@ fn bwt_matches_naive_rotation_sort(tc: TestCase) {
     tc.assume(!text.is_empty());
     let t = lyndon(&text);
     let q = tc.draw(gs::integers::<usize>()) % t.len();
-    let (l, freq, row) = run_bwt(&t, q);
+    let (l, freq, row) = run_bwt(&t, q, dirty_work(&tc, t.len()));
     let rows = naive_rows(&t);
     let n = t.len();
     let want: Vec<u8> = rows.iter().map(|&r| t[(r + n - 1) % n]).collect();
@@ -205,7 +214,7 @@ fn bwt_matches_divsufsort(tc: TestCase) {
     let t = lyndon(&large_text(shape, seed, len));
     let n = t.len();
     let q = tc.draw(gs::integers::<usize>()) % n;
-    let (l, freq, row) = run_bwt(&t, q);
+    let (l, freq, row) = run_bwt(&t, q, dirty_work(&tc, n));
     // For a Lyndon word, suffix order is rotation order.
     let mut sa = vec![0; n];
     divsufsort::sort_in_place(&t, &mut sa);
@@ -223,7 +232,7 @@ fn bwt_matches_divsufsort_on_drawn_bytes(tc: TestCase) {
     tc.assume(!text.is_empty());
     let t = lyndon(&text);
     let n = t.len();
-    let (l, _, row) = run_bwt(&t, n - 1);
+    let (l, _, row) = run_bwt(&t, n - 1, dirty_work(&tc, n));
     let mut sa = vec![0; n];
     divsufsort::sort_in_place(&t, &mut sa);
     let want: Vec<u8> = sa.iter().map(|&s| t[(s as usize + n - 1) % n]).collect();
@@ -265,29 +274,87 @@ fn least_rotation_matches_booth(tc: TestCase) {
     }
 }
 
+/// `sort_block` at every SIMD level on the block `t`, in a buffer and with a
+/// work array that an earlier block left behind (the padding and the copy
+/// are the sorter's to write): the BWT, the origPtr and the histogram.
+fn check_sort_block(tc: &TestCase, t: &[u8], want_bwt: &[u8], want_orig: usize) {
+    let n = t.len();
+    let mut rng = Rng(tc.draw(gs::integers::<u64>()));
+    let spare = tc.draw(gs::integers::<usize>().max_value(16));
+    let mut start = t.to_vec();
+    start.extend((0..n + rotate::PAD + spare).map(|_| rng.next() as u8));
+    let work = dirty_work(tc, n);
+    for level in crate::tests::levels() {
+        let (mut tt, mut work) = (start.clone(), work.clone());
+        let mut freq = [0; 256];
+        let (orig, r) = fearless_simd::dispatch!(level, simd => rotate::sort_block(simd, &mut tt, n, &mut freq, &mut work));
+        assert_eq!(tt[r..r + n], want_bwt[..], "BWT at {level:?}");
+        assert_eq!(orig, want_orig, "origPtr at {level:?}");
+        assert_eq!(freq, histogram(t), "histogram at {level:?}");
+    }
+}
+
 #[hegel::test(test_cases = 3000)]
 fn sort_block_gives_bwt_and_last_tied_row(tc: TestCase) {
     let t = tc.draw(small_text());
     tc.assume(!t.is_empty());
     let n = t.len();
-    let mut tt = doubled(&t);
-    let mut freq = [0; 256];
-    let mut work = Vec::new();
-    let (orig, r) = rotate::sort_block(
-        fearless_simd::Fallback::new(),
-        &mut tt,
-        n,
-        &mut freq,
-        &mut work,
-    );
     let rows = naive_rows(&t);
     let want: Vec<u8> = rows.iter().map(|&s| t[(s + n - 1) % n]).collect();
-    assert_eq!(tt[r..r + n], want[..], "BWT");
     // Rows whose rotation is the block itself; any is a valid origPtr, and
     // the encoder writes the last.
     let tied = (0..n).filter(|&i| rotation(&t, rows[i]) == t).max();
-    assert_eq!(Some(orig), tied, "origPtr");
-    assert_eq!(freq, histogram(&t));
+    check_sort_block(&tc, &t, &want, tied.unwrap());
+}
+
+/// The BWT of `t` and the last row holding `t` itself, for a `t` of thousands
+/// of bytes: `t = u^m` with `u` primitive has the rotations of `u`, each `m`
+/// times, in the order of the suffixes of `uu` that start in its first half
+/// (a rotation's first `|u|` bytes decide, the rotations being distinct).
+/// divsufsort sorts those suffixes.
+fn bwt_and_last_tied_row(t: &[u8]) -> (Vec<u8>, usize) {
+    let (p, m) = (root_len(t), t.len() / root_len(t));
+    let u = &t[..p];
+    let uu = u.repeat(2);
+    let mut sa = vec![0; 2 * p];
+    divsufsort::sort_in_place(&uu, &mut sa);
+    let order: Vec<usize> = sa.iter().map(|&s| s as usize).filter(|&s| s < p).collect();
+    let bwt = order
+        .iter()
+        .flat_map(|&s| std::iter::repeat_n(u[(s + p - 1) % p], m))
+        .collect();
+    let row = order.iter().position(|&s| s == 0).unwrap();
+    (bwt, row * m + m - 1)
+}
+
+/// A pattern of 1 to 40 bytes over 1 to 256 symbols, repeated to 8000 bytes
+/// or fewer, and in a third of the draws with a few bytes changed (which
+/// makes the block primitive again).
+#[hegel::composite]
+fn periodic_text(tc: &TestCase) -> Vec<u8> {
+    let p = tc.draw(gs::integers::<usize>().min_value(1).max_value(40));
+    let k = tc.draw(gs::integers::<u16>().min_value(1).max_value(256));
+    let pattern: Vec<u8> = tc
+        .draw(gs::binary().min_size(p).max_size(p))
+        .iter()
+        .map(|&b| (u16::from(b) % k) as u8)
+        .collect();
+    let m = 1 + tc.draw(gs::integers::<usize>()) % (8000 / p);
+    let mut t = pattern.repeat(m);
+    if tc.draw(gs::integers::<u8>().max_value(2)) == 0 {
+        for _ in 0..tc.draw(gs::integers::<u8>().min_value(1).max_value(3)) {
+            let at = tc.draw(gs::integers::<usize>()) % t.len();
+            t[at] = tc.draw(gs::integers::<u8>());
+        }
+    }
+    t
+}
+
+#[hegel::test(test_cases = 3000)]
+fn sort_block_gives_bwt_and_last_tied_row_of_periodic_blocks(tc: TestCase) {
+    let t = tc.draw(periodic_text());
+    let (want, orig) = bwt_and_last_tied_row(&t);
+    check_sort_block(&tc, &t, &want, orig);
 }
 
 /// libbz2's `generateMTFValues`, written from its description: a list of the
@@ -351,14 +418,21 @@ fn mtf_matches_naive(tc: TestCase) {
     }
     let (want, want_freq) = naive_mtf(&l);
     for level in crate::tests::levels() {
-        let mut mtfv = vec![0; l.len() + 1 + mtf::SLACK];
+        let mut mtfv = vec![0xBEEF; l.len() + 1 + mtf::SLACK];
+        // The counts of the symbols in use start from whatever an earlier
+        // block left; those beyond them from zero, and stay there.
         let mut freq = [0; mtf::MAX_ALPHA];
+        freq[..want_freq.len()].fill(0x5A5A);
         let n = fearless_simd::dispatch!(level, simd => mtf::mtf(simd, &l, &in_use, &mut mtfv, &mut freq));
         assert_eq!(mtfv[..n], want[..], "values at {level:?}");
         assert_eq!(
             freq[..want_freq.len()],
             want_freq[..],
             "counts at {level:?}"
+        );
+        assert!(
+            freq[want_freq.len()..].iter().all(|&c| c == 0),
+            "a count beyond the end of block symbol at {level:?}"
         );
     }
 }
@@ -462,7 +536,11 @@ fn bulk_rle(
 fn rle_text(tc: &TestCase) -> Vec<u8> {
     let mut out = Vec::new();
     for _ in 0..tc.draw(gs::integers::<usize>().max_value(60)) {
-        let byte = tc.draw(gs::integers::<u8>().max_value(3));
+        let byte = if tc.draw(gs::booleans()) {
+            tc.draw(gs::integers::<u8>().max_value(3))
+        } else {
+            tc.draw(gs::integers::<u8>())
+        };
         let len = match tc.draw(gs::integers::<u8>().max_value(2)) {
             0 => tc.draw(gs::sampled_from(vec![
                 1usize, 2, 3, 4, 5, 254, 255, 256, 259, 510,
@@ -479,7 +557,13 @@ fn rle_text(tc: &TestCase) -> Vec<u8> {
 #[hegel::test(test_cases = 3000)]
 fn rle_fill_matches_byte_loop(tc: TestCase) {
     let data = tc.draw(rle_text());
-    let nblock_max = 1 + tc.draw(gs::integers::<usize>()) % 3000;
+    // Small, to cut the data into several blocks, or any size a block has.
+    let bound = if tc.draw(gs::booleans()) {
+        3000
+    } else {
+        900_000
+    };
+    let nblock_max = 1 + tc.draw(gs::integers::<usize>()) % bound;
     let chunks = tc.draw(gs::vecs(gs::integers::<usize>().max_value(5000)).max_size(8));
     let want = naive_rle(&data, nblock_max);
     for level in crate::tests::levels() {
@@ -528,23 +612,31 @@ fn code_lengths_are_limited_complete_and_optimal_when_unlimited(tc: TestCase) {
         let scale = chain.iter().sum::<u64>().div_ceil(1_000_000);
         chain.iter().map(|&c| (c / scale) as i32).collect()
     };
+    // The encoder limits to 17; the limit is the function's parameter, down
+    // to what the alphabet needs and up to libbz2's 20.
+    let needed = usize::BITS - (alpha - 1).leading_zeros();
+    let max_len = tc.draw(gs::integers::<u32>().min_value(needed).max_value(20)) as u8;
     let mut len = [0u8; mtf::MAX_ALPHA];
-    huff::make_code_lengths(&mut len, &freq, alpha, 17);
+    huff::make_code_lengths(&mut len, &freq, alpha, max_len);
     let len = &len[..alpha];
     assert!(
-        len.iter().all(|&l| (1..=17).contains(&l)),
-        "lengths {len:?}"
+        len.iter().all(|&l| (1..=max_len).contains(&l)),
+        "lengths {len:?} over {max_len}"
     );
-    let kraft: u64 = len.iter().map(|&l| 1u64 << (17 - l)).sum();
-    assert_eq!(kraft, 1 << 17, "not a complete prefix code");
+    let kraft: u64 = len.iter().map(|&l| 1u64 << (max_len - l)).sum();
+    assert_eq!(kraft, 1 << max_len, "not a complete prefix code");
     let w: Vec<u64> = freq.iter().map(|&f| f.max(1) as u64).collect();
     let cost: u64 = w.iter().zip(len).map(|(&w, &l)| w * u64::from(l)).sum();
     let best = huffman_cost(&w);
     assert!(cost >= best);
     // A Huffman tree of depth d over weights >= 1 weighs at least the
-    // (d + 2)th Fibonacci number, so below F(20) none is deeper than 17 and
-    // libbz2's code must be optimal.
-    if w.iter().sum::<u64>() < 6765 {
+    // (d + 2)th Fibonacci number, so below F(max_len + 3) none is deeper than
+    // max_len and libbz2's code must be optimal.
+    let (mut a, mut b) = (1u64, 1u64);
+    for _ in 0..max_len + 2 {
+        (a, b) = (b, a + b);
+    }
+    if w.iter().sum::<u64>() < a {
         assert_eq!(cost, best, "not optimal");
     }
 }

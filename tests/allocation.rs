@@ -62,32 +62,76 @@ fn encoder_allocates_on_first_compress_only() {
 
     // Not periodic, so that the whole sorter (its recursion included) runs.
     let mut x = 1u32;
-    let data: Vec<u8> = (0..200_000)
-        .map(|_| {
-            x = x.wrapping_mul(1_103_515_245).wrapping_add(12_345);
-            b"ACGT"[(x >> 29) as usize & 3]
-        })
-        .collect();
-    let (n, mut encoder) = allocations_during(|| Encoder::new(Compression::BEST));
-    assert_eq!(n, 0, "Encoder::new allocated");
+    let acgt = |len: usize, x: &mut u32| -> Vec<u8> {
+        (0..len)
+            .map(|_| {
+                *x = x.wrapping_mul(1_103_515_245).wrapping_add(12_345);
+                b"ACGT"[(*x >> 29) as usize & 3]
+            })
+            .collect()
+    };
+    let data = acgt(200_000, &mut x);
+    // A pattern of 7 bytes: its blocks are exactly periodic.
+    let periodic: Vec<u8> = b"ACGTTGA".iter().copied().cycle().take(150_000).collect();
+    // Several blocks at level 1.
+    let several = acgt(350_000, &mut x);
 
-    let mut out = Vec::with_capacity(1 << 20);
-    let (n, ()) = allocations_during(|| encoder.compress(&data, &mut out));
-    assert!(
-        n > 0,
-        "the first compress allocated nothing, so this test counts nothing"
-    );
-    let first = out.clone();
-    // Once its memory has grown to an input, the encoder allocates nothing
-    // for it or a shorter one; the caller's `out` has room.
-    for input in [&data[..], &data[..1000], &[][..]] {
-        out.clear();
-        let (n, ()) = allocations_during(|| encoder.compress(input, &mut out));
-        assert_eq!(n, 0, "a later compress of {} bytes allocated", input.len());
+    for (compression, inputs) in [
+        (
+            Compression::BEST,
+            vec![
+                data.clone(),
+                periodic.clone(),
+                data[..1000].to_vec(),
+                Vec::new(),
+            ],
+        ),
+        (
+            Compression::new(1).unwrap_or_default(),
+            vec![
+                several,
+                periodic,
+                data[..1000].to_vec(),
+                data[..1].to_vec(),
+                Vec::new(),
+            ],
+        ),
+    ] {
+        // What a new encoder writes for each input: a reused one must write
+        // the same, whatever it compressed before.
+        let want: Vec<Vec<u8>> = inputs
+            .iter()
+            .map(|d| Encoder::new(compression).compress_to_vec(d))
+            .collect();
+
+        let (n, mut encoder) = allocations_during(|| Encoder::new(compression));
+        assert_eq!(n, 0, "Encoder::new allocated");
+        let mut out = Vec::with_capacity(1 << 21);
+        let (n, ()) = allocations_during(|| encoder.compress(&inputs[0], &mut out));
+        assert!(
+            n > 0,
+            "the first compress allocated nothing, so this test counts nothing"
+        );
+        assert!(out == want[0], "the first compress wrote another stream");
+        // Once its memory has grown to the first input, the encoder allocates
+        // nothing for it, for the others (each no larger in blocks) or for
+        // any of them again, in any order; the caller's `out` has room.
+        for i in (0..inputs.len()).chain((0..inputs.len()).rev()) {
+            out.clear();
+            let (n, ()) = allocations_during(|| encoder.compress(&inputs[i], &mut out));
+            assert_eq!(
+                n,
+                0,
+                "a later compress of {} bytes allocated",
+                inputs[i].len()
+            );
+            assert!(
+                out == want[i],
+                "a reused encoder wrote another stream for {} bytes",
+                inputs[i].len()
+            );
+        }
     }
-    out.clear();
-    encoder.compress(&data, &mut out);
-    assert!(out == first, "a reused encoder wrote another stream");
 }
 
 fn decoder_allocates_on_first_decode_only() {

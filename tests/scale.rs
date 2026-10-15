@@ -81,3 +81,43 @@ fn hundreds_of_tiny_blocks() {
         }
     }
 }
+
+/// Every encoder writes libbz2's stream for `data` at `level`, in at least
+/// `blocks` blocks.
+fn check_encoders_at_scale(data: &[u8], level: u32, blocks: usize) {
+    use common::enc_oracle::{Encoder, all_encoders};
+    let stream = Encoder::New.run(data, level);
+    assert!(
+        common::oracle::count_blocks(&stream) >= blocks,
+        "{} blocks",
+        common::oracle::count_blocks(&stream)
+    );
+    common::enc_props::check_all(&all_encoders(), data, level);
+}
+
+/// 3.8 MB of noise with runs at level 1: 38 blocks, so the combined CRC's
+/// rotation laps 32 and every buffer is reused 37 times.
+#[test]
+fn encoder_writes_libbz2s_stream_for_three_megabytes_at_level_1() {
+    check_encoders_at_scale(&mixed(7, 3_800_000, 256), 1, 33);
+}
+
+/// 34 blocks that are each a 27-byte pattern 3703 times (27 divides the
+/// 99 981 bytes of a level 1 block): 34 exactly periodic blocks.
+#[test]
+fn encoder_writes_libbz2s_stream_for_34_periodic_blocks() {
+    let raw: Vec<u8> = (0..27u8).map(|i| i.wrapping_mul(37)).collect();
+    let pattern = common::enc_props::run_free(&raw);
+    let data: Vec<u8> = pattern
+        .into_iter()
+        .cycle()
+        .take(34 * 99_981 + 1000)
+        .collect();
+    check_encoders_at_scale(&data, 1, 34);
+}
+
+/// 5.1 MB of one byte at level 1: units of 255 bytes, 19 997 of them per block.
+#[test]
+fn encoder_writes_libbz2s_stream_for_five_megabytes_of_one_byte() {
+    check_encoders_at_scale(&vec![0x61; 5_100_000], 1, 2);
+}

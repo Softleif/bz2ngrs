@@ -90,21 +90,28 @@ pub fn matches_libbz2_full_at_end(tc: &TestCase, encoders: &[Encoder]) {
     check_all(encoders, &case.data, case.level);
 }
 
-/// Property E1, many blocks: up to 2.5 MB of seeded data at levels 1 to 3.
+/// Property E1, many blocks: seeded data at any level, up to 2.5 MB (half
+/// the draws) or up to three blocks' worth.
 pub fn matches_libbz2_many_blocks(tc: &TestCase, encoders: &[Encoder]) {
-    let level = tc.draw(gs::integers::<u32>().min_value(1).max_value(3));
+    let level = tc.draw(inputs::level());
     let seed = tc.draw(gs::integers::<u64>());
     let alphabet = tc.draw(gs::integers::<usize>().min_value(1).max_value(256));
-    let len = below(tc, 2_500_000);
+    let bound = if tc.draw(gs::booleans()) {
+        2_500_000
+    } else {
+        300_000 * level as usize
+    };
+    let len = below(tc, bound);
     check_all(encoders, &mixed(seed, len, alphabet), level);
 }
 
-/// A pattern of 1 to 12 bytes repeated over up to 300 kB, so that level 1
-/// cuts it into several exactly periodic blocks, with up to 3 bytes changed
-/// (which makes a block primitive again).
+/// A pattern of 1 to 40 bytes repeated over up to 300 kB, so that level 1
+/// cuts it into several blocks, with up to 3 bytes changed (which makes a
+/// block primitive again). Exactly periodic blocks come from
+/// [`exact_periodic`].
 #[hegel::composite]
 pub fn long_periodic(tc: &TestCase) -> Vec<u8> {
-    let pattern = tc.draw(gs::vecs(gs::integers::<u8>()).min_size(1).max_size(12));
+    let pattern = tc.draw(gs::vecs(gs::integers::<u8>()).min_size(1).max_size(40));
     let len = below(tc, 300_000);
     let mut data: Vec<u8> = pattern.iter().copied().cycle().take(len).collect();
     for _ in 0..below(tc, 4) {
@@ -116,11 +123,186 @@ pub fn long_periodic(tc: &TestCase) -> Vec<u8> {
     data
 }
 
-/// Property E1, periodic blocks across block boundaries, at level 1.
+/// Property E1, periodic blocks across block boundaries, at any level.
 pub fn matches_libbz2_long_periodic(tc: &TestCase, encoders: &[Encoder]) {
     let data = tc.draw(long_periodic());
-    let level = tc.draw(gs::integers::<u32>().min_value(1).max_value(2));
+    let level = tc.draw(inputs::level());
     check_all(encoders, &data, level);
+}
+
+/// A level and the data to compress at it.
+#[derive(Debug, Clone)]
+pub struct LevelData {
+    pub level: u32,
+    pub data: Vec<u8>,
+}
+
+/// `raw` with every byte different from its neighbours, the last from the
+/// first too (for 2 bytes or more), so that RLE1 leaves a repeated pattern
+/// as it is.
+pub fn run_free(raw: &[u8]) -> Vec<u8> {
+    let mut p = raw.to_vec();
+    for i in 1..p.len() {
+        if p[i] == p[i - 1] {
+            p[i] = p[i].wrapping_add(1);
+        }
+    }
+    let first = p.first().copied();
+    if let [.., before, last] = p.as_mut_slice() {
+        while Some(*last) == first || last == before {
+            *last = last.wrapping_add(1);
+        }
+    }
+    p
+}
+
+/// Data at `level` whose RLE1 blocks are exactly periodic. Half the draws
+/// repeat a run-free pattern whose length divides the block size, so that
+/// every full block is the pattern over and over, the last cut anywhere; the
+/// others repeat a few runs and literals (the runs become RLE1 units) within
+/// one block.
+fn exact_periodic_at(tc: &TestCase, level: u32) -> Vec<u8> {
+    let nblock_max = 100_000 * level as usize - 19;
+    let divisors: Vec<usize> = (2..=20_000)
+        .filter(|&d| nblock_max.is_multiple_of(d))
+        .collect();
+    let mut rng = Rng(tc.draw(gs::integers::<u64>()));
+    let alphabet = tc.draw(gs::integers::<u64>().min_value(2).max_value(256));
+    if !divisors.is_empty() && tc.draw(gs::booleans()) {
+        let p = tc.draw(gs::sampled_from(divisors));
+        let raw: Vec<u8> = (0..p).map(|_| (rng.next() % alphabet) as u8).collect();
+        let pattern = run_free(&raw);
+        let blocks = if level <= 3 { 1 + below(tc, 3) } else { 1 };
+        let len = blocks * nblock_max + below(tc, 3 * p + 1);
+        return pattern.into_iter().cycle().take(len).collect();
+    }
+    let units = 2 + below(tc, 7);
+    let raw: Vec<u8> = (0..units).map(|_| (rng.next() % alphabet) as u8).collect();
+    let bytes = run_free(&raw);
+    let mut unit = Vec::new();
+    for &b in &bytes {
+        let n = if tc.draw(gs::booleans()) {
+            tc.draw(gs::sampled_from(vec![
+                1usize, 2, 3, 4, 5, 6, 254, 255, 256, 259, 300,
+            ]))
+        } else {
+            1 + below(tc, 40)
+        };
+        unit.extend(std::iter::repeat_n(b, n));
+    }
+    let reps = 1 + below(tc, 150_000 / unit.len());
+    unit.repeat(reps)
+}
+
+#[hegel::composite]
+pub fn exact_periodic(tc: &TestCase) -> LevelData {
+    let level = tc.draw(inputs::level());
+    LevelData {
+        level,
+        data: exact_periodic_at(tc, level),
+    }
+}
+
+/// Property E1 where blocks are exactly periodic: the origPtr is the last
+/// tied row (checked against the block itself, whatever libbz2 writes), and
+/// everything else is libbz2's.
+pub fn matches_libbz2_exact_periodic(tc: &TestCase, encoders: &[Encoder]) {
+    let case = tc.draw(exact_periodic());
+    check_all(encoders, &case.data, case.level);
+}
+
+/// The number of MTF values (zero-run digits, ranks, end of block) of the
+/// BWT of `block`, from the rotations sorted by direct comparison and an MTF
+/// list.
+fn naive_mtf_values(block: &[u8]) -> usize {
+    let n = block.len();
+    let mut rows: Vec<usize> = (0..n).collect();
+    rows.sort_by(|&a, &b| {
+        (0..n)
+            .map(|k| block[(a + k) % n])
+            .cmp((0..n).map(|k| block[(b + k) % n]))
+    });
+    let mut list: Vec<u8> = (0..=255u8).filter(|b| block.contains(b)).collect();
+    let digits = |z: usize| (usize::BITS - 1 - (z + 1).leading_zeros()) as usize;
+    let (mut count, mut zeros) = (1, 0);
+    for r in rows {
+        let c = block[(r + n - 1) % n];
+        let rank = list.iter().position(|&x| x == c).unwrap_or(0);
+        list.remove(rank);
+        list.insert(0, c);
+        if rank == 0 {
+            zeros += 1;
+        } else {
+            count += digits(zeros) + 1;
+            zeros = 0;
+        }
+    }
+    count + digits(zeros)
+}
+
+/// Bytes with no four equal in a row (RLE1 leaves them alone) whose block has
+/// exactly `want` MTF values, end of block included, if a search over their
+/// length finds that; else near it. libbz2 picks the number of Huffman tables
+/// from that count: 2 below 200, 3 below 600, 4 below 1200, 5 below 2400, 6
+/// from there.
+fn text_with_mtf_values(rng: &mut Rng, alphabet: u64, want: usize) -> Vec<u8> {
+    let mut t: Vec<u8> = Vec::new();
+    let mut len = want;
+    for _ in 0..40 {
+        t.truncate(len);
+        while t.len() < len {
+            let mut b = (rng.next() % alphabet) as u8;
+            if let [.., x, y, z] = t.as_slice()
+                && x == y
+                && y == z
+                && *z == b
+            {
+                b = b.wrapping_add(1);
+            }
+            t.push(b);
+        }
+        let got = naive_mtf_values(&t);
+        if got == want {
+            break;
+        }
+        len = len
+            .saturating_add_signed(want.cast_signed() - got.cast_signed())
+            .clamp(1, 20_000);
+    }
+    t
+}
+
+/// A block with 200, 600, 1200 or 2400 MTF values, give or take 3.
+#[hegel::composite]
+pub fn near_table_count_threshold(tc: &TestCase) -> Vec<u8> {
+    let threshold = tc.draw(gs::sampled_from(vec![200usize, 600, 1200, 2400]));
+    let delta = tc.draw(gs::integers::<isize>().min_value(-3).max_value(3));
+    let alphabet = tc.draw(gs::integers::<u64>().min_value(2).max_value(256));
+    let mut rng = Rng(tc.draw(gs::integers::<u64>()));
+    text_with_mtf_values(&mut rng, alphabet, threshold.saturating_add_signed(delta))
+}
+
+/// Property E1 where the number of MTF values is at a table-count threshold.
+pub fn matches_libbz2_table_count_threshold(tc: &TestCase, encoders: &[Encoder]) {
+    matches_libbz2(tc, encoders, near_table_count_threshold());
+}
+
+/// One byte value repeated: a lone symbol in the BWT, run lengths at RLE1's
+/// boundaries (multiples of 255, a few over) or anywhere.
+#[hegel::composite]
+pub fn single_byte(tc: &TestCase) -> Vec<u8> {
+    let byte = tc.draw(gs::integers::<u8>());
+    let len = match tc.draw(gs::integers::<u8>().max_value(2)) {
+        0 => 255 * below(tc, 2000) + below(tc, 8),
+        1 => below(tc, 300),
+        _ => below(tc, 300_000),
+    };
+    vec![byte; len]
+}
+
+/// Property E1 for data of one distinct byte.
+pub fn matches_libbz2_single_byte(tc: &TestCase, encoders: &[Encoder]) {
+    matches_libbz2(tc, encoders, single_byte());
 }
 
 /// A text whose block needs libbz2's 17-bit code-length limit (bz2-ng's
@@ -186,24 +368,65 @@ pub fn chain_text(seed: u64, ranks: u32) -> Vec<u8> {
 pub fn matches_libbz2_code_length_limit(tc: &TestCase, encoders: &[Encoder]) {
     let seed = tc.draw(gs::integers::<u64>());
     let ranks = tc.draw(gs::integers::<u32>().min_value(18).max_value(19));
-    check_all(encoders, &chain_text(seed, ranks), 9);
+    let level = tc.draw(inputs::level());
+    check_all(encoders, &chain_text(seed, ranks), level);
 }
 
-/// Property E2: an encoder that has compressed other data gives the same
-/// stream as a new one.
+/// An input that grows an encoder's buffers or leaves them in an odd state,
+/// for `level`: several blocks, exactly periodic blocks, long runs, noise.
+#[hegel::composite]
+pub fn big_input(tc: &TestCase, level: u32) -> Vec<u8> {
+    match tc.draw(gs::integers::<u8>().max_value(5)) {
+        0 => {
+            let seed = tc.draw(gs::integers::<u64>());
+            let alphabet = tc.draw(gs::integers::<usize>().min_value(1).max_value(256));
+            let len = below(tc, (200_000 * level as usize).min(1_200_000));
+            mixed(seed, len, alphabet)
+        }
+        1 => exact_periodic_at(tc, level),
+        2 => tc.draw(long_periodic()),
+        3 => tc.draw(inputs::runs()),
+        4 => tc.draw(inputs::expanding(21)),
+        _ => tc.draw(inputs::any_bytes()),
+    }
+}
+
+/// Empty, one byte, a short run, a few bytes.
+#[hegel::composite]
+pub fn tiny_input(tc: &TestCase) -> Vec<u8> {
+    let byte = tc.draw(gs::integers::<u8>());
+    match tc.draw(gs::integers::<u8>().max_value(3)) {
+        0 => Vec::new(),
+        1 => vec![byte],
+        2 => vec![byte; 2 + below(tc, 5)],
+        _ => tc.draw(gs::binary().max_size(8)),
+    }
+}
+
+/// Property E2: an encoder that has compressed big inputs gives, for the
+/// tiny and ordinary inputs after them, the stream a new one gives, and
+/// libbz2's.
 pub fn reuse_independent(tc: &TestCase, encoders: &[Encoder]) {
     let level = tc.draw(inputs::level());
-    let earlier = tc.draw(gs::vecs(inputs::any_bytes()).max_size(3));
-    let data = tc.draw(inputs::runs());
+    let earlier = tc.draw(gs::vecs(big_input(level)).max_size(2));
+    let mut later = tc.draw(gs::vecs(tiny_input()).min_size(1).max_size(3));
+    later.push(tc.draw(inputs::runs()));
     for e in encoders {
+        let mut enc = e.make(level);
         for d in &earlier {
-            e.run(d, level);
+            enc.compress_to_vec(d);
         }
-        assert!(
-            e.run(&data, level) == e.run_fresh(&data, level),
-            "{}: depends on earlier calls",
-            e.name()
-        );
+        for d in &later {
+            let stream = enc.compress_to_vec(d);
+            assert!(
+                stream == e.run_fresh(d, level),
+                "{}: depends on earlier calls ({} bytes after {} big inputs)",
+                e.name(),
+                d.len(),
+                earlier.len()
+            );
+            check_matches_libbz2(&e.name(), &stream, d, level);
+        }
     }
 }
 
