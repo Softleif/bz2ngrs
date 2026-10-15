@@ -12,8 +12,9 @@
 //! gathering, the LMS radix sort and markers, the 6k partial-order scans,
 //! renumbering, the compaction of unique names and its reconstruction, and the
 //! final induction). Altered: written in Rust, without the OpenMP paths, the
-//! local buffer, the bucket alignment and the prefetches, with the 4k, 2k and
-//! 1k branches replaced by `sort.rs`'s recursion.
+//! local buffer and the bucket alignment, with prefetches only in the
+//! induction scans and only on x86, and with the 4k, 2k and 1k branches
+//! replaced by `sort.rs`'s recursion.
 //!
 //! The work array `sa` has `n + fs` ints. A level keeps its 6k bucket ints at
 //! the end of it; renumbering and compaction reuse that space once the
