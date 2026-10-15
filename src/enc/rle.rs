@@ -80,20 +80,25 @@ fn load16<S: Simd>(simd: S, p: &[u8], i: usize) -> u8x16<S> {
     u8x16::simd_from(simd, *p[i..].first_chunk::<16>().unwrap_or(&[0; 16]))
 }
 
+/// `p[i..i + 64]`.
+#[inline(always)]
+pub(super) fn load64<S: Simd>(simd: S, p: &[u8], i: usize) -> u8x64<S> {
+    u8x64::simd_from(simd, *p[i..].first_chunk::<64>().unwrap_or(&[0; 64]))
+}
+
 /// Bit `k` is set iff `p[i + k] != p[i + k + 1]`, for `k` in `0..64`; reads
 /// `p[i..i + 65]`.
 #[inline(always)]
 fn diff_mask64<S: Simd>(simd: S, p: &[u8], i: usize) -> u64 {
-    let at = |o: usize| u8x64::simd_from(simd, *p[o..].first_chunk::<64>().unwrap_or(&[0; 64]));
-    !simd.to_bitmask_mask8x64(at(i).simd_eq(at(i + 1)))
+    !simd.to_bitmask_mask8x64(load64(simd, p, i).simd_eq(load64(simd, p, i + 1)))
 }
 
 /// Whether a run of 4 equal bytes starts in `p[i..i + 64]`; reads
 /// `p[i..i + 67]`.
 #[inline(always)]
 fn has_run4<S: Simd>(simd: S, p: &[u8], i: usize) -> bool {
-    let at = |o: usize| u8x64::simd_from(simd, *p[o..].first_chunk::<64>().unwrap_or(&[0; 64]));
-    let (a, b, c, d) = (at(i), at(i + 1), at(i + 2), at(i + 3));
+    let (a, b) = (load64(simd, p, i), load64(simd, p, i + 1));
+    let (c, d) = (load64(simd, p, i + 2), load64(simd, p, i + 3));
     simd.any_true_mask8x64(a.simd_eq(b) & b.simd_eq(c) & c.simd_eq(d))
 }
 
