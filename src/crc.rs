@@ -58,6 +58,12 @@ pub(crate) fn paths() -> Vec<(&'static str, Kernel)> {
     v
 }
 
+/// Feeds `n` copies of `b` into a running CRC: the encoder's RLE1 runs,
+/// whose bytes are no longer in one slice.
+pub(crate) fn repeat(crc: u32, b: u8, n: usize) -> u32 {
+    (0..n).fold(crc, |c, _| step(c, b))
+}
+
 /// The register after one byte.
 #[inline(always)]
 fn step(crc: u32, b: u8) -> u32 {

@@ -1,6 +1,6 @@
 # Agent guide
 
-bz2ngrs is a one-shot bzip2 decoder, ported from the C decoder of bz2-ng. Its only consumer is seqair's CRAM reader.
+bz2ngrs is a one-shot bzip2 decoder and encoder, ported from the C library of bz2-ng. Its only consumer is seqair's CRAM code.
 
 ## Rules
 
@@ -9,9 +9,11 @@ bz2ngrs is a one-shot bzip2 decoder, ported from the C decoder of bz2-ng. Its on
   - A `Decoder`'s results never depend on earlier calls.
   - It accepts and rejects exactly the streams libbz2 1.0.8 does.
   - On success it never touches `out` past the returned length.
+  - `Encoder::compress` must never panic, whatever its input, and an `Encoder`'s results never depend on earlier calls.
+  - Its output is byte-identical to libbz2 1.0.8's for one `BZ_FINISH` over the whole input (`BZ2_bzBuffToBuffCompress`), except the origPtr of an exactly periodic block, which is the last tied row (as in bz2-ng).
 - **Tests.**
   - Write property tests with hegel (`hegeltest`). Follow the hegel skill; never weaken a failing property.
-  - Every kernel runs at every SIMD level, `Level::fallback()` included (`Decoder::__with_level`).
+  - Every kernel runs at every SIMD level, `Level::fallback()` included (`Decoder::__with_level`, `Encoder::__with_level`).
   - The oracle is the `bzip2` crate, a dev-dependency.
   - For every property, ask: is it tautological? An oracle that shares the implementation's code or assumptions proves nothing. Neither does an expected value derived the way the code derives it.
 - **SIMD.**
@@ -22,7 +24,7 @@ bz2ngrs is a one-shot bzip2 decoder, ported from the C decoder of bz2-ng. Its on
   - Every optimisation carries before and after numbers from `bench/`, compared against bz2-ng C in the same run, in its commit message.
   - Revert what doesn't help.
 - **Sources.**
-  - bz2-ng (MIT) and libbz2 or libbz2-rs-sys (BSD-style) may be read and ported.
+  - bz2-ng (MIT, its history included), sais-lite (MIT) and libbz2 or libbz2-rs-sys (BSD-style) may be read and ported.
   - Never read GPL code (lbzip2, 7-Zip).
 
 ## Comments

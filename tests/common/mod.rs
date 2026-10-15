@@ -1,6 +1,8 @@
 //! Shared by the integration tests; each test binary uses a subset.
 #![allow(dead_code)]
 
+pub mod enc_oracle;
+pub mod enc_props;
 pub mod forge;
 pub mod inputs;
 pub mod oracle;
