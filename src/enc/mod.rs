@@ -52,17 +52,38 @@ impl Scratch {
     }
 }
 
-/// MSB-first bit writer over a growing output: the low `n` bits of `acc`
-/// are pending.
+/// MSB-first bit writer: the low `n` bits of `acc` are pending, and
+/// `out[..pos]` is written. Every flush stores 8 bytes at `pos`, so `out` is
+/// kept at least 8 bytes longer than anything written: callers reserve the
+/// worst case of what follows ([`BitWriter::reserve`]), and
+/// [`BitWriter::finish`] cuts `out` back to what was written.
 pub(crate) struct BitWriter<'a> {
     out: &'a mut Vec<u8>,
+    pos: usize,
     acc: u64,
     n: u32,
 }
 
+/// Bytes past the written end that a flush may store to.
+const SLACK: usize = 8;
+
 impl<'a> BitWriter<'a> {
     fn new(out: &'a mut Vec<u8>) -> Self {
-        BitWriter { out, acc: 0, n: 0 }
+        let pos = out.len();
+        BitWriter {
+            out,
+            pos,
+            acc: 0,
+            n: 0,
+        }
+    }
+
+    /// Makes room for `bytes` more bytes of output.
+    fn reserve(&mut self, bytes: usize) {
+        let need = self.pos + bytes + SLACK;
+        if self.out.len() < need {
+            self.out.resize(need, 0);
+        }
     }
 
     /// Appends the `n <= 32` low bits of `v` (no bits above them are set).
@@ -75,30 +96,64 @@ impl<'a> BitWriter<'a> {
         self.n += n;
     }
 
-    /// Writes the whole pending bytes.
+    /// Writes the whole pending bytes, leaving at most 7 bits pending.
     #[inline(always)]
-    fn flush(&mut self) {
-        let whole = (self.n / 8) as usize;
-        if whole > 0 {
-            let v = self.acc << (64 - self.n);
-            self.out.extend_from_slice(&v.to_be_bytes()[..whole]);
+    pub(crate) fn flush(&mut self) {
+        if self.n > 0 {
+            store(self.out, self.pos, self.acc << (64 - self.n));
+            self.pos += (self.n / 8) as usize;
             self.n &= 7;
         }
     }
 
-    /// Pads the last byte with zero bits and writes it.
+    /// The pending bits, the output and its write position, for an emitter
+    /// that keeps them in registers ([`BitWriter::set_parts`] hands them back).
+    pub(crate) fn parts(&mut self) -> (u64, u32, &mut [u8], usize) {
+        (self.acc, self.n, self.out, self.pos)
+    }
+
+    pub(crate) fn set_parts(&mut self, acc: u64, n: u32, pos: usize) {
+        self.acc = acc;
+        self.n = n;
+        self.pos = pos;
+    }
+
+    /// Pads the last byte with zero bits, writes it, and cuts the output
+    /// back to the written bytes.
     fn finish(mut self) {
         let pad = (8 - self.n % 8) % 8;
         self.put(pad, 0);
         self.flush();
+        self.out.truncate(self.pos);
     }
+}
+
+/// The 8 bytes of `v`, most significant first, at `out[pos..]`.
+#[inline(always)]
+pub(crate) fn store(out: &mut [u8], pos: usize, v: u64) {
+    if let Some(d) = out.get_mut(pos..pos + 8) {
+        d.copy_from_slice(&v.to_be_bytes());
+    }
+}
+
+/// The most bytes a block of `n` RLE1 bytes adds to the stream: its header
+/// and symbol map, at most 6 bits per selector, the six code-length tables
+/// (5 bits each, then per symbol 1 bit and 2 bits per unit of change), and at
+/// most `n + 1` coded MTF values of at most 17 bits (bz2-ng's
+/// `bzng_block_bound`).
+fn block_bound(n: usize) -> usize {
+    let nmtf = n + 1;
+    let data = (nmtf * 17).div_ceil(8);
+    let selectors = (nmtf.div_ceil(50) * 6).div_ceil(8);
+    let lengths = 6 * (5 + 258 * (1 + 2 * 17)) / 8 + 1;
+    data + selectors + lengths + 14 + 34 + 3 + 1
 }
 
 /// Compresses `src` as one stream with blocks of `level` × 100,000 bytes
 /// (after RLE1), appending it to `out`.
 #[inline(always)]
 pub(crate) fn compress_stream<S: Simd>(
-    _simd: S,
+    simd: S,
     src: &[u8],
     level: u8,
     out: &mut Vec<u8>,
@@ -118,9 +173,8 @@ pub(crate) fn compress_stream<S: Simd>(
     if sc.mtfv.len() < biggest + 1 {
         sc.mtfv.resize(biggest + 1, 0);
     }
-    out.reserve(src.len() / 8 + 64);
-
     let mut bw = BitWriter::new(out);
+    bw.reserve(4);
     bw.put(
         32,
         u64::from(u32::from_be_bytes(*b"BZh0") + u32::from(level)),
@@ -130,7 +184,7 @@ pub(crate) fn compress_stream<S: Simd>(
     let mut pos = 0;
     loop {
         if st.nblock < nblock_max {
-            pos += rle::fill(&mut st, &src[pos..], &mut sc.tt, nblock_max);
+            pos += rle::fill(simd, &mut st, &src[pos..], &mut sc.tt, nblock_max);
         }
         // As in libbz2 under BZ_FINISH: once the input is used up, the
         // pending unit joins the block even if the block is already full.
@@ -141,7 +195,7 @@ pub(crate) fn compress_stream<S: Simd>(
         if st.nblock > 0 {
             let block_crc = !st.crc;
             combined = combined.rotate_left(1) ^ block_crc;
-            encode_block(sc, st.nblock, block_crc, &mut bw);
+            encode_block(simd, sc, st.nblock, block_crc, &mut bw);
         }
         if last {
             break;
@@ -149,6 +203,7 @@ pub(crate) fn compress_stream<S: Simd>(
         st.nblock = 0;
         st.crc = !0;
     }
+    bw.reserve(11);
     bw.put(24, 0x17_7245);
     bw.put(24, 0x38_5090);
     bw.put(32, u64::from(combined));
@@ -157,17 +212,25 @@ pub(crate) fn compress_stream<S: Simd>(
 
 /// Encodes the block `sc.tt[..n]` with its finalised CRC: block magic, CRC,
 /// randomised bit, origPtr, symbol map, then the Huffman stage.
-fn encode_block(sc: &mut Scratch, n: usize, block_crc: u32, bw: &mut BitWriter<'_>) {
+#[inline(always)]
+fn encode_block<S: Simd>(
+    simd: S,
+    sc: &mut Scratch,
+    n: usize,
+    block_crc: u32,
+    bw: &mut BitWriter<'_>,
+) {
     let mut freq = [0i32; 256];
-    let (orig, r) = rotate::sort_block(&mut sc.tt, n, &mut freq, &mut sc.work);
+    let (orig, r) = rotate::sort_block(simd, &mut sc.tt, n, &mut freq, &mut sc.work);
     let mut in_use = [false; 256];
     for (u, &f) in in_use.iter_mut().zip(&freq) {
         *u = f != 0;
     }
     let n_in_use = in_use.iter().filter(|&&u| u).count();
     let mut mtf_freq = [0i32; MAX_ALPHA];
-    let nmtf = mtf::mtf(&sc.tt[r..r + n], &in_use, &mut sc.mtfv, &mut mtf_freq);
+    let nmtf = mtf::mtf(simd, &sc.tt[r..r + n], &in_use, &mut sc.mtfv, &mut mtf_freq);
 
+    bw.reserve(block_bound(n));
     bw.put(24, 0x31_4159);
     bw.put(24, 0x26_5359);
     bw.put(32, u64::from(block_crc));

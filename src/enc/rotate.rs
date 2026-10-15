@@ -1,5 +1,5 @@
 //! The block's least rotation into the block sorter (bz2-ng's `enc_sort.c`
-//! and the least-rotation kernel of `kern_template.h`, scalar tier).
+//! and the least-rotation kernel of `kern_template.h`, vector tier).
 //!
 //! The least rotation T' of a primitive block is a Lyndon word, whose suffix
 //! order equals its rotation order, so the suffix sorter on T' yields
@@ -10,6 +10,8 @@
 //! and returns the row of the rotation that is the original block, which is
 //! origPtr.
 
+use fearless_simd::{Select, Simd, SimdBase, SimdFrom, u8x16};
+
 use super::sort;
 
 /// Bytes of zeros after the block's copy, so that the 8-byte prefix
@@ -17,9 +19,7 @@ use super::sort;
 pub(crate) const PAD: usize = 64;
 
 /// Candidate-list refinement stops below `n / SPARSE_DIV` candidates, after
-/// `KMAX` bytes, or when it stalls; a smallest byte rarer than one in
-/// `DENSE_DIV` is searched for directly.
-const DENSE_DIV: usize = 32;
+/// `KMAX` bytes, or when it stalls.
 const SPARSE_DIV: usize = 1024;
 const KMAX: usize = 64;
 
@@ -27,7 +27,9 @@ const KMAX: usize = 64;
 /// frequencies to `freq`, and returns `(origPtr, r)`. `tt` holds at least
 /// `2 * n + PAD` bytes; `work` is the sorter's scratch, which also holds the
 /// least rotation's candidates.
-pub(crate) fn sort_block(
+#[inline(always)]
+pub(crate) fn sort_block<S: Simd>(
+    simd: S,
     tt: &mut [u8],
     n: usize,
     freq: &mut [i32; 256],
@@ -38,7 +40,7 @@ pub(crate) fn sort_block(
     if work.len() < sort::work_len(n) {
         work.resize(sort::work_len(n), 0);
     }
-    let (r, periodic) = least_rotation(tt, n, work);
+    let (r, periodic) = least_rotation(simd, tt, n, work);
     // A least rotation of a periodic block is a power of a Lyndon word, so
     // the root is found; the fallback only keeps a broken invariant from
     // reaching an index out of bounds.
@@ -88,26 +90,65 @@ fn lyndon_root_len(tr: &[u8]) -> Option<usize> {
 /// read off its exit: a minimal rotation is never skipped, so for T = u^m
 /// the two pointers end on two equal rotations and the prefix comparison
 /// reaches n; for a primitive T it never does. The candidates are the
-/// positions of the smallest byte (found directly when sparse, refined byte
-/// by byte while that keeps shrinking the set when dense).
-pub(super) fn least_rotation(tt: &[u8], n: usize, cand: &mut [i32]) -> (usize, bool) {
+/// positions of the smallest 2-byte window, found with vector passes, then
+/// refined byte by byte while that keeps shrinking the set.
+#[inline(always)]
+pub(super) fn least_rotation<S: Simd>(
+    simd: S,
+    tt: &[u8],
+    n: usize,
+    cand: &mut [i32],
+) -> (usize, bool) {
     if n <= 1 {
         return (0, false);
     }
-    let c0 = tt[..n].iter().copied().min().unwrap_or(0);
-    let count = tt[..n].iter().filter(|&&b| b == c0).count();
-    if count <= n / DENSE_DIV {
-        return sparse(tt, n, c0);
+    let at = |x: usize| u8x16::simd_from(simd, *tt[x..].first_chunk::<16>().unwrap_or(&[0; 16]));
+    let (chunks, end) = (n / 16, n / 16 * 16);
+
+    let mut least = u8x16::splat(simd, 255);
+    for k in 0..chunks {
+        least = least.min(at(16 * k));
     }
+    let c0 = tt[end..n]
+        .iter()
+        .copied()
+        .fold(simd.reduce_min_u8x16(least), u8::min);
+
+    // The smallest byte after a c0 (tt[n] = tt[0] continues the rotation).
+    let (v0, none) = (u8x16::splat(simd, c0), u8x16::splat(simd, 255));
+    let mut least = none;
+    for k in 0..chunks {
+        let hit = at(16 * k).simd_eq(v0);
+        least = least.min(hit.select(at(16 * k + 1), none));
+    }
+    let c1 = (end..n)
+        .filter(|&x| tt[x] == c0)
+        .map(|x| tt[x + 1])
+        .fold(simd.reduce_min_u8x16(least), u8::min);
+
+    // Their positions, and the smallest byte after them.
+    let v1 = u8x16::splat(simd, c1);
     let (mut m, mut cm) = (0, 255u8);
-    for x in 0..n {
-        cand[m] = x as i32;
-        let hit = tt[x] == c0;
-        m += usize::from(hit);
-        let f = if hit { tt[x + 1] } else { 255 };
-        cm = cm.min(f);
+    let mut take = |x: usize, m: &mut usize| {
+        cand[*m] = x as i32;
+        *m += 1;
+        cm = cm.min(tt[x + 2]);
+    };
+    for k in 0..chunks {
+        let x = 16 * k;
+        let hit = at(x).simd_eq(v0) & at(x + 1).simd_eq(v1);
+        let mut bits = simd.to_bitmask_mask8x16(hit);
+        while bits != 0 {
+            take(x + bits.trailing_zeros() as usize, &mut m);
+            bits &= bits - 1;
+        }
     }
-    refine(tt, n, cand, m, 1, cm)
+    for x in end..n {
+        if tt[x] == c0 && tt[x + 1] == c1 {
+            take(x, &mut m);
+        }
+    }
+    refine(tt, n, cand, m, 2, cm)
 }
 
 /// Length of the common prefix of `tt[a..]` and `tt[b..]`, starting the
@@ -132,40 +173,6 @@ fn load(tt: &[u8], i: usize) -> u64 {
     let mut w = [0; 8];
     w.copy_from_slice(&tt[i..i + 8]);
     u64::from_le_bytes(w)
-}
-
-/// First position `>= pos` holding `c0`, or `n`.
-fn next_cand(tt: &[u8], pos: usize, n: usize, c0: u8) -> usize {
-    if pos >= n {
-        return n;
-    }
-    tt[pos..n]
-        .iter()
-        .position(|&b| b == c0)
-        .map_or(n, |i| pos + i)
-}
-
-/// Two-pointer search over all positions holding `c0`.
-fn sparse(tt: &[u8], n: usize, c0: u8) -> (usize, bool) {
-    let mut periodic = false;
-    let mut i = next_cand(tt, 0, n, c0);
-    let mut j = next_cand(tt, i + 1, n, c0);
-    while i < n && j < n {
-        let k = common_prefix(tt, i, j, 1, n);
-        if k >= n {
-            periodic = true;
-            break;
-        }
-        if tt[i + k] > tt[j + k] {
-            i = next_cand(tt, i + k + 1, n, c0);
-        } else {
-            j = next_cand(tt, j + k + 1, n, c0);
-        }
-        if i == j {
-            j = next_cand(tt, j + 1, n, c0);
-        }
-    }
-    (i.min(j), periodic)
 }
 
 /// Refines a sorted candidate list `cand[..m]` whose members all share their

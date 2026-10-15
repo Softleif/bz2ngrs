@@ -263,6 +263,10 @@ impl Encoder {
 
     /// Compresses all of `src` as one bzip2 stream and appends it to `out`.
     /// Never fails: any input, empty included, has a stream.
+    ///
+    /// While a block is coded, `out` is grown to that block's worst case
+    /// (about 2.1 bytes per byte of block, so up to 2 MB at level 9) and cut
+    /// back afterwards, so its capacity may end up larger than the stream.
     pub fn compress(&mut self, src: &[u8], out: &mut Vec<u8>) {
         let sc = self.scratch.get_or_insert_with(enc::Scratch::new_boxed);
         let level = self.compression.0;

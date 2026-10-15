@@ -130,16 +130,16 @@ pub(super) fn make_code_lengths(len: &mut [u8], freq: &[i32], alpha: usize, max_
             upheap(&mut heap, &weight, n_heap);
         }
 
+        // A node's parent is made after it, so one pass down from the root
+        // gives every depth (libbz2 walks from each leaf to the root).
+        let mut depth = [0u8; MAX_ALPHA * 2];
+        for k in (1..n_nodes).rev() {
+            depth[k] = depth[parent[k] as usize] + 1;
+        }
         let mut too_long = false;
-        for i in 1..=alpha {
-            let mut j = 0u8;
-            let mut k = i;
-            while parent[k] >= 0 {
-                k = parent[k] as usize;
-                j += 1;
-            }
-            len[i - 1] = j;
-            too_long |= j > max_len;
+        for (l, &d) in len[..alpha].iter_mut().zip(&depth[1..=alpha]) {
+            *l = d;
+            too_long |= d > max_len;
         }
         if !too_long {
             break;
@@ -255,6 +255,9 @@ pub(crate) fn encode(
         if recount {
             h.rfreq = [[[0; MAX_ALPHA]; N_GROUPS]; 2];
         }
+        // A table whose counts no group moved into or out of keeps its
+        // lengths, so only the others are rebuilt.
+        let mut dirty = [recount; N_GROUPS];
         for v in 0..alpha {
             let mut w = 0u64;
             for t in 0..n_groups {
@@ -296,6 +299,8 @@ pub(crate) fn encode(
             } else {
                 let from = usize::from(h.prev_sel[grp]);
                 if bt != from {
+                    dirty[from] = true;
+                    dirty[bt] = true;
                     for &x in g {
                         h.rfreq[0][from][usize::from(x)] -= 1;
                         h.rfreq[0][bt][usize::from(x)] += 1;
@@ -310,7 +315,9 @@ pub(crate) fn encode(
                     *a += b;
                 }
             }
-            make_code_lengths(&mut h.len[t], &h.rfreq[0][t], alpha, MAX_CODE_LEN);
+            if dirty[t] {
+                make_code_lengths(&mut h.len[t], &h.rfreq[0][t], alpha, MAX_CODE_LEN);
+            }
         }
         h.prev_sel.copy_from_slice(&h.selector);
     }
@@ -350,11 +357,33 @@ pub(crate) fn encode(
         }
     }
 
+    // The coded MTF values: three per flush, which the at most 7 bits a
+    // flush leaves pending allow (7 + 3 * 17 <= 63), with no check per code;
+    // the caller reserved their bound.
+    bw.flush();
+    let (mut acc, mut nbits, out, mut pos) = bw.parts();
+    let mut flush = |acc: u64, nbits: &mut u32| {
+        super::store(out, pos, acc << (64 - *nbits));
+        pos += (*nbits / 8) as usize;
+        *nbits &= 7;
+    };
     for (g, &sel) in mtfv.chunks(G_SIZE).zip(&h.selector) {
         let tab = &h.ce[usize::from(sel)];
-        for &x in g {
+        let (triples, rest) = g.as_chunks::<3>();
+        for t3 in triples {
+            for &x in t3 {
+                let e = tab[usize::from(x)];
+                acc = (acc << (e & 31)) | u64::from(e >> 5);
+                nbits += e & 31;
+            }
+            flush(acc, &mut nbits);
+        }
+        for &x in rest {
             let e = tab[usize::from(x)];
-            bw.put(e & 31, u64::from(e >> 5));
+            acc = (acc << (e & 31)) | u64::from(e >> 5);
+            nbits += e & 31;
+            flush(acc, &mut nbits);
         }
     }
+    bw.set_parts(acc, nbits, pos);
 }
