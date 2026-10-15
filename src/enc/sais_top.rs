@@ -244,30 +244,6 @@ pub(super) fn renumber_and_gather(sa: &mut [i32], n: usize, m: usize, fs: usize)
     name
 }
 
-/// The LMS positions, ascending, into `sa[n - m..n]` (the classification of
-/// [`count_and_gather`] without the counts).
-pub(super) fn gather_lms(t: &[u8], sa: &mut [i32]) {
-    let n = t.len();
-    let mut m = n - 1;
-    let (mut c0, mut f0) = (t[n - 1], true);
-    for i in (0..n - 1).rev() {
-        let c1 = t[i];
-        let f1 = l_type(c1, c0, f0);
-        sa[m] = (i + 1) as i32;
-        m -= usize::from(f1 && !f0);
-        (c0, f0) = (c1, f1);
-    }
-    sa[m] = 0;
-}
-
-/// The recursion's suffix array of the reduced string, `sa[..m]`, into the
-/// LMS positions it ranks.
-pub(super) fn reconstruct(sa: &mut [i32], n: usize, m: usize) {
-    for i in 0..m {
-        sa[i] = sa[n - m + sa[i] as usize];
-    }
-}
-
 /// Places the sorted LMS suffixes `sa[..m]` at the ends of their buckets,
 /// zeros elsewhere: the seeds of the final induction.
 pub(super) fn place_lms(sa: &mut [i32], n: usize, mut m: usize, bk: &Buckets) {
