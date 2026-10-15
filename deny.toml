@@ -10,6 +10,7 @@ ignore = []
 [licenses]
 allow = [
     "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception", # this crate: the block sorter's top level, from libsais
     "BSD-3-Clause",
     "MIT",
     "NCSA", # libfuzzer-sys (fuzz crate only)
