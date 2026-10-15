@@ -351,7 +351,7 @@ fn mtf_matches_naive(tc: TestCase) {
     }
     let (want, want_freq) = naive_mtf(&l);
     for level in crate::tests::levels() {
-        let mut mtfv = vec![0; l.len() + 1];
+        let mut mtfv = vec![0; l.len() + 1 + mtf::SLACK];
         let mut freq = [0; mtf::MAX_ALPHA];
         let n = fearless_simd::dispatch!(level, simd => mtf::mtf(simd, &l, &in_use, &mut mtfv, &mut freq));
         assert_eq!(mtfv[..n], want[..], "values at {level:?}");

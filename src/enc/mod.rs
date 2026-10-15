@@ -170,8 +170,8 @@ pub(crate) fn compress_stream<S: Simd>(
     if sc.tt.len() < tt_len {
         sc.tt.resize(tt_len, 0);
     }
-    if sc.mtfv.len() < biggest + 1 {
-        sc.mtfv.resize(biggest + 1, 0);
+    if sc.mtfv.len() < biggest + 1 + mtf::SLACK {
+        sc.mtfv.resize(biggest + 1 + mtf::SLACK, 0);
     }
     let mut bw = BitWriter::new(out);
     bw.reserve(4);
