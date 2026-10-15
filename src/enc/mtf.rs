@@ -147,10 +147,8 @@ pub(crate) fn mtf<S: Simd>(
     let mut list = [0u8; 256 + 8];
     let mut n_in_use = 0;
     for c in 0..=255u8 {
-        if in_use[usize::from(c)] {
-            list[n_in_use] = c;
-            n_in_use += 1;
-        }
+        list[n_in_use] = c;
+        n_in_use += usize::from(in_use[usize::from(c)]);
     }
     // Unused slots must never match a symbol: a byte not in use fills them
     // (there is one whenever there are unused slots).
