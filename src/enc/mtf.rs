@@ -15,8 +15,6 @@
 
 use fearless_simd::{Select, Simd, SimdBase, SimdFrom, u8x16, u8x64, u16x8};
 
-use super::rle::zero_bytes;
-
 /// The highest MTF symbol plus one (RUNA, RUNB, ranks 1 to 255, EOB).
 pub(crate) const MAX_ALPHA: usize = 258;
 const RUNA: usize = 0;
@@ -39,9 +37,13 @@ impl List {
     #[inline(always)]
     fn rank<S: Simd>(&mut self, simd: S, c: u8) -> usize {
         let h = self.head;
-        let z = zero_bytes(h ^ (0x0101_0101_0101_0101 * u64::from(c)));
+        // At most one byte of `x` is zero (the list holds each byte once, and
+        // `c` is never the filler), so the lowest flag is the match; the flags
+        // above it that the borrow may add are masked off by `z ^ (z - 1)`.
+        let x = h ^ (0x0101_0101_0101_0101 * u64::from(c));
+        let z = x.wrapping_sub(0x0101_0101_0101_0101) & !x & 0x8080_8080_8080_8080;
         if z != 0 {
-            self.head = h ^ ((h ^ ((h << 8) | u64::from(c))) & (z << 1).wrapping_sub(1));
+            self.head = h ^ ((h ^ ((h << 8) | u64::from(c))) & (z ^ z.wrapping_sub(1)));
             (z.trailing_zeros() >> 3) as usize
         } else {
             self.tail_to_front(simd, c)

@@ -71,13 +71,6 @@ fn put_unit(blk: &mut [u8], nb: usize, c: u8, len: usize) -> usize {
     nb + if len >= 4 { 5 } else { len }
 }
 
-/// 0x80 in every zero byte of `v`, exactly (no false positives).
-#[inline(always)]
-pub(crate) fn zero_bytes(v: u64) -> u64 {
-    const LO7: u64 = 0x7f7f_7f7f_7f7f_7f7f;
-    !(((v & LO7).wrapping_add(LO7)) | v | LO7)
-}
-
 /// `p[i..i + 16]`.
 #[inline(always)]
 fn load16<S: Simd>(simd: S, p: &[u8], i: usize) -> u8x16<S> {
