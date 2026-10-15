@@ -47,3 +47,15 @@ name = "decompress_mutated"
 path = "fuzz_targets/decompress_mutated.rs"
 test = false
 doc = false
+
+[[bin]]
+name = "compress_differential"
+path = "fuzz_targets/compress_differential.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "compress_structured"
+path = "fuzz_targets/compress_structured.rs"
+test = false
+doc = false

@@ -15,6 +15,8 @@ a long-lived `Decoder` (one per process and SIMD level, so state left by earlier
 | `decompress_differential` | arbitrary bytes | the rule above, `cap = 4 * len + 1 MB` |
 | `decompress_mutated` | arbitrary data, level, and structured edits (bit flip, byte set, truncate, insert, delete, block-size digit, block CRC, stream CRC) of its compressed stream | the rule above |
 | `roundtrip` | arbitrary data, level, repeat count | libbz2-compressed data decodes to the same bytes into an exact `out` |
+| `compress_differential` | arbitrary data, level, repeat count | every encoder (`Encoder::new()` and every level, long-lived) writes the same stream; it is libbz2's up to the origPtr of exactly periodic blocks (`tests/common/enc_oracle.rs`), and our decoder reads it back |
+| `compress_structured` | runs around the RLE1 lengths, repeated patterns and literals, levels 1 and 2 | as `compress_differential`, reaching block boundaries and periodic blocks sooner |
 
 ## Run
 
@@ -22,12 +24,15 @@ a long-lived `Decoder` (one per process and SIMD level, so state left by earlier
 # Seeds (valid streams, plus small real CRAM blocks if corpus/cram-bzip2 exists); committed in fuzz/seeds/
 cargo +nightly run --manifest-path fuzz/Cargo.toml --example gen_seeds
 
-mkdir -p fuzz/corpus/decompress_differential fuzz/corpus/decompress_mutated fuzz/corpus/roundtrip
+mkdir -p fuzz/corpus/decompress_differential fuzz/corpus/decompress_mutated fuzz/corpus/roundtrip \
+    fuzz/corpus/compress_differential fuzz/corpus/compress_structured
 
 # A short run of each target (no long campaigns by default)
 cargo +nightly fuzz run decompress_differential fuzz/corpus/decompress_differential fuzz/seeds/decompress_differential -- -max_total_time=60 -dict=fuzz/bzip2.dict
 cargo +nightly fuzz run decompress_mutated fuzz/corpus/decompress_mutated -- -max_total_time=60
 cargo +nightly fuzz run roundtrip fuzz/corpus/roundtrip -- -max_total_time=60
+cargo +nightly fuzz run compress_differential fuzz/corpus/compress_differential -- -max_total_time=60
+cargo +nightly fuzz run compress_structured fuzz/corpus/compress_structured -- -max_total_time=60
 
 # Reproduce / minimise a crash
 cargo +nightly fuzz run decompress_differential fuzz/artifacts/decompress_differential/crash-...
