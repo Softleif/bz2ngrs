@@ -2,16 +2,17 @@
 
 Decode and encode benchmark. Compares, on identical independent streams:
 
-1. `bz2ngrs::Decoder::decompress` (or `Encoder::compress`) on one `Decoder` (`Encoder`) reused for the whole run (`ours`)
-2. the `bzip2` 0.6.1 crate, i.e. libbz2-rs-sys (`bzip2`)
-3. bz2-ng C (`C`), the target, linked in-process
+1. `bz2ngrs::Decoder::decompress` (or `Encoder::compress`) on one `Decoder` (`Encoder`) reused for the whole run (`ours`), as a reader (writer) keeps one
+2. the same on a new `Decoder` (`Encoder`) per call (`fresh`), which allocates per call as the other two do
+3. the `bzip2` 0.6.1 crate, i.e. libbz2-rs-sys (`bzip2`)
+4. bz2-ng C (`C`), the target, linked in-process
 
 Decoding (`--op decode`, the default): each stream is decoded in one call into a buffer of the known size. For C that is
 `BZ2_bzDecompressInit`, one `BZ2_bzDecompress`, `BZ2_bzDecompressEnd`, as bz2-ng's `bench.c` does.
 
 Encoding (`--op encode`): each chunk is compressed in one call at `--level`. For C that is
 `BZ2_bzBuffToBuffCompress`, for `bzip2` a new `Compress` and one `compress_vec` with `Action::Finish`; both
-allocate their block arrays per call, where ours keeps them in the reused `Encoder`.
+allocate their block arrays per call, as `fresh` does, where `ours` keeps them in the reused `Encoder`.
 
 ## Run
 
@@ -46,11 +47,11 @@ Flags (all take a value):
 | `--rounds`, `-r` | 5 | rounds; the decoder order rotates each round |
 | `--level`, `-l` | 9 | bzip2 level used to compress the corpus chunks (and the level timed with `--op encode`) |
 | `--min-ms` | 30 | a pass repeats until it ran this long (keeps small sets out of timer noise) |
-| `--max-bytes` | 4000000 | truncate each corpus file; 0 for all of it |
+| `--max-bytes` | 4000000 | truncate each corpus file; 0 for all of it (the first line of the output says which) |
 | `--data` | `/Users/pascal/code/tfenne/bz2-ng/data/corpora/1kg` | corpus directory |
 | `--manifest` | `/Users/pascal/Code/softleif/bz2ngrs/corpus/cram-bzip2/manifest.tsv` | real CRAM bzip2 blocks, one set per source directory; skipped if absent |
 | `--tsv` | none | also write a TSV |
-| `--decoders` | `ours,bzip2,C` | decoders (encoders) to time (one alone, for a profile) |
+| `--decoders` | `ours,fresh,bzip2,C` | decoders (encoders) to time (one alone, for a profile) |
 | `--stat` | `median` | `max` reports the best round instead (on a loaded machine the slow rounds are interference) |
 
 Chunks are compressed once, in parallel, before timing, with the `bzip2` crate. CRAM
@@ -63,11 +64,11 @@ blocks are used as stored; the expected bytes are the `bzip2` crate's output
   fails is reported as `FAILED` (`FAILED/stub` for ours, which errors until the real
   decoder exists) and is not timed; a note with the first error goes to stderr.
 - Every encoder's stream is decoded by libbz2 first and must give back the original
-  bytes, or the encoder is reported as `FAILED`. A note on stderr counts our streams that
-  are not byte-identical to libbz2's (they differ in the origPtr of exactly periodic
-  blocks).
+  bytes, or the encoder is reported as `FAILED`. When any of our streams is not
+  byte-identical to another encoder's, a note on stderr counts the identical ones for
+  libbz2 (the others differ in the origPtr of exactly periodic blocks), bz2-ng and `fresh`.
 - Reported: median (or best, `--stat max`) over rounds of MB/s of uncompressed data (MB = 10^6 bytes) over a
-  whole-set pass, plus ratios `ours/C` and `ours/bzip2`.
+  whole-set pass, plus ratios `ours/C`, `fresh/C` and `ours/bzip2`.
 - Per-call cost: ns per call on the 16 KiB sets, and the cost of decoding an empty
   stream (14 bytes) or encoding an empty input, which is init plus teardown with
   nothing to do (best of several runs of 20,000 calls, 1,000 when encoding).

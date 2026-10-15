@@ -1,5 +1,5 @@
-//! Decode and encode benchmark: bz2ngrs vs the `bzip2` crate (libbz2-rs-sys)
-//! vs bz2-ng C. See README.md for usage.
+//! Decode and encode benchmark: bz2ngrs, reused and fresh per call, vs the
+//! `bzip2` crate (libbz2-rs-sys) vs bz2-ng C. See README.md for usage.
 use std::{
     collections::BTreeMap,
     ffi::{c_char, c_int, c_uint, c_void},
@@ -44,11 +44,14 @@ unsafe extern "C" {
 
 const BZ_STREAM_END: c_int = 4;
 
-// ---- the three decoders: whole stream into an output of the known size ----
+// ---- the decoders: whole stream into an output of the known size ----
 
 type Dec = fn(&[u8], &mut [u8]) -> Result<usize, String>;
-const NAMES: [&str; 3] = ["ours", "bzip2", "C"];
-const DECODERS: [Dec; 3] = [dec_ours, dec_bzip2, dec_c];
+/// Ours on one `Decoder` (`Encoder`) for the whole run, as a reader (writer)
+/// keeps one; the two libraries; ours on a new one per call, as they are.
+const NAMES: [&str; 4] = ["ours", "bzip2", "C", "fresh"];
+const N: usize = NAMES.len();
+const DECODERS: [Dec; N] = [dec_ours, dec_bzip2, dec_c, dec_fresh];
 
 thread_local! {
     // One decoder for the whole run, as a reader keeps one.
@@ -57,6 +60,12 @@ thread_local! {
 
 fn dec_ours(src: &[u8], out: &mut [u8]) -> Result<usize, String> {
     OURS.with(|d| d.borrow_mut().decompress(src, out))
+        .map_err(|e| e.to_string())
+}
+
+fn dec_fresh(src: &[u8], out: &mut [u8]) -> Result<usize, String> {
+    bz2ngrs::Decoder::new()
+        .decompress(src, out)
         .map_err(|e| e.to_string())
 }
 
@@ -92,10 +101,10 @@ fn dec_c(src: &[u8], out: &mut [u8]) -> Result<usize, String> {
     }
 }
 
-// ---- the three encoders: a whole input into one stream at a level ----
+// ---- the encoders: a whole input into one stream at a level ----
 
 type Enc = fn(&[u8], &mut Vec<u8>, u32) -> Result<(), String>;
-const ENCODERS: [Enc; 3] = [enc_ours, enc_bzip2, enc_c];
+const ENCODERS: [Enc; N] = [enc_ours, enc_bzip2, enc_c, enc_fresh];
 
 thread_local! {
     // One encoder for the whole run (re-made only if the level changes), as a
@@ -119,6 +128,13 @@ fn enc_ours(src: &[u8], out: &mut Vec<u8>, level: u32) -> Result<(), String> {
         };
         e.compress(src, out);
     });
+    Ok(())
+}
+
+fn enc_fresh(src: &[u8], out: &mut Vec<u8>, level: u32) -> Result<(), String> {
+    let c = bz2ngrs::Compression::new(level).ok_or("bad level")?;
+    out.clear();
+    bz2ngrs::Encoder::new(c).compress(src, out);
     Ok(())
 }
 
@@ -331,11 +347,11 @@ fn pass(op: Op, i: usize, streams: &[Stream], buf: &mut [u8], out: &mut Vec<u8>)
 }
 
 /// Which encoders write a stream that libbz2 decodes to the original bytes,
-/// for every stream; and how many of our streams are byte-identical to
-/// libbz2's (the others differ in the origPtr of exactly periodic blocks).
-fn verify_encode(streams: &[Stream], level: u32) -> ([Result<(), String>; 3], usize) {
-    let mut res = [const { Ok(()) }; 3];
-    let mut identical = 0;
+/// for every stream; and how many of our streams are byte-identical to each
+/// encoder's (libbz2's may differ in the origPtr of exactly periodic blocks).
+fn verify_encode(streams: &[Stream], level: u32) -> ([Result<(), String>; N], [usize; N]) {
+    let mut res = [const { Ok(()) }; N];
+    let mut identical = [0; N];
     let mut out = Vec::new();
     // Ours, to compare with the `bzip2` crate's stream at the same level
     // (a CRAM set's stored block may have been written at another one).
@@ -356,17 +372,16 @@ fn verify_encode(streams: &[Stream], level: u32) -> ([Result<(), String>; 3], us
             }
             if i == 0 {
                 ours[k] = out.clone();
-            } else if i == 1 && ours[k] == out {
-                identical += 1;
             }
+            identical[i] += usize::from(ours[k] == out);
         }
     }
     (res, identical)
 }
 
 /// Which decoders reproduce the original bytes on every stream.
-fn verify(streams: &[Stream], buf: &mut [u8]) -> [Result<(), String>; 3] {
-    let mut res = [const { Ok(()) }; 3];
+fn verify(streams: &[Stream], buf: &mut [u8]) -> [Result<(), String>; N] {
+    let mut res = [const { Ok(()) }; N];
     for (i, dec) in DECODERS.iter().enumerate() {
         for (k, s) in streams.iter().enumerate() {
             let out = &mut buf[..s.raw.len()];
@@ -394,22 +409,22 @@ fn verify(streams: &[Stream], buf: &mut [u8]) -> [Result<(), String>; 3] {
 fn measure(
     op: Op,
     streams: &[Stream],
-    ok: [bool; 3],
+    ok: [bool; N],
     rounds: usize,
     min_ms: u128,
     best: bool,
     deadline: Instant,
-) -> [Option<f64>; 3] {
+) -> [Option<f64>; N] {
     let total: usize = streams.iter().map(|s| s.raw.len()).sum();
     let mut buf = vec![0u8; streams.iter().map(|s| s.raw.len()).max().unwrap_or(0)];
     let mut out = Vec::new();
-    let mut samples: [Vec<f64>; 3] = Default::default();
+    let mut samples: [Vec<f64>; N] = Default::default();
     for r in 0..rounds {
         if r > 0 && Instant::now() >= deadline {
             break;
         }
-        for k in 0..3 {
-            let i = (k + r) % 3;
+        for k in 0..N {
+            let i = (k + r) % N;
             if !ok[i] {
                 continue;
             }
@@ -441,7 +456,7 @@ struct Row {
     chunk: String,
     n: usize,
     bytes: usize,
-    mbps: [Option<f64>; 3],
+    mbps: [Option<f64>; N],
 }
 
 fn cell(v: Option<f64>, failed: &str) -> String {
@@ -457,33 +472,37 @@ fn ratio(a: Option<f64>, b: Option<f64>) -> String {
 
 impl Row {
     fn md(&self) -> String {
-        let [o, z, c] = self.mbps;
+        let [o, z, c, f] = self.mbps;
         format!(
-            "| {} | {} | {} | {:.2} | {} | {} | {} | {} | {} |",
+            "| {} | {} | {} | {:.2} | {} | {} | {} | {} | {} | {} | {} |",
             self.set,
             self.chunk,
             self.n,
             self.bytes as f64 / 1e6,
             cell(o, "FAILED/stub"),
+            cell(f, "FAILED"),
             cell(z, "FAILED"),
             cell(c, "FAILED"),
             ratio(o, c),
+            ratio(f, c),
             ratio(o, z),
         )
     }
     fn tsv(&self) -> String {
         let f = |v: Option<f64>| v.map_or("NA".into(), |v| format!("{v:.2}"));
-        let [o, z, c] = self.mbps;
+        let [o, z, c, fr] = self.mbps;
         format!(
-            "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+            "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
             self.set,
             self.chunk,
             self.n,
             self.bytes,
             f(o),
+            f(fr),
             f(z),
             f(c),
             ratio(o, c),
+            ratio(fr, c),
             ratio(o, z)
         )
     }
@@ -517,7 +536,7 @@ fn usage() -> ! {
     eprintln!(
         "usage: bz2ngrs-bench [--op decode|encode] [--sets MC,XA,QUAL,cram] [--chunks 16k,64k,1m,whole,slices,blocks]\n\
          \x20  [--samples NA12878,NA19141] [--rounds 5] [--level 9] [--min-ms 30] [--max-bytes N (0 = all)]\n\
-         \x20  [--data DIR] [--manifest FILE] [--tsv FILE] [--decoders ours,bzip2,C] [--stat median|max]\n\
+         \x20  [--data DIR] [--manifest FILE] [--tsv FILE] [--decoders ours,fresh,bzip2,C] [--stat median|max]\n\
          \x20  [--time-limit SECONDS (0 = none)]"
     );
     std::process::exit(2)
@@ -536,7 +555,7 @@ fn parse_args() -> Opts {
         data: "/Users/pascal/code/tfenne/bz2-ng/data/corpora/1kg".into(),
         manifest: "/Users/pascal/Code/softleif/bz2ngrs/corpus/cram-bzip2/manifest.tsv".into(),
         tsv: None,
-        decoders: list("ours,bzip2,C"),
+        decoders: list("ours,fresh,bzip2,C"),
         best: false,
         op: Op::Decode,
         time_limit: 60,
@@ -606,11 +625,11 @@ fn main() {
 
     let mut rows: Vec<Row> = Vec::new();
     let mut tsv = String::from(
-        "set\tchunk\tstreams\tbytes\tours_MBps\tbzip2_MBps\tC_MBps\tours/C\tours/bzip2\n",
+        "set\tchunk\tstreams\tbytes\tours_MBps\tfresh_MBps\tbzip2_MBps\tC_MBps\tours/C\tfresh/C\tours/bzip2\n",
     );
-    let mut first_err: [Option<String>; 3] = Default::default();
+    let mut first_err: [Option<String>; N] = Default::default();
     println!(
-        "{}, level {}, {} rounds, MB/s of uncompressed data (MB = 10^6 B), {}\n",
+        "{}, level {}, {} rounds, {}, MB/s of uncompressed data (MB = 10^6 B), {}\n",
         if o.op == Op::Decode {
             "decode"
         } else {
@@ -618,10 +637,17 @@ fn main() {
         },
         o.level,
         o.rounds,
+        if o.max_bytes == 0 {
+            "whole corpus files".to_string()
+        } else {
+            format!("first {} bytes of each corpus file", o.max_bytes)
+        },
         if o.best { "best" } else { "median" }
     );
-    println!("| set | chunk | streams | MB | ours | bzip2 | C | ours/C | ours/bzip2 |");
-    println!("|---|---|---:|---:|---:|---:|---:|---:|---:|");
+    println!(
+        "| set | chunk | streams | MB | ours | fresh | bzip2 | C | ours/C | fresh/C | ours/bzip2 |"
+    );
+    println!("|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|");
 
     let mut run = |set: &str, chunk: &str, streams: Vec<Stream>| {
         let mut buf = vec![0u8; streams.iter().map(|s| s.raw.len()).max().unwrap_or(0)];
@@ -629,10 +655,11 @@ fn main() {
             Op::Decode => verify(&streams, &mut buf),
             Op::Encode(level) => {
                 let (v, identical) = verify_encode(&streams, level);
-                if v[0].is_ok() && identical < streams.len() {
+                let n = streams.len();
+                if v[0].is_ok() && identical[1..].iter().any(|&k| k < n) {
                     eprintln!(
-                        "note: {set}/{chunk}: {identical} of {} of our streams byte-identical to libbz2's (the rest differ in the origPtr of exactly periodic blocks)",
-                        streams.len()
+                        "note: {set}/{chunk}: of {n} streams of ours, {} are byte-identical to libbz2's (the rest differ in the origPtr of exactly periodic blocks), {} to bz2-ng's, {} to a fresh encoder's",
+                        identical[1], identical[2], identical[3]
                     );
                 }
                 v
@@ -716,15 +743,16 @@ fn main() {
 
     // Per-call cost: ns per call on the 16 KiB sets, and the empty stream (pure
     // init + teardown) as the fixed part.
-    println!("\nPer-call cost, ns/call (ours | bzip2 | C):\n");
-    println!("| stream | ours | bzip2 | C |");
-    println!("|---|---:|---:|---:|");
+    println!("\nPer-call cost, ns/call:\n");
+    println!("| stream | ours | fresh | bzip2 | C |");
+    println!("|---|---:|---:|---:|---:|");
     let ns = |v: Option<f64>, f: &str| v.map_or(f.to_string(), |v| format!("{v:.0}"));
     for r in rows.iter().filter(|r| r.chunk == "16k") {
         println!(
-            "| {} 16 KiB | {} | {} | {} |",
+            "| {} 16 KiB | {} | {} | {} | {} |",
             r.set,
             ns(ns_per_call(r, 0), "FAILED/stub"),
+            ns(ns_per_call(r, 3), "FAILED"),
             ns(ns_per_call(r, 1), "FAILED"),
             ns(ns_per_call(r, 2), "FAILED")
         );
@@ -746,8 +774,8 @@ fn main() {
             _ if Instant::now() >= deadline => "skipped (time limit)".to_string(),
             Err(_) => (if i == 0 { "FAILED/stub" } else { "FAILED" }).to_string(),
             Ok(()) => {
-                // An encoder allocates its block arrays per call (C, bzip2)
-                // or once (ours), so far fewer calls fill the same time.
+                // An encoder allocates its block arrays per call (C, bzip2,
+                // fresh) or once (ours), so far fewer calls fill the same time.
                 let calls = if o.op == Op::Decode { 20_000 } else { 1_000 };
                 let mut best = f64::MAX;
                 for _ in 0..o.rounds.max(3) {
@@ -774,7 +802,7 @@ fn main() {
         });
     }
     println!(
-        "| empty {} ({} B), fixed cost | {} | {} | {} |",
+        "| empty {} ({} B), fixed cost | {} | {} | {} | {} |",
         if o.op == Op::Decode {
             "stream"
         } else {
@@ -782,6 +810,7 @@ fn main() {
         },
         empty[0].comp.len(),
         cells[0],
+        cells[3],
         cells[1],
         cells[2]
     );
