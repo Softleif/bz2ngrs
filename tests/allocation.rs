@@ -5,25 +5,37 @@
 #![allow(unsafe_code, reason = "a counting GlobalAlloc has no safe form")]
 
 use std::alloc::{GlobalAlloc, Layout, System};
+use std::cell::Cell;
 use std::io::Write;
-use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
 
 use bz2ngrs::{Compression, Decoder, Encoder};
 
 struct Counting;
 
-static ALLOCS: AtomicUsize = AtomicUsize::new(0);
+thread_local! {
+    // Per thread, so that the test harness's other threads, which may
+    // allocate at any time, are not counted.
+    static ALLOCS: Cell<usize> = const { Cell::new(0) };
+}
+
+fn count() {
+    let _ = ALLOCS.try_with(|n| n.set(n.get() + 1));
+}
+
+fn allocs() -> usize {
+    ALLOCS.with(Cell::get)
+}
 
 // SAFETY: forwards every call to `System` unchanged; the counter is the only
 // addition.
 unsafe impl GlobalAlloc for Counting {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        ALLOCS.fetch_add(1, Relaxed);
+        count();
         // SAFETY: the caller's contract is `System`'s contract.
         unsafe { System.alloc(layout) }
     }
     unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
-        ALLOCS.fetch_add(1, Relaxed);
+        count();
         // SAFETY: as in `alloc`.
         unsafe { System.alloc_zeroed(layout) }
     }
@@ -32,7 +44,7 @@ unsafe impl GlobalAlloc for Counting {
         unsafe { System.dealloc(ptr, layout) }
     }
     unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
-        ALLOCS.fetch_add(1, Relaxed);
+        count();
         // SAFETY: as in `dealloc`, and the caller's contract for `new_size`.
         unsafe { System.realloc(ptr, layout, new_size) }
     }
@@ -42,21 +54,14 @@ unsafe impl GlobalAlloc for Counting {
 static GLOBAL: Counting = Counting;
 
 fn allocations_during<T>(f: impl FnOnce() -> T) -> (usize, T) {
-    let before = ALLOCS.load(Relaxed);
+    let before = allocs();
     let r = f();
-    (ALLOCS.load(Relaxed) - before, r)
+    (allocs() - before, r)
 }
 
 fn assert_send<T: Send>() {}
 
-// One test function: the counter is global, so tests running in parallel
-// threads would count each other's allocations.
 #[test]
-fn allocates_on_first_use_only() {
-    decoder_allocates_on_first_decode_only();
-    encoder_allocates_on_first_compress_only();
-}
-
 fn encoder_allocates_on_first_compress_only() {
     assert_send::<Encoder>();
 
@@ -134,6 +139,7 @@ fn encoder_allocates_on_first_compress_only() {
     }
 }
 
+#[test]
 fn decoder_allocates_on_first_decode_only() {
     assert_send::<Decoder>();
 
