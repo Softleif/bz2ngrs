@@ -12,7 +12,7 @@ use std::cell::RefCell;
 use bz2ngrs::Compression;
 use fearless_simd::Level;
 
-use super::oracle::{Reference, block_starts, read_bits, reference};
+use super::oracle::{Decoder, Reference, block_starts, check_exact, read_bits, reference};
 
 /// One way of making a `bz2ngrs::Encoder`: `Encoder::new()`, or a fixed SIMD
 /// level. Each thread keeps one long-lived encoder per variant and
@@ -171,13 +171,9 @@ fn z_function(s: &[u8]) -> Vec<usize> {
     z
 }
 
-/// The origPtr of `block`: the last row, among its sorted rotations, that
-/// holds the block itself. A block `u^m` with `u` primitive has the `p = |u|`
-/// rotations of `u`, each `m` times over and in their order; so the rows
-/// below the block number `m * c`, `c` being the rotations of `u` below `u`
-/// (read off the Z-function of `uu`), and the block's `m` tied rows are the
-/// next `m`. Shares nothing with the sorter.
-fn last_tied_row(block: &[u8]) -> usize {
+/// The length of the primitive root `u` of `block = u^m`, from its longest
+/// border.
+fn root_len(block: &[u8]) -> usize {
     let n = block.len();
     let mut border = vec![0; n + 1];
     for i in 1..n {
@@ -187,10 +183,29 @@ fn last_tied_row(block: &[u8]) -> usize {
         }
         border[i + 1] = k + usize::from(block[i] == block[k]);
     }
-    let p = match n - border[n] {
+    match n - border[n] {
         p if n.is_multiple_of(p) => p,
         _ => n,
-    };
+    }
+}
+
+/// How many of the RLE1 blocks of `data` at `level` are exactly periodic.
+pub fn periodic_blocks(data: &[u8], level: u32) -> usize {
+    rle1_blocks(data, level)
+        .iter()
+        .filter(|b| root_len(b) < b.len())
+        .count()
+}
+
+/// The origPtr of `block`: the last row, among its sorted rotations, that
+/// holds the block itself. A block `u^m` with `u` primitive has the `p = |u|`
+/// rotations of `u`, each `m` times over and in their order; so the rows
+/// below the block number `m * c`, `c` being the rotations of `u` below `u`
+/// (read off the Z-function of `uu`), and the block's `m` tied rows are the
+/// next `m`. Shares nothing with the sorter.
+fn last_tied_row(block: &[u8]) -> usize {
+    let n = block.len();
+    let p = root_len(block);
     let uu = [&block[..p], &block[..p]].concat();
     let z = z_function(&uu);
     let below = (1..p)
@@ -259,6 +274,29 @@ pub fn check_matches_libbz2(who: &str, ours: &[u8], data: &[u8], level: u32) {
             "{who}: a block with another origPtr decodes to other bytes"
         ),
         other => panic!("{who}: libbz2 rejects a stream that differs in an origPtr: {other:?}"),
+    }
+}
+
+/// A fresh encoder of the first variant writes libbz2's stream for `data`
+/// at `level` (up to the origPtr of exactly periodic blocks), our decoder
+/// reads it back, and the long-lived encoders of the other variants write
+/// the same. The stream checked against libbz2 owes nothing to earlier
+/// calls, so a failure replays in a new process; a long-lived encoder that
+/// disagrees depends on earlier calls, or its SIMD level disagrees.
+pub fn check_all(encoders: &[Encoder], data: &[u8], level: u32) {
+    let Some((first, rest)) = encoders.split_first() else {
+        return;
+    };
+    let stream = first.run_fresh(data, level);
+    check_matches_libbz2(&first.name(), &stream, data, level);
+    check_exact(Decoder::New, &stream, data);
+    for e in rest {
+        assert!(
+            e.run(data, level) == stream,
+            "{} (long-lived) and a fresh {} write different streams at level {level}",
+            e.name(),
+            first.name()
+        );
     }
 }
 

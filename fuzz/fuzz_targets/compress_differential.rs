@@ -1,14 +1,13 @@
 #![no_main]
 
-//! Arbitrary data at an arbitrary level: every encoder (`Encoder::new()` and
-//! every SIMD level, each long-lived) writes the same stream, it is libbz2's
-//! up to the origPtr of exactly periodic blocks, and our decoder reads it
-//! back. `repeat` tiles the data so that small inputs reach several blocks
+//! Arbitrary data at an arbitrary level: a fresh `Encoder::new()` writes
+//! libbz2's stream up to the origPtr of exactly periodic blocks, our decoder
+//! reads it back, and a long-lived encoder at every SIMD level writes the
+//! same (`enc_oracle::check_all`). `repeat` tiles the data so that small inputs reach several blocks
 //! and long runs.
 
 use arbitrary::Arbitrary;
-use bz2ngrs_fuzz::enc_oracle::{all_encoders, check_matches_libbz2};
-use bz2ngrs_fuzz::oracle::{Decoder, check_exact};
+use bz2ngrs_fuzz::enc_oracle::{all_encoders, check_all};
 use libfuzzer_sys::fuzz_target;
 
 #[derive(Debug, Arbitrary)]
@@ -29,16 +28,5 @@ fuzz_target!(|input: Input| {
         .cycle()
         .take((input.data.len() * times).min(2 << 20))
         .collect();
-    let encoders = all_encoders();
-    let stream = encoders[0].run(&data, level);
-    for e in &encoders[1..] {
-        assert!(
-            e.run(&data, level) == stream,
-            "{} differs from {}",
-            e.name(),
-            encoders[0].name()
-        );
-    }
-    check_matches_libbz2(&encoders[0].name(), &stream, &data, level);
-    check_exact(Decoder::New, &stream, &data);
+    check_all(&all_encoders(), &data, level);
 });

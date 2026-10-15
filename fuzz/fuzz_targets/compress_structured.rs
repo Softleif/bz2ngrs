@@ -7,8 +7,7 @@
 //! `compress_differential`.
 
 use arbitrary::Arbitrary;
-use bz2ngrs_fuzz::enc_oracle::{all_encoders, check_matches_libbz2};
-use bz2ngrs_fuzz::oracle::{Decoder, check_exact};
+use bz2ngrs_fuzz::enc_oracle::{all_encoders, check_all};
 use libfuzzer_sys::fuzz_target;
 
 #[derive(Debug, Arbitrary)]
@@ -57,16 +56,5 @@ fuzz_target!(|input: Input| {
             break;
         }
     }
-    let encoders = all_encoders();
-    let stream = encoders[0].run(&data, level);
-    for e in &encoders[1..] {
-        assert!(
-            e.run(&data, level) == stream,
-            "{} differs from {}",
-            e.name(),
-            encoders[0].name()
-        );
-    }
-    check_matches_libbz2(&encoders[0].name(), &stream, &data, level);
-    check_exact(Decoder::New, &stream, &data);
+    check_all(&all_encoders(), &data, level);
 });

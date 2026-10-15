@@ -15,7 +15,7 @@ a long-lived `Decoder` (one per process and SIMD level, so state left by earlier
 | `decompress_differential` | arbitrary bytes | the rule above, `cap = 4 * len + 1 MB` |
 | `decompress_mutated` | arbitrary data, level, and structured edits (bit flip, byte set, truncate, insert, delete, block-size digit, block CRC, stream CRC) of its compressed stream | the rule above |
 | `roundtrip` | arbitrary data, level, repeat count | libbz2-compressed data decodes to the same bytes into an exact `out` |
-| `compress_differential` | arbitrary data, level, repeat count | every encoder (`Encoder::new()` and every level, long-lived) writes the same stream; it is libbz2's up to the origPtr of exactly periodic blocks (`tests/common/enc_oracle.rs`), and our decoder reads it back |
+| `compress_differential` | arbitrary data, level, repeat count | a fresh `Encoder::new()` writes libbz2's stream up to the origPtr of exactly periodic blocks (`tests/common/enc_oracle.rs`), our decoder reads it back, and a long-lived encoder at every level writes the same |
 | `compress_structured` | runs around the RLE1 lengths, repeated patterns and literals, levels 1 and 2 | as `compress_differential`, reaching block boundaries and periodic blocks sooner |
 
 ## Run
