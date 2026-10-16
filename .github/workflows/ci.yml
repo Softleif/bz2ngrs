@@ -44,6 +44,26 @@ jobs:
           RUSTDOCFLAGS: -D warnings
         run: cargo doc --locked --workspace --exclude bz2ngrs-bench --no-deps --examples
 
+  # The library builds on the `rust-version` in Cargo.toml; the tests and
+  # their dev-dependencies need the pinned toolchain. `+1.89` wins over
+  # rust-toolchain.toml.
+  msrv:
+    name: MSRV (${{ matrix.runner }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-latest, ubuntu-24.04-arm]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f # v2.0.0
+        with:
+          toolchain: "1.89"
+          cache-key: msrv
+      - run: cargo +1.89 check --locked -p bz2ngrs --lib
+
   # The CRC and SIMD code is cfg'd per architecture, so lint on both.
   clippy:
     name: clippy (${{ matrix.runner }})
