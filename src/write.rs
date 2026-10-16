@@ -8,22 +8,18 @@ use crate::{Compression, Encoder, enc};
 /// Compresses everything written to it as one bzip2 stream into an inner
 /// writer.
 ///
-/// The stream is byte-identical to what [`Encoder::compress`] writes for the
-/// concatenation of all the input, however the input is split into `write`
-/// calls. Call [`finish`](CompressWriter::finish) to end the stream and to
-/// see its errors; a writer that is dropped first ends the stream as well,
-/// but ignores errors, as `flate2` does.
+/// The stream is what [`Encoder::compress`] writes for all the input at
+/// once, however the input is split into `write` calls.
 ///
-/// Output appears one block at a time: nothing reaches the inner writer
-/// until a block (`level` × 100 kB of run-length-coded input) is full and
-/// more input follows it. The writer holds that block, about 10 bytes of
-/// working memory per byte of it, and the compressed bytes the inner writer
-/// has not accepted yet. A single large `write` call is compressed in full
-/// before it returns, so that much compressed output is buffered if the
-/// inner writer refuses it.
+/// Call [`finish`](CompressWriter::finish) to end the stream and see its
+/// errors; dropping the writer ends the stream but ignores errors, as
+/// `flate2` does.
 ///
-/// An error from the inner writer loses no output: the bytes are kept and
-/// the next call retries them, in order.
+/// Output reaches the inner writer one block at a time, once the block
+/// (`level` × 100 kB of run-length-coded input) is full. The writer holds
+/// that block, about 10 bytes of working memory per byte of it, and any
+/// compressed bytes the inner writer has not accepted yet; those are
+/// retried on the next call, so an inner error loses nothing.
 ///
 /// # Examples
 ///

@@ -13,30 +13,25 @@ use crate::{Decoder, Error};
 /// reader read more and decode the block again.
 const READ_AHEAD: usize = 1 << 20;
 
-/// Decompresses the bzip2 data that a reader yields.
+/// Decompresses the bzip2 data in a reader: one stream or several back to
+/// back, to the end of `inner`.
 ///
-/// It reads all of `inner` until its end: one bzip2 stream or several back
-/// to back (as `pbzip2`, `lbzip2` and `cat a.bz2 b.bz2` make them). Every
-/// byte must belong to a stream, so data after the last stream is an error,
-/// as with the `bzip2` crate's `MultiBzDecoder`.
+/// Data after the last stream is an error, as with the `bzip2` crate's
+/// `MultiBzDecoder`.
 ///
-/// Output comes one block at a time: each block is decoded whole and its CRC
-/// checked before any of its bytes are returned, so a corrupt block yields an
-/// error and none of its bytes. The reader holds the decoder's working memory
-/// (about 6 MiB), about 1 MiB of compressed input read ahead, and the
-/// current block's output (about 1 MB at level 9 for typical data). It reads
-/// `inner` in large pieces, so wrapping `inner` in a `BufReader` gains
-/// nothing.
-///
-/// It also implements [`BufRead`], whose [`fill_buf`](BufRead::fill_buf)
+/// Each block is decoded whole and its CRC checked before any of its bytes
+/// are returned. The reader holds the decoder's working memory (about
+/// 6 MiB), about 1 MiB of input read ahead and the current block's output.
+/// It reads `inner` in large pieces, so a `BufReader` around it gains
+/// nothing. It is also a [`BufRead`], whose [`fill_buf`](BufRead::fill_buf)
 /// hands out the decoded block without a copy.
 ///
-/// Errors are [`io::Error`]s that wrap the [`Error`] (get it back with
-/// [`io::Error::get_ref`] and `downcast_ref`). [`Error::UnexpectedEof`] is
-/// [`io::ErrorKind::UnexpectedEof`], other bad input
-/// [`io::ErrorKind::InvalidData`]; their positions count from the first byte
-/// read. Once the data turns out bad, every later read fails the same way.
-/// An error from `inner` is passed on as it is, and a later read retries.
+/// Errors are [`io::Error`]s that wrap the [`Error`] (see
+/// [`io::Error::get_ref`]): [`io::ErrorKind::UnexpectedEof`] for
+/// [`Error::UnexpectedEof`], [`io::ErrorKind::InvalidData`] for other bad
+/// input, with positions counted from the first byte read. Bad data fails
+/// every later read too; an error from `inner` is passed on and the next
+/// read retries.
 ///
 /// # Examples
 ///

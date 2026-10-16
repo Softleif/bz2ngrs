@@ -47,28 +47,15 @@ pub use write::CompressWriter;
 
 use decode::Scratch;
 
-/// Reusable decoder state for compressed data in memory. Keep one per thread
-/// and reuse it for every stream: it owns the working memory a decode needs
-/// (about 6 MiB of address space). For a single stream,
-/// `Decoder::new().decompress(src, out)` allocates that memory, uses it once
-/// and frees it. To decode from a file or socket, use [`DecompressReader`].
+/// Decoder for bzip2 data in memory; [`DecompressReader`] decodes from a
+/// `Read`.
 ///
-/// Which method fits:
+/// It owns the working memory of a decode (about 6 MiB), allocated
+/// on the first call and kept until it is dropped, so keep one per thread
+/// and reuse it. The SIMD level is chosen in [`Decoder::new`]. The crate
+/// docs say which method fits which input.
 ///
-/// | the input | method |
-/// |---|---|
-/// | one stream whose decompressed size is known (a container header declares it) | [`decompress`](Decoder::decompress), [`decompress_to_vec`](Decoder::decompress_to_vec) |
-/// | a whole `.bz2` file of unknown size, perhaps of several streams (`pbzip2`, `lbzip2`) | [`decompress_all`](Decoder::decompress_all), [`decompress_all_to_vec`](Decoder::decompress_all_to_vec) |
-/// | a stream followed by other data | [`decompress_prefix`](Decoder::decompress_prefix) |
-///
-/// Nothing is allocated until the first decode, so [`Decoder::new`] is free
-/// and a reader that never meets bzip2 pays nothing. The memory then lives
-/// until the `Decoder` is dropped, and is never shrunk in between. The SIMD
-/// level is chosen once, in [`Decoder::new`].
-///
-/// A result never depends on earlier calls: a `Decoder` that has decoded
-/// other streams, or failed on them, gives the same answer as a new one. It
-/// is `Send`, so a reader can move to another thread with its decoder.
+/// A result never depends on earlier calls, failed ones included.
 ///
 /// # Examples
 ///
@@ -79,11 +66,11 @@ use decode::Scratch;
 /// let stream = Encoder::new(Compression::BEST).compress_to_vec(data);
 ///
 /// let mut decoder = Decoder::new();
-/// // The decompressed size is known: allocate it, decode into it.
+/// // The decompressed size is known.
 /// assert_eq!(decoder.decompress_to_vec(&stream, data.len()).unwrap(), data);
-/// // It is not: let the output grow, up to a bound.
+/// // It is not: the output grows, up to a bound.
 /// assert_eq!(decoder.decompress_all_to_vec(&stream, 1 << 30).unwrap(), data);
-/// // Later calls reuse the same memory.
+/// // Into a caller's buffer.
 /// let mut out = [0u8; 64];
 /// let n = decoder.decompress(&stream, &mut out).unwrap();
 /// assert_eq!(&out[..n], data);
@@ -131,13 +118,9 @@ impl Decoder {
     /// output would pass `out.len()`; a corrupt stream may report its
     /// corruption first.
     ///
-    /// Never panics, whatever `src` holds (a failure to allocate the working
-    /// memory on the first call aborts, as Rust's allocation failures do). On
-    /// success the bytes of `out` past the returned length are untouched. On
-    /// error the contents of `out` are unspecified.
-    ///
-    /// A caller that pools its output buffers keeps each one at full length
-    /// and reads `out[..n]`; this call never zeroes or resizes `out`.
+    /// Never panics, whatever `src` holds. On success the bytes of `out`
+    /// past the returned length are untouched; on error `out` is
+    /// unspecified.
     pub fn decompress(&mut self, src: &[u8], out: &mut [u8]) -> Result<usize, Error> {
         self.decompress_prefix(src, out).map(|d| d.written)
     }
@@ -170,12 +153,10 @@ impl Decoder {
     /// `pbzip2`, `lbzip2` and `cat a.bz2 b.bz2` make them), and appends the
     /// bytes to `out`. Returns how many it appended.
     ///
-    /// For input whose decompressed size is not known. `out` grows one block
-    /// at a time, by about what the block needs, and at most by `limit`
-    /// bytes in all: a stream that decodes to more is
-    /// [`Error::OutputTooSmall`] with `capacity: limit`. bzip2 can expand
-    /// data by a factor of thousands, so input from elsewhere needs a
-    /// `limit` its reader can afford; `usize::MAX` trusts the input.
+    /// `out` grows one block at a time and by at most `limit` bytes in all:
+    /// a stream that decodes to more is [`Error::OutputTooSmall`] with
+    /// `capacity: limit`. bzip2 can expand data a thousandfold, so untrusted
+    /// input needs a `limit` the caller can afford; `usize::MAX` trusts it.
     ///
     /// Every byte of `src` must belong to a stream: bytes after a stream
     /// that do not start another are [`Error::NotBzip2`] (or
@@ -216,16 +197,11 @@ impl Decoder {
         Ok(out)
     }
 
-    /// Decompresses the stream at the start of `src` into a new `Vec`, for
-    /// a stream whose decompressed size is declared (as a CRAM block header
-    /// declares it). Allocates `size` bytes, decodes, and truncates to the
-    /// bytes written. A stream shorter than `size` is allowed, which a
-    /// caller that wants exact sizes checks with `len()`. A longer one is
-    /// [`Error::OutputTooSmall`] with `capacity: size`.
-    ///
-    /// `size` comes from the file being read, so a caller that distrusts it
-    /// bounds it first: the allocation is `size` bytes, and its failure
-    /// aborts. The `Vec` keeps capacity `size` even when shorter.
+    /// Decompresses the stream at the start of `src` into a new `Vec` of
+    /// capacity `size`, for a stream whose decompressed size is declared
+    /// (as a CRAM block header does). A shorter stream gives a shorter
+    /// `Vec`; a longer one is [`Error::OutputTooSmall`] with `capacity:
+    /// size`. `size` is allocated up front, so bound it if it is untrusted.
     ///
     /// ```
     /// use std::io::Write;
@@ -295,24 +271,21 @@ impl Default for Compression {
     }
 }
 
-/// Reusable encoder state for whole inputs; [`CompressWriter`] compresses a
-/// stream written piece by piece. Keep one per writer or thread and reuse it for
-/// every stream: it owns the working memory a compression needs, about 10
-/// bytes per byte of the largest block it has met (9 MB at level 9; a short
-/// input needs a block only as large as itself).
+/// Encoder for whole inputs in memory; [`CompressWriter`] compresses a
+/// `Write` piece by piece.
 ///
-/// Nothing is allocated until the first call, and the memory then lives
-/// until the `Encoder` is dropped. The SIMD level is chosen once, in
-/// [`Encoder::new`]. A result never depends on earlier calls.
+/// It owns the working memory of a compression,
+/// about 10 bytes per byte of the largest block it has met (9 MB at level
+/// 9), allocated on the first call and kept until it is dropped, so keep
+/// one per thread and reuse it. A result never depends on earlier calls.
 ///
-/// The output is byte-identical to what libbz2 1.0.8 writes for the same
-/// input and level in one call (`BZ2_bzBuffToBuffCompress`, or one
-/// `BZ_FINISH`), with one exception. A block that is exactly periodic after
-/// libbz2's first run-length stage (a string repeated a whole number of
-/// times, such as all zeros) has several valid BWT origins, and libbz2's
-/// choice depends on which of its sorters ran. This always writes the last
-/// of the tied rows, as bz2-ng does. Such streams differ in those 24 bits
-/// only and decode identically.
+/// The output is byte-identical to libbz2 1.0.8's for one
+/// `BZ2_bzBuffToBuffCompress` of the same input and level, with one
+/// exception. A block that is exactly periodic after run-length coding (a
+/// string repeated a whole number of times, such as all zeros) has several
+/// valid BWT origins, and libbz2's choice depends on which of its sorters
+/// ran. This always writes the last of the tied rows, as bz2-ng does. The
+/// streams differ in those 24 bits only and decode identically.
 ///
 /// # Examples
 ///
@@ -324,7 +297,7 @@ impl Default for Compression {
 /// let stream = encoder.compress_to_vec(data);
 /// assert_eq!(Decoder::new().decompress_to_vec(&stream, data.len()).unwrap(), data);
 ///
-/// // Later streams reuse the same memory, and can go to the end of a buffer.
+/// // Appended to a buffer.
 /// let mut block = b"header".to_vec();
 /// encoder.compress(data, &mut block);
 /// assert_eq!(&block[6..], stream);
@@ -359,11 +332,9 @@ impl Encoder {
     }
 
     /// Compresses all of `src` as one bzip2 stream and appends it to `out`.
-    /// Never fails: any input, empty included, has a stream.
-    ///
-    /// While a block is coded, `out` is grown to that block's worst case
-    /// (about 2.1 bytes per byte of block, so up to 2 MB at level 9) and cut
-    /// back afterwards, so its capacity may end up larger than the stream.
+    /// Cannot fail. `out` is grown to each block's worst case (up to 2 MB
+    /// at level 9) while the block is coded, so its capacity may end up
+    /// larger than the stream.
     pub fn compress(&mut self, src: &[u8], out: &mut Vec<u8>) {
         let sc = self.scratch.get_or_insert_with(enc::Scratch::new_boxed);
         let level = self.compression.0;
