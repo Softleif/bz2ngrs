@@ -38,7 +38,8 @@ use core::fmt;
 #[non_exhaustive]
 pub enum Error {
     /// The input does not start with `BZh1` to `BZh9` (libbz2's
-    /// `BZ_DATA_ERROR_MAGIC`). Input that ends inside those four bytes is
+    /// `BZ_DATA_ERROR_MAGIC`), or, where several streams are read, bytes
+    /// after a stream do not. Input that ends inside those four bytes is
     /// [`Error::UnexpectedEof`] instead.
     NotBzip2,
     /// The stream breaks a format rule.
@@ -177,6 +178,38 @@ impl fmt::Display for Error {
 }
 
 impl std::error::Error for Error {}
+
+/// [`Error::UnexpectedEof`] is [`std::io::ErrorKind::UnexpectedEof`], every
+/// other error [`std::io::ErrorKind::InvalidData`]; the `io::Error` wraps
+/// the `Error`.
+impl From<Error> for std::io::Error {
+    fn from(e: Error) -> Self {
+        let kind = match e {
+            Error::UnexpectedEof { .. } => std::io::ErrorKind::UnexpectedEof,
+            _ => std::io::ErrorKind::InvalidData,
+        };
+        std::io::Error::new(kind, e)
+    }
+}
+
+impl Error {
+    /// The error with its position moved `bits` later, for input that was
+    /// decoded from a window into it.
+    pub(crate) fn offset(self, bits: u64) -> Error {
+        let shift = |at: Position| Position {
+            bit: at.bit.saturating_add(bits),
+            ..at
+        };
+        match self {
+            Error::Corrupt { kind, at } => Error::Corrupt {
+                kind,
+                at: shift(at),
+            },
+            Error::UnexpectedEof { at } => Error::UnexpectedEof { at: shift(at) },
+            e => e,
+        }
+    }
+}
 
 /// A failure as the decoder's helpers see it, before the block index, the
 /// reader position and the output capacity are known. One byte, like the

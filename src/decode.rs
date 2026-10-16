@@ -87,84 +87,115 @@ fn expect(br: &mut Bits, bytes: &[u8], why: Fail) -> Result<(), Fail> {
     Ok(())
 }
 
-/// Decodes the stream at the start of `src` into `out`.
-#[fearless_simd_macros::simd]
-pub(crate) fn decode_stream<S: Simd>(
-    simd: S,
-    src: &[u8],
-    out: &mut [u8],
-    sc: &mut Scratch,
-) -> Result<usize, Error> {
-    let mut br = Bits::new(src);
-    let mut block = 0u32;
-    // Returns the public error for a `Fail`, from scalars read off the reader
-    // on the cold path.
-    macro_rules! bail {
-        ($f:expr) => {
-            return Err(error::raise(
-                $f,
-                block,
-                br.consumed(),
-                br.len_bits(),
-                out.len(),
-            ))
-        };
+/// A stream being decoded: what its header fixed, and its blocks so far.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Stream {
+    /// The most bytes of text a block may hold.
+    nmax: u32,
+    /// 0-based index of the next block.
+    block: u32,
+    /// The stream CRC combined from the blocks so far.
+    combined: u32,
+}
+
+/// A block decoded as far as its text, which is in `Scratch::text`.
+#[derive(Clone, Copy)]
+pub(crate) struct Text {
+    len: u32,
+    crc: u32,
+}
+
+impl Text {
+    /// The most bytes the text can decode to: at most one text byte in five
+    /// is a count, and four equal bytes and their count decode to 4 + 255.
+    fn max_output(self) -> usize {
+        (self.len as usize).div_ceil(5) * 259
     }
-    macro_rules! check {
-        ($r:expr) => {
-            match $r {
-                Ok(v) => v,
-                Err(f) => bail!(f),
-            }
-        };
+}
+
+/// The public error for `f`, from scalars read off the reader on the cold
+/// path.
+#[inline(always)]
+fn raise(f: Fail, block: u32, br: &Bits, capacity: usize) -> Error {
+    error::raise(f, block, br.consumed(), br.len_bits(), capacity)
+}
+
+impl Stream {
+    /// Reads the stream header at the reader's position.
+    #[inline(always)]
+    pub(crate) fn start(br: &mut Bits) -> Result<Stream, Error> {
+        if let Err(f) = expect(br, b"BZh", Fail::NotBzip2) {
+            return Err(raise(f, 0, br, 0));
+        }
+        let digit = br.get(8).wrapping_sub(u32::from(b'0'));
+        if !(1..=9).contains(&digit) {
+            return Err(raise(fail(br, Fail::NotBzip2), 0, br, 0));
+        }
+        Ok(Stream {
+            nmax: 100_000 * digit,
+            block: 0,
+            combined: 0,
+        })
     }
-    check!(expect(&mut br, b"BZh", Fail::NotBzip2));
-    let digit = br.get(8).wrapping_sub(u32::from(b'0'));
-    if !(1..=9).contains(&digit) {
-        bail!(fail(&br, Fail::NotBzip2));
-    }
-    let nmax = 100_000 * digit;
-    let mut o = 0usize;
-    let mut combined = 0u32;
-    loop {
+
+    /// Decodes the next block as far as its text, into `sc`. At the
+    /// end-of-stream marker instead checks the combined CRC and returns
+    /// `None`, with the reader just past the CRC; the rest of that byte is
+    /// padding.
+    #[inline(always)]
+    pub(crate) fn next<S: Simd>(
+        &mut self,
+        simd: S,
+        br: &mut Bits,
+        sc: &mut Scratch,
+    ) -> Result<Option<Text>, Error> {
+        let block = self.block;
+        macro_rules! check {
+            ($r:expr) => {
+                match $r {
+                    Ok(v) => v,
+                    Err(f) => return Err(raise(f, block, br, 0)),
+                }
+            };
+        }
         let b = br.get(8);
         if b == 0x17 {
             check!(expect(
-                &mut br,
+                br,
                 &[0x72, 0x45, 0x38, 0x50, 0x90],
                 Fail::Corrupt(Corruption::BlockMagic)
             ));
             let stored = br.get(32);
             if br.overrun() {
-                bail!(Fail::Eof);
+                return Err(raise(Fail::Eof, block, br, 0));
             }
-            return if stored == combined {
-                Ok(o)
+            return if stored == self.combined {
+                Ok(None)
             } else {
                 Err(Error::StreamCrc {
                     stored,
-                    computed: combined,
+                    computed: self.combined,
                 })
             };
         }
         if b != 0x31 {
-            bail!(corrupt(&br, Corruption::BlockMagic));
+            check!(Err(corrupt(br, Corruption::BlockMagic)));
         }
         check!(expect(
-            &mut br,
+            br,
             &[0x41, 0x59, 0x26, 0x53, 0x59],
             Fail::Corrupt(Corruption::BlockMagic)
         ));
-        let stored_crc = br.get(32);
+        let crc = br.get(32);
         let randomised = br.get(1) != 0;
         let orig_ptr = br.get(24);
-        if orig_ptr > 10 + nmax {
-            bail!(corrupt(&br, Corruption::OrigPtr));
+        if orig_ptr > 10 + self.nmax {
+            check!(Err(corrupt(br, Corruption::OrigPtr)));
         }
-        let (eob, n_selectors) = check!(block_tables(simd, &mut br, sc));
-        let n = check!(symbols(simd, &mut br, sc, eob, n_selectors, nmax));
+        let (eob, n_selectors) = check!(block_tables(simd, br, sc));
+        let n = check!(symbols(simd, br, sc, eob, n_selectors, self.nmax));
         if orig_ptr >= n {
-            bail!(Fail::Corrupt(Corruption::OrigPtr));
+            check!(Err(Fail::Corrupt(Corruption::OrigPtr)));
         }
 
         bwt::inverse(&mut sc.bwt, &mut sc.ll, n, orig_ptr, &mut sc.text);
@@ -177,18 +208,153 @@ pub(crate) fn decode_stream<S: Simd>(
         if randomised {
             unrle::derandomise(text);
         }
-        let o2 = check!(unrle::unrle(simd, text, out, o));
+        Ok(Some(Text { len: n, crc }))
+    }
+
+    /// Un-RLE1s `text`, the block [`Stream::next`] last returned, into
+    /// `out[o..]` and checks its CRC. Returns the new output position. Only
+    /// a success changes the stream, so a caller may retry with a larger
+    /// `out`.
+    #[inline(always)]
+    pub(crate) fn emit<S: Simd>(
+        &mut self,
+        simd: S,
+        br: &Bits,
+        sc: &Scratch,
+        text: Text,
+        out: &mut [u8],
+        o: usize,
+    ) -> Result<usize, Error> {
+        let t = sc.text.get(..text.len as usize).unwrap_or_default();
+        let o2 = match unrle::unrle(simd, t, out, o) {
+            Ok(o2) => o2,
+            Err(f) => return Err(raise(f, self.block, br, out.len())),
+        };
         let crc = !crate::crc::update(!0, out.get(o..o2).unwrap_or_default());
-        if crc != stored_crc {
+        if crc != text.crc {
             return Err(Error::BlockCrc {
-                block,
-                stored: stored_crc,
+                block: self.block,
+                stored: text.crc,
                 computed: crc,
             });
         }
-        combined = combined.rotate_left(1) ^ crc;
-        o = o2;
-        block = block.saturating_add(1);
+        self.combined = self.combined.rotate_left(1) ^ crc;
+        self.block = self.block.saturating_add(1);
+        Ok(o2)
+    }
+
+    /// [`Stream::emit`], growing `out` (zero-filled, up to `cap` bytes) when
+    /// the block needs more room. Leaves `out` at least as long as the
+    /// returned position.
+    #[allow(clippy::too_many_arguments, reason = "inlined into its two callers")]
+    #[inline(always)]
+    fn emit_growing<S: Simd>(
+        &mut self,
+        simd: S,
+        br: &Bits,
+        sc: &Scratch,
+        text: Text,
+        out: &mut Vec<u8>,
+        o: usize,
+        cap: usize,
+    ) -> Result<usize, Error> {
+        // Most blocks decode to about the length of their text. One that
+        // decodes to more is un-RLE1ed again, into twice the room each time,
+        // up to the most it can need.
+        let most = o.saturating_add(text.max_output()).min(cap);
+        let len = text.len as usize;
+        let mut want = o.saturating_add(len + len / 4 + 64).min(most);
+        loop {
+            if out.len() < want {
+                out.resize(want, 0);
+            }
+            match self.emit(simd, br, sc, text, out, o) {
+                Err(Error::OutputTooSmall { .. }) if want < most => {
+                    want = want.saturating_mul(2).min(most);
+                }
+                r => return r,
+            }
+        }
+    }
+}
+
+/// Decodes the stream at the start of `src` into `out`. Returns the bytes
+/// written and the bytes of `src` the stream takes up.
+#[fearless_simd_macros::simd]
+pub(crate) fn decode_stream<S: Simd>(
+    simd: S,
+    src: &[u8],
+    out: &mut [u8],
+    sc: &mut Scratch,
+) -> Result<(usize, usize), Error> {
+    let mut br = Bits::new(src);
+    let mut st = Stream::start(&mut br)?;
+    let mut o = 0usize;
+    while let Some(text) = st.next(simd, &mut br, sc)? {
+        o = st.emit(simd, &br, sc, text, out, o)?;
+    }
+    Ok((o, br.consumed().div_ceil(8) as usize))
+}
+
+/// Decodes the streams that make up all of `src`, back to back, appending
+/// their bytes to `out`, which may grow by at most `limit`. Returns the
+/// bytes appended. On error, `out` is cut back to its length before the call.
+#[fearless_simd_macros::simd]
+pub(crate) fn decode_all<S: Simd>(
+    simd: S,
+    src: &[u8],
+    out: &mut Vec<u8>,
+    limit: usize,
+    sc: &mut Scratch,
+) -> Result<usize, Error> {
+    let start = out.len();
+    let cap = start.saturating_add(limit);
+    let mut o = start;
+    let mut at = 0u64;
+    let r = 'streams: loop {
+        let mut br = Bits::at(src, at);
+        let mut st = match Stream::start(&mut br) {
+            Ok(st) => st,
+            Err(e) => break Err(e),
+        };
+        loop {
+            match st.next(simd, &mut br, sc) {
+                Ok(Some(text)) => match st.emit_growing(simd, &br, sc, text, out, o, cap) {
+                    Ok(o2) => o = o2,
+                    Err(Error::OutputTooSmall { .. }) => {
+                        break 'streams Err(Error::OutputTooSmall { capacity: limit });
+                    }
+                    Err(e) => break 'streams Err(e),
+                },
+                Ok(None) => break,
+                Err(e) => break 'streams Err(e),
+            }
+        }
+        at = br.consumed().next_multiple_of(8);
+        if at >= br.len_bits() {
+            break Ok(o - start);
+        }
+    };
+    out.truncate(if r.is_ok() { o } else { start });
+    r
+}
+
+/// The next block of a stream read piece by piece, un-RLE1ed into
+/// `out[..n]` (grown as needed, never shrunk), as `Some(n)`; or `None` at
+/// the end-of-stream marker.
+#[fearless_simd_macros::simd]
+pub(crate) fn next_block<S: Simd>(
+    simd: S,
+    st: &mut Stream,
+    br: &mut Bits,
+    sc: &mut Scratch,
+    out: &mut Vec<u8>,
+) -> Result<Option<usize>, Error> {
+    match st.next(simd, br, sc)? {
+        Some(text) => st
+            .emit_growing(simd, br, sc, text, out, 0, usize::MAX)
+            .map(Some),
+        None => Ok(None),
     }
 }
 

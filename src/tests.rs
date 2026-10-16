@@ -157,6 +157,111 @@ fn trailing_bytes_are_ignored() {
     assert_eq!(&out[..17], b"hello hello hello");
 }
 
+/// A reader that hands out at most `step` bytes per call.
+struct Trickle<'a> {
+    src: &'a [u8],
+    step: usize,
+}
+
+impl std::io::Read for Trickle<'_> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let n = self.step.min(buf.len()).min(self.src.len());
+        buf[..n].copy_from_slice(&self.src[..n]);
+        self.src = &self.src[n..];
+        Ok(n)
+    }
+}
+
+fn read_all(src: &[u8], step: usize) -> std::io::Result<Vec<u8>> {
+    let mut out = Vec::new();
+    std::io::Read::read_to_end(
+        &mut crate::DecompressReader::new(Trickle { src, step }),
+        &mut out,
+    )
+    .map(|_| out)
+}
+
+#[test]
+fn concatenated_streams() {
+    let parts = [
+        lcg(250_000, 5, 255),
+        b"".to_vec(),
+        vec![9u8; 1_000_000],
+        lcg(10, 6, 3),
+    ];
+    let mut src = Vec::new();
+    for (i, p) in parts.iter().enumerate() {
+        src.extend(compress(p, [1, 9, 2, 5][i]));
+    }
+    let want = parts.concat();
+
+    let mut out = b"prefix".to_vec();
+    assert_eq!(
+        Decoder::new().decompress_all(&src, &mut out, usize::MAX),
+        Ok(want.len())
+    );
+    assert!(out[6..] == want[..]);
+    assert_eq!(
+        Decoder::new().decompress_all(&src, &mut out, want.len() - 1),
+        Err(Error::OutputTooSmall {
+            capacity: want.len() - 1
+        })
+    );
+    assert_eq!(out.len(), 6 + want.len());
+
+    let first = compress(&parts[0], 1).len();
+    let mut big = vec![0; 300_000];
+    let d = Decoder::new().decompress_prefix(&src, &mut big).unwrap();
+    assert_eq!((d.written, d.read), (parts[0].len(), first));
+
+    for step in [1, 7, 4096, 1 << 20] {
+        assert!(read_all(&src, step).unwrap() == want, "step {step}");
+    }
+}
+
+#[test]
+fn bytes_after_the_streams_are_an_error() {
+    let mut src = compress(b"hello", 9);
+    let len = src.len();
+    src.extend_from_slice(b"BZ");
+    let mut out = Vec::new();
+    assert!(matches!(
+        Decoder::new().decompress_all(&src, &mut out, 100),
+        Err(Error::UnexpectedEof { at }) if at.bit == src.len() as u64 * 8
+    ));
+    assert!(out.is_empty());
+    src.truncate(len);
+    src.push(0);
+    assert_eq!(
+        Decoder::new().decompress_all(&src, &mut out, 100),
+        Err(Error::NotBzip2)
+    );
+    let e = read_all(&src, 3).unwrap_err();
+    assert_eq!(e.kind(), std::io::ErrorKind::InvalidData);
+    assert_eq!(
+        e.get_ref().unwrap().downcast_ref::<Error>(),
+        Some(&Error::NotBzip2)
+    );
+    assert_eq!(
+        read_all(b"", 3).unwrap_err().kind(),
+        std::io::ErrorKind::UnexpectedEof
+    );
+}
+
+#[test]
+fn reader_positions_count_from_the_first_byte() {
+    let data = lcg(300_000, 8, 255);
+    let c = compress(&data, 1);
+    for cut in [c.len() / 2, c.len() - 1] {
+        let e = read_all(&c[..cut], 1000).unwrap_err();
+        let inner = *e.get_ref().unwrap().downcast_ref::<Error>().unwrap();
+        assert_eq!(
+            inner,
+            decompress(&c[..cut], &mut vec![0; data.len()]).unwrap_err()
+        );
+    }
+}
+
 #[test]
 fn truncation_at_every_byte() {
     let data = lcg(3000, 9, 20);

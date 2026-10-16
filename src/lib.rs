@@ -35,18 +35,29 @@ mod error;
     reason = "values bounded by the format"
 )]
 mod huffman;
+mod read;
 mod unrle;
 
 use core::fmt;
 
 pub use error::{Corruption, Error, Position};
+pub use read::DecompressReader;
 
 use decode::Scratch;
 
-/// Reusable decoder state. Keep one per reader or thread and reuse it for
-/// every stream: it owns the working memory a decode needs (about 6 MiB of
-/// address space). For a single stream, `Decoder::new().decompress(src, out)`
-/// allocates that memory, uses it once and frees it.
+/// Reusable decoder state for compressed data in memory. Keep one per thread
+/// and reuse it for every stream: it owns the working memory a decode needs
+/// (about 6 MiB of address space). For a single stream,
+/// `Decoder::new().decompress(src, out)` allocates that memory, uses it once
+/// and frees it. To decode from a file or socket, use [`DecompressReader`].
+///
+/// Which method fits:
+///
+/// | the input | method |
+/// |---|---|
+/// | one stream whose decompressed size is known (a container header declares it) | [`decompress`](Decoder::decompress), [`decompress_to_vec`](Decoder::decompress_to_vec) |
+/// | a whole `.bz2` file of unknown size, perhaps of several streams (`pbzip2`, `lbzip2`) | [`decompress_all`](Decoder::decompress_all), [`decompress_all_to_vec`](Decoder::decompress_all_to_vec) |
+/// | a stream followed by other data | [`decompress_prefix`](Decoder::decompress_prefix) |
 ///
 /// Nothing is allocated until the first decode, so [`Decoder::new`] is free
 /// and a reader that never meets bzip2 pays nothing. The memory then lives
@@ -60,20 +71,20 @@ use decode::Scratch;
 /// # Examples
 ///
 /// ```
-/// use std::io::Write;
+/// use bz2ngrs::{Compression, Decoder, Encoder};
 ///
-/// let mut enc = bzip2::write::BzEncoder::new(Vec::new(), bzip2::Compression::best());
-/// enc.write_all(b"hello hello hello hello").unwrap();
-/// let stream = enc.finish().unwrap();
+/// let data = b"hello hello hello hello";
+/// let stream = Encoder::new(Compression::BEST).compress_to_vec(data);
 ///
-/// let mut decoder = bz2ngrs::Decoder::new();
-/// // A block that declares its uncompressed size: allocate it, decode into it.
-/// let block = decoder.decompress_to_vec(&stream, 23).unwrap();
-/// assert_eq!(block, b"hello hello hello hello");
-/// // Later blocks reuse the same memory.
+/// let mut decoder = Decoder::new();
+/// // The decompressed size is known: allocate it, decode into it.
+/// assert_eq!(decoder.decompress_to_vec(&stream, data.len()).unwrap(), data);
+/// // It is not: let the output grow, up to a bound.
+/// assert_eq!(decoder.decompress_all_to_vec(&stream, 1 << 30).unwrap(), data);
+/// // Later calls reuse the same memory.
 /// let mut out = [0u8; 64];
 /// let n = decoder.decompress(&stream, &mut out).unwrap();
-/// assert_eq!(&out[..n], b"hello hello hello hello");
+/// assert_eq!(&out[..n], data);
 /// ```
 pub struct Decoder {
     level: fearless_simd::Level,
@@ -126,15 +137,88 @@ impl Decoder {
     /// A caller that pools its output buffers keeps each one at full length
     /// and reads `out[..n]`; this call never zeroes or resizes `out`.
     pub fn decompress(&mut self, src: &[u8], out: &mut [u8]) -> Result<usize, Error> {
-        let sc = self.scratch.get_or_insert_with(Scratch::new_boxed);
-        fearless_simd::dispatch!(self.level, simd => decode::decode_stream(simd, src, out, sc))
+        self.decompress_prefix(src, out).map(|d| d.written)
     }
 
-    /// Decompresses the stream at the start of `src` into a new `Vec`, for a
-    /// block whose uncompressed size is declared (a CRAM block header says
-    /// it). Allocates `size` bytes, decodes, and truncates to the bytes
-    /// written. A stream shorter than `size` is allowed, which a caller that
-    /// wants exact sizes checks with `len()`. A longer one is
+    /// [`Decoder::decompress`], which also says where in `src` the stream
+    /// ends, for a stream that other data follows.
+    ///
+    /// ```
+    /// use bz2ngrs::{Compression, Decoded, Decoder, Encoder};
+    ///
+    /// let mut src = Encoder::new(Compression::BEST).compress_to_vec(b"hello");
+    /// let len = src.len();
+    /// src.extend_from_slice(b"trailer");
+    ///
+    /// let mut out = [0u8; 16];
+    /// let d = Decoder::new().decompress_prefix(&src, &mut out).unwrap();
+    /// assert_eq!(d, Decoded { written: 5, read: len });
+    /// assert_eq!(&src[d.read..], b"trailer");
+    /// ```
+    pub fn decompress_prefix(&mut self, src: &[u8], out: &mut [u8]) -> Result<Decoded, Error> {
+        let sc = self.scratch.get_or_insert_with(Scratch::new_boxed);
+        let (written, read) = fearless_simd::dispatch!(
+            self.level,
+            simd => decode::decode_stream(simd, src, out, sc)
+        )?;
+        Ok(Decoded { written, read })
+    }
+
+    /// Decompresses all of `src`, one stream or several back to back (as
+    /// `pbzip2`, `lbzip2` and `cat a.bz2 b.bz2` make them), and appends the
+    /// bytes to `out`. Returns how many it appended.
+    ///
+    /// For input whose decompressed size is not known. `out` grows one block
+    /// at a time, by about what the block needs, and at most by `limit`
+    /// bytes in all: a stream that decodes to more is
+    /// [`Error::OutputTooSmall`] with `capacity: limit`. bzip2 can expand
+    /// data by a factor of thousands, so input from elsewhere needs a
+    /// `limit` its reader can afford; `usize::MAX` trusts the input.
+    ///
+    /// Every byte of `src` must belong to a stream: bytes after a stream
+    /// that do not start another are [`Error::NotBzip2`] (or
+    /// [`Error::UnexpectedEof`] if they could start one), as with the
+    /// `bzip2` crate's `MultiBzDecoder`. An error leaves `out` as it was.
+    ///
+    /// ```
+    /// use bz2ngrs::{Compression, Decoder, Encoder, Error};
+    ///
+    /// let mut enc = Encoder::new(Compression::BEST);
+    /// let mut src = enc.compress_to_vec(b"hello, ");
+    /// enc.compress(b"world", &mut src);
+    ///
+    /// let mut out = Vec::new();
+    /// let mut decoder = Decoder::new();
+    /// assert_eq!(decoder.decompress_all(&src, &mut out, 1 << 20), Ok(12));
+    /// assert_eq!(out, b"hello, world");
+    /// assert_eq!(
+    ///     decoder.decompress_all(&src, &mut out, 11),
+    ///     Err(Error::OutputTooSmall { capacity: 11 })
+    /// );
+    /// assert_eq!(out, b"hello, world");
+    /// ```
+    pub fn decompress_all(
+        &mut self,
+        src: &[u8],
+        out: &mut Vec<u8>,
+        limit: usize,
+    ) -> Result<usize, Error> {
+        let sc = self.scratch.get_or_insert_with(Scratch::new_boxed);
+        fearless_simd::dispatch!(self.level, simd => decode::decode_all(simd, src, out, limit, sc))
+    }
+
+    /// [`Decoder::decompress_all`] into a new `Vec`.
+    pub fn decompress_all_to_vec(&mut self, src: &[u8], limit: usize) -> Result<Vec<u8>, Error> {
+        let mut out = Vec::new();
+        self.decompress_all(src, &mut out, limit)?;
+        Ok(out)
+    }
+
+    /// Decompresses the stream at the start of `src` into a new `Vec`, for
+    /// a stream whose decompressed size is declared (as a CRAM block header
+    /// declares it). Allocates `size` bytes, decodes, and truncates to the
+    /// bytes written. A stream shorter than `size` is allowed, which a
+    /// caller that wants exact sizes checks with `len()`. A longer one is
     /// [`Error::OutputTooSmall`] with `capacity: size`.
     ///
     /// `size` comes from the file being read, so a caller that distrusts it
@@ -163,6 +247,16 @@ impl Decoder {
         out.truncate(n);
         Ok(out)
     }
+}
+
+/// What [`Decoder::decompress_prefix`] wrote and read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct Decoded {
+    /// Bytes written to `out`.
+    pub written: usize,
+    /// Bytes of `src` the stream takes up: through the byte that holds the
+    /// end of its combined CRC (the rest of that byte is padding).
+    pub read: usize,
 }
 
 /// A bzip2 compression level, 1 to 9: the block size in units of 100,000
