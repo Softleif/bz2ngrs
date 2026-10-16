@@ -59,3 +59,9 @@ name = "compress_structured"
 path = "fuzz_targets/compress_structured.rs"
 test = false
 doc = false
+
+[[bin]]
+name = "multistream_differential"
+path = "fuzz_targets/multistream_differential.rs"
+test = false
+doc = false
