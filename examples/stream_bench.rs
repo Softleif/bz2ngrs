@@ -60,6 +60,15 @@ fn main() {
             }),
         );
         row(
+            "decode: Decoder::decompress_to_vec (known size)",
+            time(rounds, n, || {
+                assert_eq!(
+                    decoder.decompress_to_vec(&stream, n).map(|v| v.len()),
+                    Ok(n)
+                );
+            }),
+        );
+        row(
             "decode: Decoder::decompress_all_to_vec",
             time(rounds, n, || {
                 assert_eq!(

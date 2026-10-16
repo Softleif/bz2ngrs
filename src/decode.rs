@@ -96,6 +96,9 @@ pub(crate) struct Stream {
     block: u32,
     /// The stream CRC combined from the blocks so far.
     combined: u32,
+    /// Output bytes per 16 text bytes of the last block, a guess at the
+    /// next one's.
+    expand: usize,
 }
 
 /// A block decoded as far as its text, which is in `Scratch::text`.
@@ -135,6 +138,7 @@ impl Stream {
             nmax: 100_000 * digit,
             block: 0,
             combined: 0,
+            expand: 20,
         })
     }
 
@@ -258,19 +262,25 @@ impl Stream {
         o: usize,
         cap: usize,
     ) -> Result<usize, Error> {
-        // Most blocks decode to about the length of their text. One that
-        // decodes to more is un-RLE1ed again, into twice the room each time,
-        // up to the most it can need.
+        // Blocks of a stream tend to expand alike, so the room is what the
+        // last block's ratio gives, and an eighth more. A block that needs more is
+        // un-RLE1ed again, into twice the room each time, up to the most it
+        // can need.
         let most = o.saturating_add(text.max_output()).min(cap);
         let len = text.len as usize;
-        let mut want = o.saturating_add(len + len / 4 + 64).min(most);
+        let guess = len.saturating_mul(self.expand) / 16;
+        let mut want = o.saturating_add(guess + guess / 8 + 64).min(most);
         loop {
             if out.len() < want {
                 out.resize(want, 0);
             }
             match self.emit(simd, br, sc, text, out, o) {
                 Err(Error::OutputTooSmall { .. }) if want < most => {
-                    want = want.saturating_mul(2).min(most);
+                    want = o.saturating_add((want - o).saturating_mul(2)).min(most);
+                }
+                Ok(o2) => {
+                    self.expand = (o2 - o) * 16 / len.max(1);
+                    return Ok(o2);
                 }
                 r => return r,
             }
