@@ -7,6 +7,7 @@ mod common;
 use common::oracle::all_decoders;
 use common::pinned::cases;
 use common::stream_props as p;
+use hegel::HealthCheck;
 
 macro_rules! prop {
     ($name:ident, $f:path) => {
@@ -16,10 +17,7 @@ macro_rules! prop {
         }
     };
     ($name:ident, $n:expr, $f:path) => {
-        #[hegel::test(
-                                    test_cases = cases($n),
-                                    suppress_health_check = [hegel::HealthCheck::TooSlow]
-                                )]
+        #[hegel::test(test_cases = cases($n), suppress_health_check = [HealthCheck::TooSlow])]
         fn $name(tc: hegel::TestCase) {
             $f(&tc, &all_decoders());
         }
