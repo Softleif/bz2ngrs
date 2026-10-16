@@ -11,7 +11,7 @@
 
 use std::io::{self, Read};
 
-use bz2ngrs::{DecompressReader, Decoder, Error};
+use bz2ngrs::{Decoder, DecompressReader, Error};
 use bzip2::read::MultiBzDecoder;
 use fearless_simd::Level;
 use libfuzzer_sys::fuzz_target;
@@ -73,7 +73,10 @@ fuzz_target!(|input: (u16, &[u8])| {
         match (&all, &read) {
             (Ok(_), Ok(_)) => assert!(got == want, "{level:?}: reader bytes"),
             (Err(ours), Err(e)) => {
-                assert_eq!(e.get_ref().and_then(|e| e.downcast_ref::<Error>()), Some(ours));
+                assert_eq!(
+                    e.get_ref().and_then(|e| e.downcast_ref::<Error>()),
+                    Some(ours)
+                );
                 // The oracle drops what it decoded in the read that fails.
                 assert!(
                     want.starts_with(&got) || got.starts_with(&want),
