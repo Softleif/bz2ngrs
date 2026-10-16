@@ -7,6 +7,7 @@ pub mod forge;
 pub mod inputs;
 pub mod oracle;
 pub mod props;
+pub mod stream_props;
 
 /// Case counts for the slow properties that pin their own `test_cases`. A
 /// count compiled into `#[hegel::test]` wins over `HEGEL_TEST_CASES` and the
