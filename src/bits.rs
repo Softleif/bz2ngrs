@@ -34,6 +34,22 @@ impl<'a> Bits<'a> {
         }
     }
 
+    /// A reader whose first bit is bit `bit` of `src`; `consumed` counts
+    /// from the start of `src`.
+    pub(crate) fn at(src: &'a [u8], bit: u64) -> Self {
+        let mut b = Bits {
+            src,
+            pos: usize::try_from(bit / 8).unwrap_or(src.len()),
+            buf: 0,
+            cnt: 0,
+        };
+        if !bit.is_multiple_of(8) {
+            b.refill();
+            b.consume((bit % 8) as u32);
+        }
+        b
+    }
+
     /// Tops `buf` up to at least 56 valid bits with one 8-byte load.
     #[inline(always)]
     pub(crate) fn refill(&mut self) {
