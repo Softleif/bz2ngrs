@@ -79,6 +79,23 @@ impl<'a> BitWriter<'a> {
         }
     }
 
+    /// A writer that continues after [`BitWriter::suspend`]; `n < 8` bits
+    /// are pending in `acc`.
+    fn resume(out: &'a mut Vec<u8>, acc: u64, n: u32) -> Self {
+        let pos = out.len();
+        BitWriter { out, pos, acc, n }
+    }
+
+    /// Writes the whole pending bytes, cuts the output back to them and
+    /// returns the remaining `n < 8` bits.
+    fn suspend(mut self) -> (u64, u32) {
+        if self.n >= 8 {
+            self.flush();
+        }
+        self.out.truncate(self.pos);
+        (self.acc & ((1 << self.n) - 1), self.n)
+    }
+
     /// Makes room for `bytes` more bytes of output on top of the bits
     /// pending.
     fn reserve(&mut self, bytes: usize) {
@@ -179,54 +196,116 @@ pub(crate) fn compress_stream<S: Simd>(
     out: &mut Vec<u8>,
     sc: &mut Scratch,
 ) {
-    let cap = 100_000 * usize::from(level);
-    // libbz2's limit, 19 bytes below the block size: the last unit, written
-    // once the block is full, may add up to 5.
-    let nblock_max = cap - 19;
-    // RLE1 grows input by at most 5/4 (four equal bytes become five), so a
-    // short input never needs a full-size block.
-    let biggest = nblock_max.min(src.len() + src.len() / 4) + rle::SLACK;
-    if sc.tt.len() < 2 * biggest {
-        sc.tt.resize(2 * biggest, 0);
+    let mut s = Stream::start(simd, level, src.len(), out, sc);
+    s.push(simd, sc, src, out);
+    s.finish(simd, sc, out);
+}
+
+/// One stream in progress: the RLE1 state, the combined CRC and the bits not
+/// yet a whole byte, kept between calls so that input may arrive in any
+/// pieces. Only whole bytes are in the output `Vec` between calls.
+pub(crate) struct Stream {
+    st: rle::Rle,
+    combined: u32,
+    acc: u64,
+    n: u32,
+    nblock_max: usize,
+}
+
+impl Stream {
+    /// Sizes `sc` for at most `size_hint` bytes of input and writes the
+    /// stream header to `out`.
+    #[inline(always)]
+    pub(crate) fn start<S: Simd>(
+        _simd: S,
+        level: u8,
+        size_hint: usize,
+        out: &mut Vec<u8>,
+        sc: &mut Scratch,
+    ) -> Stream {
+        let cap = 100_000 * usize::from(level);
+        // libbz2's limit, 19 bytes below the block size: the last unit,
+        // written once the block is full, may add up to 5.
+        let nblock_max = cap - 19;
+        // RLE1 grows input by at most 5/4 (four equal bytes become five), so
+        // a short input never needs a full-size block.
+        let biggest = nblock_max.min(size_hint.saturating_add(size_hint / 4)) + rle::SLACK;
+        if sc.tt.len() < 2 * biggest {
+            sc.tt.resize(2 * biggest, 0);
+        }
+        if sc.mtfv.len() < biggest + 1 + mtf::SLACK {
+            sc.mtfv.resize(biggest + 1 + mtf::SLACK, 0);
+        }
+        let mut bw = BitWriter::new(out);
+        bw.reserve(4);
+        bw.put(
+            32,
+            u64::from(u32::from_be_bytes(*b"BZh0") + u32::from(level)),
+        );
+        let (acc, n) = bw.suspend();
+        Stream {
+            st: rle::Rle::new(),
+            combined: 0,
+            acc,
+            n,
+            nblock_max,
+        }
     }
-    if sc.mtfv.len() < biggest + 1 + mtf::SLACK {
-        sc.mtfv.resize(biggest + 1 + mtf::SLACK, 0);
+
+    /// Feeds `input`, appending each block that completes to `out`.
+    #[inline(always)]
+    pub(crate) fn push<S: Simd>(
+        &mut self,
+        simd: S,
+        sc: &mut Scratch,
+        input: &[u8],
+        out: &mut Vec<u8>,
+    ) {
+        let mut bw = BitWriter::resume(out, self.acc, self.n);
+        let mut pos = 0;
+        while pos < input.len() {
+            // A full block is held until more input shows that it is not
+            // the last: libbz2 under BZ_FINISH adds the pending unit to the
+            // last block even when it is full.
+            if self.st.nblock >= self.nblock_max {
+                self.emit(simd, sc, &mut bw);
+            }
+            pos += rle::fill(
+                simd,
+                &mut self.st,
+                &input[pos..],
+                &mut sc.tt,
+                self.nblock_max,
+            );
+        }
+        (self.acc, self.n) = bw.suspend();
     }
-    let mut bw = BitWriter::new(out);
-    bw.reserve(4);
-    bw.put(
-        32,
-        u64::from(u32::from_be_bytes(*b"BZh0") + u32::from(level)),
-    );
-    let mut st = rle::Rle::new();
-    let mut combined: u32 = 0;
-    let mut pos = 0;
-    loop {
-        if st.nblock < nblock_max {
-            pos += rle::fill(simd, &mut st, &src[pos..], &mut sc.tt, nblock_max);
+
+    /// Ends the stream: the last block, the end-of-stream marker and the
+    /// combined CRC, padded to a whole byte.
+    #[inline(always)]
+    pub(crate) fn finish<S: Simd>(mut self, simd: S, sc: &mut Scratch, out: &mut Vec<u8>) {
+        let mut bw = BitWriter::resume(out, self.acc, self.n);
+        self.st.flush(&mut sc.tt);
+        if self.st.nblock > 0 {
+            self.emit(simd, sc, &mut bw);
         }
-        // As in libbz2 under BZ_FINISH: once the input is used up, the
-        // pending unit joins the block even if the block is already full.
-        let last = pos == src.len();
-        if last {
-            st.flush(&mut sc.tt);
-        }
-        if st.nblock > 0 {
-            let block_crc = !st.crc;
-            combined = combined.rotate_left(1) ^ block_crc;
-            encode_block(simd, sc, st.nblock, block_crc, &mut bw);
-        }
-        if last {
-            break;
-        }
-        st.nblock = 0;
-        st.crc = !0;
+        bw.reserve(11);
+        bw.put(24, 0x17_7245);
+        bw.put(24, 0x38_5090);
+        bw.put(32, u64::from(self.combined));
+        bw.finish();
     }
-    bw.reserve(11);
-    bw.put(24, 0x17_7245);
-    bw.put(24, 0x38_5090);
-    bw.put(32, u64::from(combined));
-    bw.finish();
+
+    /// Encodes the block in `sc.tt` and starts the next one.
+    #[inline(always)]
+    fn emit<S: Simd>(&mut self, simd: S, sc: &mut Scratch, bw: &mut BitWriter<'_>) {
+        let block_crc = !self.st.crc;
+        self.combined = self.combined.rotate_left(1) ^ block_crc;
+        encode_block(simd, sc, self.st.nblock, block_crc, bw);
+        self.st.nblock = 0;
+        self.st.crc = !0;
+    }
 }
 
 /// Encodes the block `sc.tt[..n]` with its finalised CRC: block magic, CRC,

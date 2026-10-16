@@ -37,11 +37,13 @@ mod error;
 mod huffman;
 mod read;
 mod unrle;
+mod write;
 
 use core::fmt;
 
 pub use error::{Corruption, Error, Position};
 pub use read::DecompressReader;
+pub use write::CompressWriter;
 
 use decode::Scratch;
 
@@ -293,7 +295,8 @@ impl Default for Compression {
     }
 }
 
-/// Reusable encoder state. Keep one per writer or thread and reuse it for
+/// Reusable encoder state for whole inputs; [`CompressWriter`] compresses a
+/// stream written piece by piece. Keep one per writer or thread and reuse it for
 /// every stream: it owns the working memory a compression needs, about 10
 /// bytes per byte of the largest block it has met (9 MB at level 9; a short
 /// input needs a block only as large as itself).
