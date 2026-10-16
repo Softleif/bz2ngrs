@@ -4,11 +4,12 @@ version = "0.1.0"
 edition = "2024"
 rust-version = "1.89"
 license = "Apache-2.0 WITH LLVM-exception"
-description = "Fast one-shot bzip2 compression and decompression, a Rust port of bz2-ng"
+description = "Fast bzip2 compression and decompression, one-shot and streaming, a Rust port of bz2-ng"
+repository = "https://github.com/Softleif/bz2ngrs"
 readme = "README.md"
 keywords = ["bzip2", "compression", "decompression", "simd", "cram"]
 categories = ["compression"]
-publish = false
+exclude = [".github", "AGENTS.md", "CLAUDE.md", "deny.toml", "hegel.toml", "rust-toolchain.toml", "examples"]
 
 [workspace]
 members = [".", "bench"]
