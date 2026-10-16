@@ -53,8 +53,11 @@ const READ_AHEAD: usize = 1 << 20;
 pub struct DecompressReader<R> {
     inner: R,
     decoder: Decoder,
-    /// Compressed bytes read from `inner` and not yet dropped.
+    /// Compressed bytes read from `inner` and not yet dropped are
+    /// `input[..filled]`. The rest stays allocated and zeroed, so that a
+    /// reader that hands out little per call does not cost a refill each.
     input: Vec<u8>,
+    filled: usize,
     /// The next bit of `input` to decode.
     bit: u64,
     /// Bytes read from `inner` before `input[0]`.
@@ -99,6 +102,7 @@ impl<R: Read> DecompressReader<R> {
             inner,
             decoder,
             input: Vec::new(),
+            filled: 0,
             bit: 0,
             dropped: 0,
             eof: false,
@@ -112,7 +116,7 @@ impl<R: Read> DecompressReader<R> {
     /// Starts over on `inner`, keeping the working memory, and returns the
     /// old reader.
     pub fn reset(&mut self, inner: R) -> R {
-        self.input.clear();
+        self.filled = 0;
         self.bit = 0;
         self.dropped = 0;
         self.eof = false;
@@ -128,21 +132,22 @@ impl<R: Read> DecompressReader<R> {
     fn fill(&mut self, want: usize) -> io::Result<()> {
         let skip = usize::try_from(self.bit / 8)
             .unwrap_or(usize::MAX)
-            .min(self.input.len());
+            .min(self.filled);
         if skip > 0 {
-            self.input.drain(..skip);
+            self.input.copy_within(skip..self.filled, 0);
+            self.filled -= skip;
             self.bit -= skip as u64 * 8;
             self.dropped += skip as u64;
         }
-        while !self.eof && self.input.len() < want {
-            let len = self.input.len();
+        if self.input.len() < want {
             self.input.resize(want, 0);
-            let r = self.inner.read(&mut self.input[len..]);
-            let n = *r.as_ref().unwrap_or(&0);
-            self.input.truncate(len + n);
-            match r {
+        }
+        while !self.eof && self.filled < want {
+            match self.inner.read(&mut self.input[self.filled..]) {
                 Ok(0) => self.eof = true,
-                Ok(_) => {}
+                // `min`: a `Read` that claims more than it was given is a
+                // bug in it, not a reason to panic here.
+                Ok(n) => self.filled = (self.filled + n).min(self.input.len()),
                 Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
                 Err(e) => return Err(e),
             }
@@ -153,11 +158,11 @@ impl<R: Read> DecompressReader<R> {
     /// Reads the next stream header, or finds the input's end.
     fn header(&mut self, first: bool) -> io::Result<()> {
         self.fill(4)?;
-        if !first && self.eof && self.input.len() as u64 * 8 <= self.bit {
+        if !first && self.eof && self.filled as u64 * 8 <= self.bit {
             self.state = State::Done;
             return Ok(());
         }
-        let mut br = Bits::at(&self.input, self.bit);
+        let mut br = Bits::at(&self.input[..self.filled], self.bit);
         match Stream::start(&mut br) {
             Ok(st) => {
                 self.bit = br.consumed();
@@ -174,7 +179,7 @@ impl<R: Read> DecompressReader<R> {
         loop {
             self.fill(want)?;
             let mut next = st;
-            let mut br = Bits::at(&self.input, self.bit);
+            let mut br = Bits::at(&self.input[..self.filled], self.bit);
             let sc = self.decoder.scratch.get_or_insert_with(Scratch::new_boxed);
             let r = fearless_simd::dispatch!(
                 self.decoder.level,
@@ -193,7 +198,7 @@ impl<R: Read> DecompressReader<R> {
                     self.state = State::Header { first: false };
                 }
                 Err(Error::UnexpectedEof { .. }) if !self.eof => {
-                    want = self.input.len().saturating_mul(2).max(READ_AHEAD);
+                    want = self.filled.saturating_mul(2).max(READ_AHEAD);
                     continue;
                 }
                 Err(e) => self.state = State::Failed(e.offset(self.dropped * 8)),
