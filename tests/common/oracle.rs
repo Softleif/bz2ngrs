@@ -26,14 +26,14 @@ thread_local! {
 }
 
 impl Decoder {
-    fn make(self) -> bz2ngrs::Decoder {
+    pub fn make(self) -> bz2ngrs::Decoder {
         match self {
             Decoder::New => bz2ngrs::Decoder::new(),
             Decoder::At(level) => bz2ngrs::Decoder::__with_level(level),
         }
     }
 
-    fn with_reused<T>(self, f: impl FnOnce(&mut bz2ngrs::Decoder) -> T) -> T {
+    pub fn with_reused<T>(self, f: impl FnOnce(&mut bz2ngrs::Decoder) -> T) -> T {
         let key = self.name();
         REUSED.with(|cell| {
             let mut all = cell.borrow_mut();
@@ -48,6 +48,14 @@ impl Decoder {
     /// Decodes with this thread's long-lived decoder.
     pub fn run(self, src: &[u8], out: &mut [u8]) -> Result<usize, Error> {
         self.with_reused(|d| d.decompress(src, out))
+    }
+
+    /// A `DecompressReader` over `inner` at this decoder's SIMD level.
+    pub fn reader<R: Read>(self, inner: R) -> bz2ngrs::DecompressReader<R> {
+        match self {
+            Decoder::New => bz2ngrs::DecompressReader::new(inner),
+            Decoder::At(level) => bz2ngrs::DecompressReader::__with_level(inner, level),
+        }
     }
 
     /// Decodes with a decoder made for this one call.
@@ -183,13 +191,13 @@ fn reference_outcome(src: &[u8]) -> Result<(), io::ErrorKind> {
 /// The class of an error: what libbz2 can tell apart (the input ended early,
 /// the input is bad), and the caller's buffer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Class {
+pub enum Class {
     EarlyEnd,
     BadInput,
     OutputFull,
 }
 
-fn class(e: &Error) -> Class {
+pub fn class(e: &Error) -> Class {
     match e {
         Error::UnexpectedEof { .. } => Class::EarlyEnd,
         Error::OutputTooSmall { .. } => Class::OutputFull,
@@ -197,7 +205,7 @@ fn class(e: &Error) -> Class {
     }
 }
 
-fn io_class(kind: io::ErrorKind) -> Class {
+pub fn io_class(kind: io::ErrorKind) -> Class {
     if kind == io::ErrorKind::UnexpectedEof {
         Class::EarlyEnd
     } else {
