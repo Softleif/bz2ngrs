@@ -269,7 +269,12 @@ impl Stream {
         let most = o.saturating_add(text.max_output()).min(cap);
         let len = text.len as usize;
         let guess = len.saturating_mul(self.expand) / 16;
-        let mut want = o.saturating_add(guess + guess / 8 + 64).min(most);
+        // Room `out` already has costs nothing, and a retry within it would
+        // fail again.
+        let mut want = o
+            .saturating_add(guess + guess / 8 + 64)
+            .max(out.len())
+            .min(most);
         loop {
             if out.len() < want {
                 out.resize(want, 0);
@@ -304,6 +309,25 @@ pub(crate) fn decode_stream<S: Simd>(
         o = st.emit(simd, &br, sc, text, out, o)?;
     }
     Ok((o, br.consumed().div_ceil(8) as usize))
+}
+
+/// [`decode_stream`] into a `Vec` grown as needed (zero-filled, up to `cap`
+/// bytes). Returns the bytes written; `out` may be longer.
+#[fearless_simd_macros::simd]
+pub(crate) fn decode_stream_growing<S: Simd>(
+    simd: S,
+    src: &[u8],
+    out: &mut Vec<u8>,
+    cap: usize,
+    sc: &mut Scratch,
+) -> Result<usize, Error> {
+    let mut br = Bits::new(src);
+    let mut st = Stream::start(&mut br)?;
+    let mut o = 0usize;
+    while let Some(text) = st.next(simd, &mut br, sc)? {
+        o = st.emit_growing(simd, &br, sc, text, out, o, cap)?;
+    }
+    Ok(o)
 }
 
 /// Decodes the streams that make up all of `src`, back to back, appending
