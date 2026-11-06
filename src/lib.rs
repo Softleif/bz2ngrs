@@ -197,11 +197,14 @@ impl Decoder {
         Ok(out)
     }
 
-    /// Decompresses the stream at the start of `src` into a new `Vec` of
-    /// capacity `size`, for a stream whose decompressed size is declared
-    /// (as a CRAM block header does). A shorter stream gives a shorter
-    /// `Vec`; a longer one is [`Error::OutputTooSmall`] with `capacity:
-    /// size`. `size` is allocated up front, so bound it if it is untrusted.
+    /// Decompresses the stream at the start of `src` into a new `Vec`, for a
+    /// stream whose decompressed size is declared (as a CRAM block header
+    /// does). A shorter stream gives a shorter `Vec`; a longer one is
+    /// [`Error::OutputTooSmall`] with `capacity: size`.
+    ///
+    /// `size` may come from untrusted input: up to 64 MiB of it is allocated
+    /// up front, and beyond that the `Vec` grows only as the stream's
+    /// blocks need.
     ///
     /// ```
     /// use std::io::Write;
@@ -220,8 +223,16 @@ impl Decoder {
     /// );
     /// ```
     pub fn decompress_to_vec(&mut self, src: &[u8], size: usize) -> Result<Vec<u8>, Error> {
-        let mut out = vec![0; size];
-        let n = self.decompress(src, &mut out)?;
+        // An honest size (nearly every CRAM block is well under this) gets
+        // one exact allocation and no growth; a hostile one costs at most this
+        // until the stream really decodes to more.
+        const UP_FRONT: usize = 64 << 20;
+        let mut out = vec![0; size.min(UP_FRONT)];
+        let sc = self.scratch.get_or_insert_with(Scratch::new_boxed);
+        let n = fearless_simd::dispatch!(
+            self.level,
+            simd => decode::decode_stream_growing(simd, src, &mut out, size, sc)
+        )?;
         out.truncate(n);
         Ok(out)
     }

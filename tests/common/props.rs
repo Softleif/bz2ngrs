@@ -586,28 +586,32 @@ pub fn reuse_independent(tc: &TestCase, decoders: &[Decoder]) {
 
 /// Property 9: `decompress_to_vec` with a size at or above the stream's
 /// length is the oracle's bytes, and its length is the stream's length (the
-/// vector is cut to what was written).
+/// vector is cut to what was written). A size far above it, as a hostile
+/// header declares, is not allocated: the capacity stays within the 64 MiB
+/// allocated up front, plus the output and one block's most (900 000 text
+/// bytes, each five of which decode to at most 259).
 #[allow(clippy::panic, reason = "a failed property is a panic")]
 pub fn to_vec_equals_oracle(tc: &TestCase, decoders: &[Decoder]) {
     let v = tc.draw(inputs::valid_stream());
-    let extra = if tc.draw(gs::booleans()) {
-        0
-    } else {
-        below(tc, 70_000)
+    let extra = match below(tc, 3) {
+        0 => 0,
+        1 => below(tc, 70_000),
+        _ => tc.draw(gs::integers::<usize>().max_value(usize::MAX - v.data.len())),
     };
     let size = v.data.len() + extra;
+    // At the stream's length: the oracle allocates its cap.
     assert!(
-        matches!(reference(&v.stream, size), Reference::Ok(ref got) if *got == v.data),
+        matches!(reference(&v.stream, v.data.len()), Reference::Ok(ref got) if *got == v.data),
         "premise: libbz2 decodes a valid stream to its data"
     );
+    let most = size.min(64 << 20) + v.data.len() + 900_000 / 5 * 259;
     for d in decoders {
         let got = d.run_to_vec(&v.stream, size);
         assert_eq!(got.as_deref(), Ok(&v.data[..]), "{}: size {size}", d.name());
-        // "The `Vec` keeps capacity `size` even when shorter."
         let capacity = got.map(|g| g.capacity());
         assert!(
-            capacity.is_ok_and(|c| c >= size),
-            "{}: {capacity:?}",
+            capacity.is_ok_and(|c| c <= most),
+            "{}: size {size}, {capacity:?}",
             d.name()
         );
     }
