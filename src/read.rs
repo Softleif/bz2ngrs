@@ -21,7 +21,8 @@ const READ_AHEAD: usize = 1 << 20;
 ///
 /// Each block is decoded whole and its CRC checked before any of its bytes
 /// are returned. The reader holds the decoder's working memory (about
-/// 6 MiB), about 1 MiB of input read ahead and the current block's output.
+/// 6 MiB), a 2 MiB input buffer (about 1 MiB of it read ahead) and the
+/// current block's output.
 /// It reads `inner` in large pieces, so a `BufReader` around it gains
 /// nothing. It is also a [`BufRead`], whose [`fill_buf`](BufRead::fill_buf)
 /// hands out the decoded block without a copy.
@@ -122,27 +123,32 @@ impl<R: Read> DecompressReader<R> {
     }
 
     /// Reads from `inner` until at least `want` bytes from the next whole
-    /// byte to decode are at hand, or `inner` ends. Drops the bytes before
-    /// it first.
+    /// byte to decode are at hand, or `inner` ends.
     fn fill(&mut self, want: usize) -> io::Result<()> {
-        let skip = usize::try_from(self.bit / 8)
+        let mut skip = usize::try_from(self.bit / 8)
             .unwrap_or(usize::MAX)
             .min(self.filled);
-        if skip > 0 {
+        // The bytes before `skip` are dropped only once `want` more no longer
+        // fit in a buffer of twice `want`, so each byte moves about once.
+        // Moving the read-ahead on every call costs ~1 MiB per stream, which
+        // hostile input of 14-byte empty streams turns into ~30 µs per stream.
+        if skip.saturating_add(want) > self.input.len() {
             self.input.copy_within(skip..self.filled, 0);
             self.filled -= skip;
             self.bit -= skip as u64 * 8;
             self.dropped += skip as u64;
+            skip = 0;
+            if self.input.len() < want {
+                self.input.resize(want.saturating_mul(2), 0);
+            }
         }
-        if self.input.len() < want {
-            self.input.resize(want, 0);
-        }
-        while !self.eof && self.filled < want {
-            match self.inner.read(&mut self.input[self.filled..]) {
+        let target = skip + want;
+        while !self.eof && self.filled < target {
+            match self.inner.read(&mut self.input[self.filled..target]) {
                 Ok(0) => self.eof = true,
                 // `min`: a `Read` that claims more than it was given is a
                 // bug in it, not a reason to panic here.
-                Ok(n) => self.filled = (self.filled + n).min(self.input.len()),
+                Ok(n) => self.filled = (self.filled + n).min(target),
                 Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
                 Err(e) => return Err(e),
             }
