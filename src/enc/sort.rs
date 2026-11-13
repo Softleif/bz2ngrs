@@ -170,6 +170,29 @@ trait Sym: Copy {
     }
 }
 
+/// [`Sym::counts`] spread over `c` and three more tables in `x` (`3k`
+/// ints), so that a run of one symbol does not wait on its own counter.
+fn counts4<S: Sym>(t: &[S], c: &mut [i32], x: &mut [i32]) {
+    let k = c.len();
+    c.fill(0);
+    x.fill(0);
+    let (x1, x23) = x.split_at_mut(k);
+    let (x2, x3) = x23.split_at_mut(k);
+    let (quads, rest) = t.as_chunks::<4>();
+    for q in quads {
+        c[q[0].get()] += 1;
+        x1[q[1].get()] += 1;
+        x2[q[2].get()] += 1;
+        x3[q[3].get()] += 1;
+    }
+    for &v in rest {
+        c[v.get()] += 1;
+    }
+    for (i, c) in c.iter_mut().enumerate() {
+        *c += x1[i] + x2[i] + x3[i];
+    }
+}
+
 impl Sym for i32 {
     #[inline(always)]
     fn get(self) -> usize {
@@ -743,7 +766,11 @@ fn sais_reduce<S: Sym, const REG: bool, const P: bool>(
     {
         let (main, tail) = split_tail(sa, used_tail);
         let (d, mut bk) = layout(tail, k, one);
-        S::counts(t, bk.counts());
+        if n >= 8 * k {
+            counts4(t, bk.counts(), &mut main[..3 * k]);
+        } else {
+            S::counts(t, bk.counts());
+        }
         bk.heads_from_counts(true);
         main[..n].fill(0);
         // Each LMS position p reserves the next slot from the end of bucket
