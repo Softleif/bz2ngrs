@@ -13,7 +13,7 @@ dependencies = [
 
 [[package]]
 name = "bz2ngrs"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "fearless_simd",
  "fearless_simd_macros",
