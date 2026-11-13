@@ -330,6 +330,25 @@ impl Meta {
         cold: &mut Cold,
         out: u32,
     ) -> Option<(u32, u32)> {
+        let p = self.seg_begin_at(tt, pool, cold, out)?;
+        let out = out + 1;
+        let out = if (out as usize).is_multiple_of(CHUNK) {
+            self.new_chunk(cold, out, true)
+        } else {
+            out
+        };
+        Some((p, out))
+    }
+
+    /// [`Meta::seg_begin`] without moving on from `out`: writes the
+    /// splitter row's byte there and returns the lane's next row.
+    fn seg_begin_at(
+        &mut self,
+        tt: &[u32; ROWS],
+        pool: &mut [u8; BYTES],
+        cold: &mut Cold,
+        out: u32,
+    ) -> Option<u32> {
         if self.next_split >= self.n_seg {
             return None;
         }
@@ -341,13 +360,7 @@ impl Meta {
         cold.mark = cold.written + out % CHUNK as u32;
         let e = tt[self.seg_row[s] as usize & ROW_MASK];
         pool[out as usize & ROW_MASK] = e as u8;
-        let out = out + 1;
-        let out = if (out as usize).is_multiple_of(CHUNK) {
-            self.new_chunk(cold, out, true)
-        } else {
-            out
-        };
-        Some(((e >> 8) & ROW_MASK as u32, out))
+        Some((e >> 8) & ROW_MASK as u32)
     }
 }
 
@@ -450,29 +463,97 @@ lockstep!(lockstep1, 1, [(p0 o0 0)]);
 lockstep!(lockstep2, 2, [(p0 o0 0) (p1 o1 1)]);
 lockstep!(lockstep8, 8, [(p0 o0 0) (p1 o1 1) (p2 o2 2) (p3 o3 3) (p4 o4 4) (p5 o5 5) (p6 o6 6) (p7 o7 7)]);
 
-/// [`lockstep!`] for lane counts too large for registers: the lanes stay in
-/// their arrays, but the steps are still written out (a loop over the lanes
-/// costs as many instructions again as a step).
-macro_rules! lockstep_mem {
-    ($name:ident, $k:literal, [$($i:literal)*]) => {
-        #[inline(never)]
-        fn $name(
-            tt: &[u32; ROWS],
-            pool: &mut [u8; BYTES],
-            m: &mut Meta,
-            hot: &mut [(u32, u32); $k],
-            cold: &mut [Cold; $k],
-        ) {
-            let mut dead = false;
-            while !dead {
-                $(
-                    hot[$i] = step(tt, pool, m, &mut cold[$i], hot[$i].0, hot[$i].1, &mut dead);
-                )*
-            }
+/// The lock-step walk for 24 lanes, too many for registers. Every lane
+/// starts its first chunk in the same round, chunks taken in lane order, and
+/// writes one byte per round (a segment's end included, whose next segment
+/// writes its splitter's byte), so until a lane runs out all lanes write at
+/// the same offset of their chunks, and the chunks of lane `i` are always
+/// the `i`-th of 24 taken together. The offset and the chunks' base are
+/// shared, so a step is a load, a test and a store at a constant distance
+/// from the shared position, and the chunks turn for all lanes once per
+/// `CHUNK` rounds.
+#[inline(never)]
+fn lockstep24(
+    tt: &[u32; ROWS],
+    pool: &mut [u8; BYTES],
+    m: &mut Meta,
+    hot: &mut [(u32, u32); 24],
+    cold: &mut [Cold; 24],
+) {
+    const C: u32 = CHUNK as u32;
+    let mut p = hot.map(|h| h.0);
+    let (mut base, mut off) = (hot[0].1 / C * C, hot[0].1 % C);
+    debug_assert!(
+        (0..24).all(|i| hot[i].1 == base + i as u32 * C + off),
+        "lanes out of step"
+    );
+    let mut dead = false;
+    while !dead {
+        let at = base + off;
+        macro_rules! lanes {
+            ($($i:literal)*) => {$(
+                let e = tt[p[$i] as usize & ROW_MASK];
+                let out = at + $i * C;
+                if e & SPLIT != 0 {
+                    p[$i] = seg_turn(tt, pool, m, &mut cold[$i], p[$i], out, &mut dead);
+                } else {
+                    pool[out as usize & ROW_MASK] = e as u8;
+                    p[$i] = (e >> 8) & ROW_MASK as u32;
+                }
+            )*};
         }
-    };
+        lanes!(0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23);
+        off += 1;
+        if off == C {
+            base = turn24(m, cold, base);
+            off = 0;
+        }
+    }
+    for (i, h) in hot.iter_mut().enumerate() {
+        *h = (p[i], base + i as u32 * C + off);
+    }
 }
-lockstep_mem!(lockstep24, 24, [0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23]);
+
+/// End of a lane's segment at row `p` in [`lockstep24`]: records it and
+/// starts the next one at `out`, whose byte it writes. Returns the lane's
+/// next row, or [`DONE`] (and sets `dead`) if no segment is left.
+#[cold]
+#[inline(never)]
+fn seg_turn(
+    tt: &[u32; ROWS],
+    pool: &mut [u8; BYTES],
+    m: &mut Meta,
+    cold: &mut Cold,
+    p: u32,
+    out: u32,
+    dead: &mut bool,
+) -> u32 {
+    let s = cold.seg as usize % SEGS;
+    m.seg_len[s] = cold.written + out % CHUNK as u32 - cold.mark;
+    m.seg_next[s] = m.seg_index(p);
+    match m.seg_begin_at(tt, pool, cold, out) {
+        Some(p) => p,
+        None => {
+            *dead = true;
+            DONE
+        }
+    }
+}
+
+/// Every lane of [`lockstep24`] has filled its chunk: links each to a fresh
+/// one, taken in lane order, and returns lane 0's.
+#[cold]
+#[inline(never)]
+fn turn24(m: &mut Meta, cold: &mut [Cold; 24], base: u32) -> u32 {
+    let mut first = 0;
+    for (i, c) in cold.iter_mut().enumerate() {
+        let start = m.new_chunk(c, base + (i as u32 + 1) * CHUNK as u32, true);
+        if i == 0 {
+            first = start;
+        }
+    }
+    first
+}
 
 /// Walks every segment with `k` (1, 2, 8 or 24) lanes in lock step, then
 /// finishes the stragglers.
