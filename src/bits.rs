@@ -16,14 +16,6 @@ pub(crate) struct Bits<'a> {
     pub(crate) cnt: u32,
 }
 
-/// A saved reader position, to re-decode from.
-#[derive(Clone, Copy)]
-pub(crate) struct Mark {
-    pos: usize,
-    buf: u64,
-    cnt: u32,
-}
-
 impl<'a> Bits<'a> {
     pub(crate) fn new(src: &'a [u8]) -> Self {
         Bits {
@@ -103,20 +95,6 @@ impl<'a> Bits<'a> {
     pub(crate) fn overrun(&self) -> bool {
         self.overrun_by(0)
     }
-
-    pub(crate) fn mark(&self) -> Mark {
-        Mark {
-            pos: self.pos,
-            buf: self.buf,
-            cnt: self.cnt,
-        }
-    }
-
-    pub(crate) fn reset(&mut self, m: Mark) {
-        self.pos = m.pos;
-        self.buf = m.buf;
-        self.cnt = m.cnt;
-    }
 }
 
 /// The 8 bytes at `pos` near or past the end of `src`, zero-padded. Takes
@@ -185,24 +163,5 @@ mod tests {
             assert_eq!(b.overrun(), at as u64 > len_bits);
             assert_eq!(b.overrun_by(extra), at as u64 + extra > len_bits);
         }
-    }
-
-    /// Resetting to a mark replays the same bits.
-    #[hegel::test]
-    fn reset_replays_the_reads(tc: hegel::TestCase) {
-        use hegel::generators as gs;
-        let src = tc.draw(gs::binary().max_size(40));
-        let before = tc.draw(gs::integers::<u32>().min_value(1).max_value(32));
-        let widths =
-            tc.draw(gs::vecs(gs::integers::<u32>().min_value(1).max_value(32)).max_size(20));
-        let mut b = Bits::new(&src);
-        b.get(before);
-        let mark = b.mark();
-        let first: Vec<u32> = widths.iter().map(|&w| b.get(w)).collect();
-        let consumed = b.consumed();
-        b.reset(mark);
-        let second: Vec<u32> = widths.iter().map(|&w| b.get(w)).collect();
-        assert_eq!(first, second);
-        assert_eq!(b.consumed(), consumed);
     }
 }

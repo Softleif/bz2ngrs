@@ -554,37 +554,67 @@ fn symbols<S: Simd>(
         head,
         zero: core::hint::black_box(u8x16::splat(simd, 0)),
     };
-    let mut syms = [0u16; 64];
     for g in 0..n_selectors {
         let t = &tables[usize::from(selectors[g % (1 << 15)]) % 8];
-        let start = br.mark();
-        // Decode up to 50 codes, stopping after EOB. A refill leaves at least
-        // 56 bits: two codes of up to 20 bits, or four of up to 14, which
-        // most tables' codes are.
-        let (k, bad) = if t.maxlen <= 14 {
-            decode_group::<4>(t, br, &mut syms, eob)
+        // A refill leaves at least 56 bits: two codes of up to 20 bits, or
+        // four of up to 14, which most tables' codes are.
+        let end = if t.maxlen <= 14 {
+            group::<S, 4>(simd, t, br, &mut st, ll, mtf, eob, nmax)?
         } else {
-            decode_group::<2>(t, br, &mut syms, eob)
+            group::<S, 2>(simd, t, br, &mut st, ll, mtf, eob, nmax)?
         };
-        for (i, &sym) in syms[..k.min(64)].iter().enumerate() {
-            match step(simd, &mut st, u32::from(sym), ll, mtf, eob, nmax) {
+        if end {
+            return if br.overrun() {
+                Err(Fail::Eof)
+            } else {
+                Ok(st.nb)
+            };
+        }
+    }
+    Err(corrupt(br, Corruption::NoEndOfBlock))
+}
+
+/// Decodes and steps a group's codes, `N` per refill (`N` codes fit in 56
+/// bits): up to [`G_SIZE`]. Each code is stepped as soon as it is decoded,
+/// so that the decoding of the next, a chain through the bit buffer,
+/// overlaps the step, a chain through the MTF list. Returns whether the
+/// group ended the block.
+#[allow(clippy::too_many_arguments, reason = "inlined into `symbols`")]
+#[inline(always)]
+fn group<S: Simd, const N: usize>(
+    simd: S,
+    t: &HTable,
+    br: &mut Bits,
+    st: &mut Run<S>,
+    ll: &mut [u8; BYTES],
+    mtf: &mut [u8; 272],
+    eob: u32,
+    nmax: u32,
+) -> Result<bool, Fail> {
+    for r in 0..G_SIZE.div_ceil(N) {
+        br.refill();
+        // The last refill takes what is left of the group.
+        let take = if r < G_SIZE / N { N } else { G_SIZE % N };
+        for _ in 0..take {
+            let e = t.decode(br.buf);
+            let l = e & 31;
+            if l == 0 {
+                // libbz2 rejects a pattern once 21 of its bits are in.
+                return Err(if br.overrun_by(21) {
+                    Fail::Eof
+                } else {
+                    Fail::Corrupt(Corruption::HuffmanCode)
+                });
+            }
+            br.consume(l);
+            let sym = e >> 5;
+            match step(simd, st, sym, ll, mtf, eob, nmax) {
                 CONT => {}
-                EOB => {
-                    return if br.overrun() {
-                        Err(Fail::Eof)
-                    } else {
-                        Ok(st.nb)
-                    };
-                }
+                EOB => return Ok(true),
                 _ => {
-                    // libbz2 stops right after this symbol: truncated only if
-                    // its bits are not all in the input. Rewinding to it also
-                    // gives the error its position.
-                    br.reset(start);
-                    for _ in 0..=i {
-                        br.refill();
-                        br.consume(t.decode(br.buf) & 31);
-                    }
+                    // libbz2 stops right after this symbol, which is where
+                    // the reader is: truncated only if its bits are not all
+                    // in the input.
                     let kind = if sym < 2 && st.rshift >= 21 {
                         Corruption::RunTooLong
                     } else {
@@ -594,48 +624,8 @@ fn symbols<S: Simd>(
                 }
             }
         }
-        if bad {
-            // libbz2 rejects a pattern once 21 of its bits are in.
-            return Err(if br.overrun_by(21) {
-                Fail::Eof
-            } else {
-                Fail::Corrupt(Corruption::HuffmanCode)
-            });
-        }
     }
-    Err(corrupt(br, Corruption::NoEndOfBlock))
-}
-
-/// Decodes a group's codes into `syms`, `N` per refill (`N` codes fit in 56
-/// bits): up to [`G_SIZE`], stopping after EOB or at a pattern that is no
-/// code. Returns the codes decoded and whether it stopped at such a pattern.
-#[inline(always)]
-fn decode_group<const N: usize>(
-    t: &HTable,
-    br: &mut Bits,
-    syms: &mut [u16; 64],
-    eob: u32,
-) -> (usize, bool) {
-    let mut k = 0usize;
-    for r in 0..G_SIZE.div_ceil(N) {
-        br.refill();
-        // The last refill takes what is left of the group.
-        let take = if r < G_SIZE / N { N } else { G_SIZE % N };
-        for _ in 0..take {
-            let e = t.decode(br.buf);
-            let l = e & 31;
-            if l == 0 {
-                return (k, true);
-            }
-            br.consume(l);
-            syms[k % 64] = (e >> 5) as u16;
-            k += 1;
-            if e >> 5 == eob {
-                return (k, false);
-            }
-        }
-    }
-    (k, false)
+    Ok(false)
 }
 
 /// One symbol (`kern_template.h` SYMBOL_STEP): run and literal symbols take
