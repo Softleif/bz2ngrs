@@ -44,7 +44,8 @@ pub(crate) struct Scratch {
 struct Small {
     tables: [HTable; 8],
     selectors: [u8; 1 << 15],
-    lens: [[u8; MAX_ALPHA]; 6],
+    /// Per table; 16 bytes of slack for the whole-vector run stores.
+    lens: [[u8; MAX_ALPHA + 16]; 6],
     /// The MTF list; entries 16.. are the tail behind the vector head.
     mtf: [u8; 272],
 }
@@ -58,7 +59,7 @@ impl Scratch {
             small: Small {
                 tables: [HTable::ZERO; 8],
                 selectors: [0; 1 << 15],
-                lens: [[0; MAX_ALPHA]; 6],
+                lens: [[0; MAX_ALPHA + 16]; 6],
                 mtf: [0; 272],
             },
         })
@@ -425,7 +426,8 @@ fn block_tables<S: Simd>(simd: S, br: &mut Bits, sc: &mut Scratch) -> Result<(u3
     }
     // Selector MTF values are undone as they arrive. A unary code is a count
     // of leading ones.
-    let mut pos = [0u8, 1, 2, 3, 4, 5];
+    // The selector MTF list, entry k in byte k.
+    let mut pos = 0x0504_0302_0100u64;
     let mut used = 0u8;
     for i in 0..n_selectors {
         if br.cnt < 8 {
@@ -438,9 +440,10 @@ fn block_tables<S: Simd>(simd: S, br: &mut Bits, sc: &mut Scratch) -> Result<(u3
         }
         br.consume(j as u32 + 1);
         if i < MAX_SELECTORS {
-            let v = pos[j % 6];
-            pos.copy_within(0..j % 6, 1);
-            pos[0] = v;
+            let at = 8 * (j % 6);
+            let v = (pos >> at) as u8;
+            let below = (1u64 << at) - 1;
+            pos = (pos & !((below << 8) | 0xff)) | ((pos & below) << 8) | u64::from(v);
             sc.small.selectors[i % (1 << 15)] = v;
             used |= 1 << v;
         }
@@ -465,7 +468,15 @@ fn block_tables<S: Simd>(simd: S, br: &mut Bits, sc: &mut Scratch) -> Result<(u3
             let z = br.buf.leading_zeros().min(br.cnt) as usize;
             if z > 0 {
                 let z = z.min(alpha_size - i);
-                lens[i..i + z].fill(curr as u8);
+                // Whole 16-byte stores, not a call to memset per run; the
+                // bytes past the run are written again or lie past the
+                // alphabet.
+                let run = [curr as u8; 16];
+                for k in (0..z).step_by(16) {
+                    if let Some(d) = lens.get_mut(i + k..i + k + 16) {
+                        d.copy_from_slice(&run);
+                    }
+                }
                 br.consume(z as u32);
                 i += z;
                 continue;
