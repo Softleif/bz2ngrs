@@ -103,15 +103,16 @@ fn build_t(tt: &mut [u32; ROWS], ll: &[u8; BYTES], n: u32) {
         h[PARTS - 1][at(PARTS - 1, i)] += 1;
     }
 
-    // Exclusive prefix sums, split into per-part cursors.
-    let mut cf = [[0u32; 256]; PARTS];
+    // Exclusive prefix sums, in place: the counts become per-part cursors.
     let mut sum = 0u32;
     for c in 0..256 {
-        for k in 0..PARTS {
-            cf[k][c] = sum;
-            sum += h[k][c];
+        for h in &mut h {
+            let x = h[c];
+            h[c] = sum;
+            sum += x;
         }
     }
+    let mut cf = h;
 
     // Four parts per pass: eight at once spill on x86-64 (16 registers) and
     // gain nothing on aarch64. All cursors are loaded before any entry is
