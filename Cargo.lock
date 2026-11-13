@@ -112,7 +112,7 @@ checksum = "3e91d94c6885390b81782d7ee60fd6583b33907333a8b340de25ccf468353315"
 dependencies = [
  "proc-macro2",
  "quote",
- "syn 3.0.9",
+ "syn 3.0.10",
 ]
 
 [[package]]
@@ -133,9 +133,9 @@ dependencies = [
 
 [[package]]
 name = "hegeltest"
-version = "0.52.0"
+version = "0.52.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f6b95008b427c3bd008deeafe667169eae3f69543035f2ce57e9b9bba45876c0"
+checksum = "1747a2cc6f35b8b7cd64d8934513074275c35d753e97eb5d021406580bfc2645"
 dependencies = [
  "hegeltest-macros",
  "parking_lot",
@@ -143,9 +143,9 @@ dependencies = [
 
 [[package]]
 name = "hegeltest-macros"
-version = "0.52.0"
+version = "0.52.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7ccc83b3daf472bc2d84b675ac403fdfcc76df02044a2ab9facc1294baeba017"
+checksum = "e5b90edbcfbc33749cb3f9dd0de7a178656d3980d3f53060ca5dffc5ff4206f0"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -255,9 +255,9 @@ checksum = "f8fadd59c855ef2080decdef8ff161eb6661b86933c9d82e5ba29dc602a55aba"
 
 [[package]]
 name = "smallvec"
-version = "1.16.4"
+version = "1.16.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d0d5d4b1981b8bbbb7aed204cae5726d683d5d6ac7e74ec54122ea28f315e7c8"
+checksum = "149309498a5f7334b12ddae0cad8aba81ce785fe91755068867e017cf98fee46"
 
 [[package]]
 name = "spin"
@@ -278,9 +278,9 @@ dependencies = [
 
 [[package]]
 name = "syn"
-version = "3.0.9"
+version = "3.0.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d78c8dee4c7bf0e14673097256fed6142ce9d3b85a408189d07482442145823b"
+checksum = "4ae9ccbea3a7b0b09443036490c8f34a8b1b760fd345e5c0dae0aac718faea79"
 dependencies = [
  "proc-macro2",
  "quote",
