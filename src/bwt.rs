@@ -128,15 +128,29 @@ fn build_t(tt: &mut [u32; ROWS], ll: &[u8; BYTES], n: u32) {
     }
 
     // Exclusive prefix sums, in place: the counts become per-part cursors.
-    let mut sum = 0u32;
-    for c in 0..256 {
-        for h in &mut h {
-            let x = h[c];
-            h[c] = sum;
-            sum += x;
+    // Symbol by symbol, the parts' counts, then the parts within each
+    // symbol: the serial chain runs over the 256 totals only, and the rest
+    // vectorises over the symbols.
+    let mut base = [0u32; 256];
+    for h in &h {
+        for (b, &x) in base.iter_mut().zip(h) {
+            *b += x;
         }
     }
-    let mut cf = h;
+    let mut sum = 0u32;
+    for b in &mut base {
+        let x = *b;
+        *b = sum;
+        sum += x;
+    }
+    for h in &mut h {
+        for (x, b) in h.iter_mut().zip(&mut base) {
+            let c = *x;
+            *x = *b;
+            *b += c;
+        }
+    }
+    let cf = &mut h;
 
     // Four parts per pass: eight at once spill on x86-64 (16 registers) and
     // gain nothing on aarch64. All cursors are loaded before any entry is
@@ -144,7 +158,7 @@ fn build_t(tt: &mut [u32; ROWS], ll: &[u8; BYTES], n: u32) {
     // dec_block.c).
     for g in (0..PARTS).step_by(4) {
         #[cfg(target_arch = "aarch64")]
-        let i0 = scatter_runs(tt, ll, &mut cf, g, q);
+        let i0 = scatter_runs(tt, ll, cf, g, q);
         #[cfg(not(target_arch = "aarch64"))]
         let i0 = 0;
         for i in i0..q {
