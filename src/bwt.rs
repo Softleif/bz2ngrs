@@ -323,7 +323,9 @@ struct Cold {
 
 /// One step of a lane: emits the current row's byte and follows the table.
 /// A marked row (end of segment) and a full chunk go out of line. Returns
-/// the new `p` and `out`, and false when the lane has nothing left to walk.
+/// the new `p` and `out`; sets `dead` when the lane has nothing left to walk,
+/// which only the out-of-line path can find, so the steps of a round do not
+/// carry a flag each.
 #[inline(always)]
 fn step(
     tt: &[u32; ROWS],
@@ -332,17 +334,20 @@ fn step(
     cold: &mut Cold,
     p: u32,
     out: u32,
-) -> (u32, u32, bool) {
+    dead: &mut bool,
+) -> (u32, u32) {
     let e = tt[p as usize & ROW_MASK];
     if e & SPLIT != 0 {
-        return seg_done(tt, pool, m, cold, p, out);
+        let (p, out, live) = seg_done(tt, pool, m, cold, p, out);
+        *dead |= !live;
+        return (p, out);
     }
     pool[out as usize & ROW_MASK] = e as u8;
     let (p, out) = ((e >> 8) & ROW_MASK as u32, out + 1);
     if (out as usize).is_multiple_of(CHUNK) {
-        return (p, chunk_full(m, cold, out), true);
+        return (p, chunk_full(m, cold, out));
     }
-    (p, out, true)
+    (p, out)
 }
 
 #[cold]
@@ -388,13 +393,10 @@ macro_rules! lockstep {
             cold: &mut [Cold; $k],
         ) {
             $(let (mut $p, mut $o) = hot[$i];)*
-            let mut live = true;
-            while live {
+            let mut dead = false;
+            while !dead {
                 $(
-                    let (p, o, l) = step(tt, pool, m, &mut cold[$i], $p, $o);
-                    $p = p;
-                    $o = o;
-                    live &= l;
+                    ($p, $o) = step(tt, pool, m, &mut cold[$i], $p, $o, &mut dead);
                 )*
             }
             $(hot[$i] = ($p, $o);)*
@@ -418,12 +420,10 @@ macro_rules! lockstep_mem {
             hot: &mut [(u32, u32); $k],
             cold: &mut [Cold; $k],
         ) {
-            let mut live = true;
-            while live {
+            let mut dead = false;
+            while !dead {
                 $(
-                    let (p, o, l) = step(tt, pool, m, &mut cold[$i], hot[$i].0, hot[$i].1);
-                    hot[$i] = (p, o);
-                    live &= l;
+                    hot[$i] = step(tt, pool, m, &mut cold[$i], hot[$i].0, hot[$i].1, &mut dead);
                 )*
             }
         }
@@ -479,8 +479,9 @@ fn walk(tt: &[u32; ROWS], pool: &mut [u8; BYTES], m: &mut Meta, k: usize) {
         if i >= active {
             i = 0;
         }
-        let (p, o, live) = step(tt, pool, m, &mut cold[i], hot[i].0, hot[i].1);
-        if live {
+        let mut dead = false;
+        let (p, o) = step(tt, pool, m, &mut cold[i], hot[i].0, hot[i].1, &mut dead);
+        if !dead {
             hot[i] = (p, o);
             i += 1;
         } else {
