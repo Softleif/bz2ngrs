@@ -404,25 +404,31 @@ lockstep!(lockstep1, 1, [(p0 o0 0)]);
 lockstep!(lockstep2, 2, [(p0 o0 0) (p1 o1 1)]);
 lockstep!(lockstep8, 8, [(p0 o0 0) (p1 o1 1) (p2 o2 2) (p3 o3 3) (p4 o4 4) (p5 o5 5) (p6 o6 6) (p7 o7 7)]);
 
-/// [`lockstep!`] for lane counts too large for registers, where unrolling
-/// only adds spills: the lanes stay in their arrays.
-#[inline(never)]
-fn lockstep_mem<const K: usize>(
-    tt: &[u32; ROWS],
-    pool: &mut [u8; BYTES],
-    m: &mut Meta,
-    hot: &mut [(u32, u32); K],
-    cold: &mut [Cold; K],
-) {
-    let mut dead = 0u32;
-    while dead == 0 {
-        for (k, (h, c)) in hot.iter_mut().zip(cold.iter_mut()).enumerate() {
-            let (p, o, l) = step(tt, pool, m, c, h.0, h.1);
-            *h = (p, o);
-            dead |= u32::from(!l) << k;
+/// [`lockstep!`] for lane counts too large for registers: the lanes stay in
+/// their arrays, but the steps are still written out (a loop over the lanes
+/// costs as many instructions again as a step).
+macro_rules! lockstep_mem {
+    ($name:ident, $k:literal, [$($i:literal)*]) => {
+        #[inline(never)]
+        fn $name(
+            tt: &[u32; ROWS],
+            pool: &mut [u8; BYTES],
+            m: &mut Meta,
+            hot: &mut [(u32, u32); $k],
+            cold: &mut [Cold; $k],
+        ) {
+            let mut live = true;
+            while live {
+                $(
+                    let (p, o, l) = step(tt, pool, m, &mut cold[$i], hot[$i].0, hot[$i].1);
+                    hot[$i] = (p, o);
+                    live &= l;
+                )*
+            }
         }
-    }
+    };
 }
+lockstep_mem!(lockstep24, 24, [0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23]);
 
 /// Walks every segment with `k` (1, 2, 8 or 24) lanes in lock step, then
 /// finishes the stragglers.
@@ -452,7 +458,7 @@ fn walk(tt: &[u32; ROWS], pool: &mut [u8; BYTES], m: &mut Meta, k: usize) {
             };
         }
         match k {
-            24 => run!(lockstep_mem, 24),
+            24 => run!(lockstep24, 24),
             8 => run!(lockstep8, 8),
             2 => run!(lockstep2, 2),
             _ => run!(lockstep1, 1),
