@@ -475,6 +475,7 @@ macro_rules! lockstep {
 }
 lockstep!(lockstep1, 1, [(p0 o0 0)]);
 lockstep!(lockstep2, 2, [(p0 o0 0) (p1 o1 1)]);
+lockstep!(lockstep4, 4, [(p0 o0 0) (p1 o1 1) (p2 o2 2) (p3 o3 3)]);
 lockstep!(lockstep8, 8, [(p0 o0 0) (p1 o1 1) (p2 o2 2) (p3 o3 3) (p4 o4 4) (p5 o5 5) (p6 o6 6) (p7 o7 7)]);
 
 /// The lock-step walk for 24 lanes, too many for registers. Every lane
@@ -587,23 +588,28 @@ fn walk(tt: &[u32; ROWS], pool: &mut [u8; BYTES], m: &mut Meta, k: usize) {
         cold[active] = c;
         active += 1;
     }
+    macro_rules! run {
+        ($f:ident, $n:literal) => {
+            match (hot.first_chunk_mut::<$n>(), cold.first_chunk_mut::<$n>()) {
+                (Some(h), Some(c)) => $f(tt, pool, m, h, c),
+                _ => {}
+            }
+        };
+    }
     if active == k {
-        macro_rules! run {
-            ($f:ident, $n:literal) => {
-                match (hot.first_chunk_mut::<$n>(), cold.first_chunk_mut::<$n>()) {
-                    (Some(h), Some(c)) => $f(tt, pool, m, h, c),
-                    _ => {}
-                }
-            };
-        }
         match k {
             24 => run!(lockstep24, 24),
             8 => run!(lockstep8, 8),
             2 => run!(lockstep2, 2),
             _ => run!(lockstep1, 1),
         }
+    }
+    // The lanes left, in lock step in groups of 8, 4, 2 or 1 until one of
+    // the group runs out, the others waiting; a group in lock step overlaps
+    // its lanes' chains, where taking the lanes in turn does not.
+    loop {
         let mut a = 0;
-        for i in 0..k {
+        for i in 0..active {
             if hot[i].0 != DONE {
                 hot[a] = hot[i];
                 cold[a] = cold[i];
@@ -611,21 +617,12 @@ fn walk(tt: &[u32; ROWS], pool: &mut [u8; BYTES], m: &mut Meta, k: usize) {
             }
         }
         active = a;
-    }
-    let mut i = 0;
-    while active > 0 {
-        if i >= active {
-            i = 0;
-        }
-        let mut dead = false;
-        let (p, o) = step(tt, pool, m, &mut cold[i], hot[i].0, hot[i].1, &mut dead);
-        if !dead {
-            hot[i] = (p, o);
-            i += 1;
-        } else {
-            active -= 1;
-            hot[i] = hot[active];
-            cold[i] = cold[active];
+        match active {
+            0 => break,
+            1 => run!(lockstep1, 1),
+            2 | 3 => run!(lockstep2, 2),
+            4..8 => run!(lockstep4, 4),
+            _ => run!(lockstep8, 8),
         }
     }
 }
