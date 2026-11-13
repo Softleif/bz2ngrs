@@ -93,11 +93,18 @@ fn dirty_work(tc: &TestCase, n: usize) -> Vec<i32> {
 
 /// The sorter's results for the Lyndon word `t`, with `work` as its work
 /// array: BWT, histogram, row of `q`.
-fn run_bwt(t: &[u8], q: usize, mut work: Vec<i32>) -> (Vec<u8>, [i32; 256], usize) {
-    let mut l = t.to_vec();
-    let mut freq = [0; 256];
-    let row = sort::bwt(&mut l, q, &mut freq, &mut work);
-    (l, freq, row)
+/// The sorter's BWT of `t`, the same at every level.
+fn run_bwt(t: &[u8], q: usize, work: Vec<i32>) -> (Vec<u8>, [i32; 256], usize) {
+    let mut first = None;
+    for level in crate::tests::levels() {
+        let (mut l, mut freq, mut work) = (t.to_vec(), [0; 256], work.clone());
+        let row = fearless_simd::dispatch!(level, simd => sort::bwt(simd, &mut l, q, &mut freq, &mut work));
+        match &first {
+            None => first = Some((l, freq, row)),
+            Some(f) => assert!(*f == (l, freq, row), "differs at {level:?}"),
+        }
+    }
+    first.expect("at least the fallback level")
 }
 
 fn histogram(t: &[u8]) -> [i32; 256] {

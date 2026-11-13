@@ -1,11 +1,12 @@
 //! The block sorter's top level: SA-IS stages 1 and 2 on the block's bytes,
 //! and the placement of the sorted LMS suffixes for the final induction.
 //!
-//! Ported from libsais, Copyright (c) 2021-2025 Ilya Grebnov, under the
-//! Apache License 2.0 with LLVM Exceptions (`LICENSE-libsais`), from the copy
-//! at commit 1a696e6 that bz2-ng vendors: the single-threaded path of
-//! `libsais_main_8u` up to the final induction:
-//! `count_and_gather_lms_suffixes_8u`, the LMS radix sort, the partial-order
+//! Ported from libsais, Copyright (c) 2021-2026 Ilya Grebnov, under the
+//! Apache License 2.0 with LLVM Exceptions (`LICENSE-libsais`), from the
+//! copies at commit 1a696e6 and release 2.12.0 that bz2-ng vendors: the
+//! single-threaded path of `libsais_main_8u` up to the final induction:
+//! `count_and_gather_lms_suffixes_8u` (with 2.12.0's 64-byte classification,
+//! LMS lanes and four histograms), the LMS radix sort, the partial-order
 //! scans with their 2-symbol buckets and sign-bit name marks, renumbering and
 //! gathering, and `place_lms_suffixes_interval_8u`. Altered: written in Rust,
 //! without the OpenMP paths and the GSA flag, with fewer prefetches, with the bucket
@@ -39,6 +40,9 @@ impl Buckets {
     }
 }
 
+use fearless_simd::{Simd, SimdBase};
+
+use super::load64;
 use super::sort::{PF, prefetch};
 
 const MIN: i32 = i32::MIN;
@@ -61,15 +65,84 @@ fn l_type(c0: u8, c1: u8, f1: bool) -> bool {
     i32::from(c0) > i32::from(c1) - i32::from(f1)
 }
 
+/// For each byte of LMS flags (bit j: offset j), its offsets descending and
+/// right-aligned, so that eight stores ending at the write cursor put them
+/// in place (libsais 2.12.0's `lms_lanes`).
+const LMS_LANES: [[u8; 8]; 256] = {
+    let mut t = [[0; 8]; 256];
+    let mut x = 0;
+    while x < 256 {
+        let (mut j, mut slot) = (8, 8);
+        while j > 0 {
+            j -= 1;
+            if x & (1 << j) != 0 {
+                slot -= 1;
+                t[x][slot] = j as u8;
+            }
+        }
+        x += 1;
+    }
+    t
+};
+
 /// Counts the suffixes by symbol and type pair into `bk.b4`, and gathers the
 /// LMS positions, ascending, into `sa[n - m..n]`; returns `m`.
-pub(super) fn count_and_gather(t: &[u8], sa: &mut [i32], bk: &mut Buckets) -> usize {
-    bk.b4.fill(0);
+///
+/// The types of 64 positions at a time come from two vector compares with
+/// their successors (libsais 2.12.0's `classify_suffixes_8u`): a position is
+/// L-type if its byte is greater than the next, or equal to it and the next
+/// is L-type, which an addition carries through each run of equal bytes.
+/// That takes the type, a chain from byte to byte, off the counting loop.
+#[inline(always)]
+pub(super) fn count_and_gather<S: Simd>(
+    simd: S,
+    t: &[u8],
+    sa: &mut [i32],
+    bk: &mut Buckets,
+) -> usize {
     let n = t.len();
     let mut m = n - 1;
-    // The last suffix is L-type: the implicit sentinel after it is smaller.
-    let (mut c0, mut f0) = (t[n - 1], true);
-    for i in (0..n - 1).rev() {
+    // `c0`, `f0`: the byte and type (L = true) of position `i`, whose
+    // predecessors are still to do. The last suffix is L-type: the implicit
+    // sentinel after it is smaller.
+    let (mut i, mut c0, mut f0) = (n - 1, t[n - 1], true);
+    let mut h = [[0i32; 1024]; 4];
+    while i >= 64 {
+        let base = i - 64;
+        let (a, b) = (load64(simd, t, base), load64(simd, t, base + 1));
+        // Bit j stands for position i - 1 - j, so that a carry runs down.
+        let ge = simd.to_bitmask_mask8x64(a.simd_ge(b)).reverse_bits();
+        let eq = simd.to_bitmask_mask8x64(a.simd_eq(b)).reverse_bits();
+        let types =
+            (ge ^ (eq & ge.wrapping_add(ge ^ eq).wrapping_add(u64::from(f0)))).reverse_bits();
+        // Bit k: the type of position base + k, for k in 0..=64.
+        let ext = u128::from(types) | (u128::from(f0) << 64);
+        // Bit k - 1 set: position base + k is S-type after an L-type one.
+        let lms = (ext & !(ext >> 1)) as u64;
+        for b in (0..8).rev() {
+            let x = (lms >> (8 * b)) as u8;
+            let at = (base + 8 * b + 1) as i32;
+            let dst = &mut sa[m - 7..=m];
+            for (d, &o) in dst.iter_mut().zip(&LMS_LANES[usize::from(x)]) {
+                *d = at + i32::from(o);
+            }
+            m -= x.count_ones() as usize;
+        }
+        // Four tables, as a run of one byte increments one counter.
+        let bytes = t[base + 1..=i].as_chunks::<4>().0;
+        for (k, c) in bytes.iter().enumerate() {
+            let e = (ext >> (4 * k)) as usize;
+            h[0][idx4(c[0], e)] += 1;
+            h[1][idx4(c[1], e >> 1)] += 1;
+            h[2][idx4(c[2], e >> 2)] += 1;
+            h[3][idx4(c[3], e >> 3)] += 1;
+        }
+        (i, c0, f0) = (base, t[base], types & 1 != 0);
+    }
+    for (j, b) in bk.b4.iter_mut().enumerate() {
+        *b = h[0][j] + h[1][j] + h[2][j] + h[3][j];
+    }
+    for i in (0..i).rev() {
         let c1 = t[i];
         let f1 = l_type(c1, c0, f0);
         sa[m] = (i + 1) as i32;
@@ -283,4 +356,72 @@ pub(super) fn place_lms(sa: &mut [i32], n: usize, mut m: usize, bk: &Buckets) {
         }
     }
     sa[..j].fill(0);
+}
+
+#[cfg(test)]
+mod tests {
+    use hegel::TestCase;
+    use hegel::generators as gs;
+
+    use super::{Buckets, count_and_gather, idx4, l_type};
+
+    /// libsais's byte-at-a-time pass: each suffix's type from its
+    /// successor's.
+    fn count_and_gather_scalar(t: &[u8], sa: &mut [i32], bk: &mut Buckets) -> usize {
+        bk.b4.fill(0);
+        let n = t.len();
+        let mut m = n - 1;
+        let (mut c0, mut f0) = (t[n - 1], true);
+        for i in (0..n - 1).rev() {
+            let c1 = t[i];
+            let f1 = l_type(c1, c0, f0);
+            sa[m] = (i + 1) as i32;
+            m -= usize::from(f1 && !f0);
+            bk.b4[idx4(c0, 2 * usize::from(f0) + usize::from(f1))] += 1;
+            (c0, f0) = (c1, f1);
+        }
+        sa[m] = 0;
+        bk.b4[idx4(c0, 2 * usize::from(f0))] += 1;
+        n - 1 - m
+    }
+
+    /// Bytes over 1 to 256 symbols, each repeated 1 to 300 times or (so that
+    /// LMS positions come as densely as they can) once, so that runs and
+    /// dense stretches cross the 64-byte steps.
+    #[hegel::test(test_cases = 1000)]
+    fn count_and_gather_matches_the_byte_loop(tc: TestCase) {
+        let k = tc.draw(gs::integers::<u16>().min_value(1).max_value(256));
+        let max_run = tc.draw(gs::sampled_from(vec![1u16, 2, 300]));
+        let runs = tc.draw(
+            gs::vecs(gs::tuples2(
+                gs::integers::<u8>(),
+                gs::integers::<u16>().min_value(1).max_value(max_run),
+            ))
+            .min_size(1)
+            .max_size(400),
+        );
+        let mut t: Vec<u8> = runs
+            .iter()
+            .flat_map(|&(b, l)| std::iter::repeat_n((u16::from(b) % k) as u8, usize::from(l)))
+            .collect();
+        // "ba" repeated has an LMS position at every other byte, the most.
+        if tc.draw(gs::booleans()) {
+            let at = tc.draw(gs::integers::<usize>()) % t.len();
+            let reps = tc.draw(gs::integers::<usize>().max_value(200));
+            t.splice(at..at, b"ba".repeat(reps));
+        }
+        let n = t.len();
+        let mut sa = vec![0; n];
+        let mut bk = Buckets::new();
+        let m = count_and_gather_scalar(&t, &mut sa, &mut bk);
+        let want = (m, sa[n - m..].to_vec(), bk.b4);
+        for level in crate::tests::levels() {
+            let (mut sa, mut bk) = (vec![0; n], Buckets::new());
+            let m = fearless_simd::dispatch!(level, simd => count_and_gather(simd, &t, &mut sa, &mut bk));
+            assert!(
+                (m, sa[n - m..].to_vec(), bk.b4) == want,
+                "at {level:?}, n = {n}"
+            );
+        }
+    }
 }

@@ -24,6 +24,8 @@
 //! (`SORT_SUFFIX0_APART` on; branchy naming, branchy selects and no
 //! empty-slot skipping), since rustc's backend is LLVM.
 
+use fearless_simd::Simd;
+
 use super::sais_top as top;
 use super::sais32;
 
@@ -81,7 +83,13 @@ fn free_len(n: usize) -> usize {
 /// histogram of `t` into `freq`; returns the row of rotation `q < t.len()`.
 /// `work` is grown to [`work_len`] if it is shorter. The top level's
 /// left-to-right scan picks the bucket-cursor mode of everything after it.
-pub(crate) fn bwt(t: &mut [u8], q: usize, freq: &mut [i32; 256], work: &mut Vec<i32>) -> usize {
+pub(crate) fn bwt<S: Simd>(
+    simd: S,
+    t: &mut [u8],
+    q: usize,
+    freq: &mut [i32; 256],
+    work: &mut Vec<i32>,
+) -> usize {
     let n = t.len();
     if n <= 1 {
         freq.fill(0);
@@ -96,7 +104,7 @@ pub(crate) fn bwt(t: &mut [u8], q: usize, freq: &mut [i32; 256], work: &mut Vec<
     let fs = free_len(n);
     let (sa, lms) = work.split_at_mut(n + fs);
     let mut bk = top::Buckets::new();
-    let m = top::count_and_gather(t, sa, &mut bk);
+    let m = top::count_and_gather(simd, t, sa, &mut bk);
     lms[..m].copy_from_slice(&sa[n - m..n]);
     top::start_and_end(&mut bk, freq);
     let mut mode = false;

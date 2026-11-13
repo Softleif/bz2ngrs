@@ -45,7 +45,7 @@ pub(crate) fn sort_block<S: Simd>(
     debug_assert!(p < n || !periodic, "periodic block without a root");
     let m = n / p;
     let q = (n - r) % n;
-    let rank = sort::bwt(&mut tt[r..r + p], q % p, freq, work);
+    let rank = sort::bwt(simd, &mut tt[r..r + p], q % p, freq, work);
     if m > 1 {
         let l = &mut tt[r..r + n];
         for i in (0..p).rev() {
