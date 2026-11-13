@@ -102,10 +102,37 @@ fn main() {
     let hdr = out.join("ng_rename.h");
     fs::write(&hdr, rename).unwrap();
 
+    // lib/sort_libsais.c includes libsais.c with the patches in
+    // third_party/libsais/patches applied, as CMake applies them at configure
+    // time. shortcut: patches/SHA256 is not checked; CMake's build checks it.
+    let sais_src = dir.join("third_party/libsais");
+    let sais = out.join("libsais");
+    fs::create_dir_all(&sais).unwrap();
+    for f in ["libsais.c", "libsais.h"] {
+        fs::copy(sais_src.join(f), sais.join(f)).unwrap();
+    }
+    let mut patches: Vec<_> = fs::read_dir(sais_src.join("patches"))
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .filter(|p| p.extension().is_some_and(|e| e == "patch"))
+        .collect();
+    patches.sort();
+    for p in &patches {
+        let st = std::process::Command::new("patch")
+            .args(["-p1", "--forward", "--batch", "-s", "-i"])
+            .arg(p)
+            .current_dir(&sais)
+            .status()
+            .expect("run patch");
+        assert!(st.success(), "{p:?} does not apply to libsais");
+    }
+    println!("cargo:rerun-if-changed={}", sais_src.display());
+
     let mut objects = Vec::new();
     for src in SOURCES {
         let mut b = cc::Build::new();
         b.file(dir.join(src))
+            .include(&sais)
             .include(&dir)
             .include(dir.join("lib"))
             .std("c11")
