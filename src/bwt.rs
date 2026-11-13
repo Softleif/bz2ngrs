@@ -118,7 +118,11 @@ fn build_t(tt: &mut [u32; ROWS], ll: &[u8; BYTES], n: u32) {
     // stored, and each entry is stored before its cursor (the clang order of
     // dec_block.c).
     for g in (0..PARTS).step_by(4) {
-        for i in 0..q {
+        #[cfg(target_arch = "aarch64")]
+        let i0 = scatter_runs(tt, ll, &mut cf, g, q);
+        #[cfg(not(target_arch = "aarch64"))]
+        let i0 = 0;
+        for i in i0..q {
             let c: [usize; 4] = core::array::from_fn(|k| at(g + k, i));
             let j: [u32; 4] = core::array::from_fn(|k| cf[g + k][c[k]]);
             for k in 0..4 {
@@ -133,6 +137,71 @@ fn build_t(tt: &mut [u32; ROWS], ll: &[u8; BYTES], n: u32) {
         tt[j as usize & ROW_MASK] = (((PARTS - 1) * q + i) as u32) << 8 | c as u32;
         cf[PARTS - 1][c] = j + 1;
     }
+}
+
+/// Rows of a part taken as one group by [`scatter_runs`].
+#[cfg(target_arch = "aarch64")]
+const RUN: usize = 16;
+
+/// [`build_t`]'s scatter of parts `g..g + 4`, `RUN` rows at a time: when a
+/// part's `RUN` symbols are all `c`, their entries go to the `RUN`
+/// consecutive rows at its cursor for `c` with consecutive row numbers, one
+/// run of stores and one cursor update. The mixed parts of a group are
+/// scattered row by row. Returns the row the rest of the scatter starts at.
+///
+/// Only on aarch64: on x86-64 the test for a run costs mixed data more than
+/// runs gain (bz2-ng 517948e).
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+fn scatter_runs(
+    tt: &mut [u32; ROWS],
+    ll: &[u8; BYTES],
+    cf: &mut [[u32; 256]; PARTS],
+    g: usize,
+    q: usize,
+) -> usize {
+    let word =
+        |p: usize| u64::from_le_bytes(*ll[p & ROW_MASK..].first_chunk::<8>().unwrap_or(&[0; 8]));
+    // Nonzero unless the 16 bytes at `p` are all equal.
+    let mixed16 = |p: usize| {
+        let (a, b) = (word(p), word(p + 8));
+        (a ^ b) | (a ^ a.rotate_right(8))
+    };
+    let mut i = 0;
+    while i + RUN <= q {
+        let mut mixed = 0u32;
+        for k in 0..4 {
+            mixed |= u32::from(mixed16((g + k) * q + i) != 0) << k;
+        }
+        for k in 0..4 {
+            if mixed & (1 << k) == 0 {
+                let c = usize::from(ll[((g + k) * q + i) & ROW_MASK]);
+                let j = cf[g + k][c] as usize;
+                let e = (((g + k) * q + i) as u32) << 8 | c as u32;
+                if let Some(run) = tt.get_mut(j..j + RUN) {
+                    for (t, x) in run.iter_mut().enumerate() {
+                        *x = e + ((t as u32) << 8);
+                    }
+                }
+                cf[g + k][c] = (j + RUN) as u32;
+            }
+        }
+        if mixed != 0 {
+            for r in i..i + RUN {
+                for k in 0..4 {
+                    if mixed & (1 << k) != 0 {
+                        let row = (g + k) * q + r;
+                        let c = usize::from(ll[row & ROW_MASK]);
+                        let j = cf[g + k][c];
+                        tt[j as usize & ROW_MASK] = (row as u32) << 8 | c as u32;
+                        cf[g + k][c] = j + 1;
+                    }
+                }
+            }
+        }
+        i += RUN;
+    }
+    i
 }
 
 /// Chooses splitter rows (evenly spaced, plus `orig_ptr`), marks them in the
