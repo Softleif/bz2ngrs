@@ -111,8 +111,10 @@ fn main() {
     for f in ["libsais.c", "libsais.h"] {
         fs::copy(sais_src.join(f), sais.join(f)).unwrap();
     }
+    // Before 517948e, bz2-ng compiled libsais unpatched and found it itself.
     let mut patches: Vec<_> = fs::read_dir(sais_src.join("patches"))
-        .unwrap()
+        .into_iter()
+        .flatten()
         .map(|e| e.unwrap().path())
         .filter(|p| p.extension().is_some_and(|e| e == "patch"))
         .collect();
