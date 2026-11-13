@@ -558,27 +558,14 @@ fn symbols<S: Simd>(
     for g in 0..n_selectors {
         let t = &tables[usize::from(selectors[g % (1 << 15)]) % 8];
         let start = br.mark();
-        // Decode up to 50 codes, two per refill (a refill leaves at least 56
-        // bits and a code has at most 20), stopping after EOB.
-        let mut k = 0usize;
-        let mut bad = false;
-        'group: while k < G_SIZE {
-            br.refill();
-            for _ in 0..2 {
-                let e = t.decode(br.buf);
-                let l = e & 31;
-                if l == 0 {
-                    bad = true;
-                    break 'group;
-                }
-                br.consume(l);
-                syms[k % 64] = (e >> 5) as u16;
-                k += 1;
-                if e >> 5 == eob {
-                    break 'group;
-                }
-            }
-        }
+        // Decode up to 50 codes, stopping after EOB. A refill leaves at least
+        // 56 bits: two codes of up to 20 bits, or four of up to 14, which
+        // most tables' codes are.
+        let (k, bad) = if t.maxlen <= 14 {
+            decode_group::<4>(t, br, &mut syms, eob)
+        } else {
+            decode_group::<2>(t, br, &mut syms, eob)
+        };
         for (i, &sym) in syms[..k.min(64)].iter().enumerate() {
             match step(simd, &mut st, u32::from(sym), ll, mtf, eob, nmax) {
                 CONT => {}
@@ -617,6 +604,38 @@ fn symbols<S: Simd>(
         }
     }
     Err(corrupt(br, Corruption::NoEndOfBlock))
+}
+
+/// Decodes a group's codes into `syms`, `N` per refill (`N` codes fit in 56
+/// bits): up to [`G_SIZE`], stopping after EOB or at a pattern that is no
+/// code. Returns the codes decoded and whether it stopped at such a pattern.
+#[inline(always)]
+fn decode_group<const N: usize>(
+    t: &HTable,
+    br: &mut Bits,
+    syms: &mut [u16; 64],
+    eob: u32,
+) -> (usize, bool) {
+    let mut k = 0usize;
+    for r in 0..G_SIZE.div_ceil(N) {
+        br.refill();
+        // The last refill takes what is left of the group.
+        let take = if r < G_SIZE / N { N } else { G_SIZE % N };
+        for _ in 0..take {
+            let e = t.decode(br.buf);
+            let l = e & 31;
+            if l == 0 {
+                return (k, true);
+            }
+            br.consume(l);
+            syms[k % 64] = (e >> 5) as u16;
+            k += 1;
+            if e >> 5 == eob {
+                return (k, false);
+            }
+        }
+    }
+    (k, false)
 }
 
 /// One symbol (`kern_template.h` SYMBOL_STEP): run and literal symbols take

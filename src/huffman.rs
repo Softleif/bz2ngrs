@@ -27,7 +27,7 @@ pub(crate) struct HTable {
     first_code: [i32; MAX_CODE as usize + 2],
     first_idx: [i32; MAX_CODE as usize + 2],
     perm: [u16; MAX_ALPHA],
-    maxlen: u32,
+    pub(crate) maxlen: u32,
 }
 
 impl HTable {
