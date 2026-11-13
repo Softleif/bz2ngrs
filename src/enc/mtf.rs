@@ -8,10 +8,10 @@
 //!
 //! - Rank 0 is exactly `L[i] == L[i - 1]`, so only positions where the byte
 //!   changes are visited, found 64 at a time with vector compares.
-//! - List positions 0 to 7 live in one 64-bit word: ranks 1 to 7 are a SWAR
-//!   byte search and a masked shift.
-//! - Positions 8 to 255 live in an array, searched and shifted 16 bytes at a
-//!   time.
+//! - List positions 0 to 15 live in two 64-bit words: ranks 1 to 15 are a
+//!   SWAR byte search and masked shifts, with no branch on which word.
+//! - Positions 16 to 255 live in an array, searched and shifted 16 bytes at
+//!   a time.
 
 use fearless_simd::{Select, Simd, SimdBase, SimdFrom, u8x16, u16x8};
 
@@ -26,9 +26,11 @@ const RUNB: usize = 1;
 pub(crate) const SLACK: usize = 8;
 
 /// The MTF list: entries 0 to 7 in `head` (entry 0 in the low byte), 8 to
-/// 255 in `tail`, padded with a byte that never matches.
+/// 15 in `head1`, 16 to 255 in `tail`, padded with a byte that never
+/// matches.
 struct List {
     head: u64,
+    head1: u64,
     tail: [u8; 256],
 }
 
@@ -38,28 +40,32 @@ impl List {
     /// Moves `c` to the front and returns its rank.
     #[inline(always)]
     fn rank<S: Simd>(&mut self, simd: S, c: u8) -> usize {
-        let h = self.head;
-        // At most one byte of `x` is zero (the list holds each byte once, and
-        // `c` is never the filler), so the lowest flag is the match; the flags
-        // above it that the borrow may add are masked off by `z ^ (z - 1)`.
-        let x = h ^ (0x0101_0101_0101_0101 * u64::from(c));
-        let z = x.wrapping_sub(0x0101_0101_0101_0101) & !x & 0x8080_8080_8080_8080;
-        if z != 0 {
-            self.head = h ^ ((h ^ ((h << 8) | u64::from(c))) & (z ^ z.wrapping_sub(1)));
-            (z.trailing_zeros() >> 3) as usize
+        let (h, h1) = (self.head, self.head1);
+        // At most one byte of either word xor `c` is zero (the list holds
+        // each byte once, and `c` is never the filler), so the lowest flag is
+        // the match; the flags above it that the borrow may add are masked
+        // off by `z ^ (z - 1)`, which is all ones when `z` is 0.
+        let cc = 0x0101_0101_0101_0101 * u64::from(c);
+        let z0 = borrow_zero_bytes(h ^ cc);
+        let z1 = borrow_zero_bytes(h1 ^ cc);
+        if z0 | z1 != 0 {
+            let m1 = (z1 ^ z1.wrapping_sub(1)) & 0u64.wrapping_sub(u64::from(z1 != 0));
+            self.head1 = h1 ^ ((h1 ^ ((h1 << 8) | (h >> 56))) & m1);
+            self.head = h ^ ((h ^ ((h << 8) | u64::from(c))) & (z0 ^ z0.wrapping_sub(1)));
+            ((z0 | z1 >> 7).trailing_zeros() >> 3) as usize + 8 * usize::from(z0 == 0)
         } else {
             self.tail_to_front(simd, c)
         }
     }
 
-    /// Moves `c`, known to be at list position 8 or later, to the front;
+    /// Moves `c`, known to be at list position 16 or later, to the front;
     /// returns its rank. Each 16 bytes of the tail shift up one entry, taking
     /// the previous vector's last byte; the one holding `c` shifts only up
     /// to it.
     #[inline(always)]
     fn tail_to_front<S: Simd>(&mut self, simd: S, c: u8) -> usize {
         let vc = u8x16::splat(simd, c);
-        let mut prev = u8x16::splat(simd, (self.head >> 56) as u8);
+        let mut prev = u8x16::splat(simd, (self.head1 >> 56) as u8);
         let mut r = 0;
         for (k, chunk) in self.tail.as_chunks_mut::<16>().0.iter_mut().enumerate() {
             let cur = u8x16::simd_from(simd, *chunk);
@@ -69,15 +75,23 @@ impl List {
                 let lane = hit.trailing_zeros();
                 let keep = u8x16::simd_from(simd, IOTA).simd_le(u8x16::splat(simd, lane as u8));
                 keep.select(shifted, cur).store_slice(chunk);
-                r = 8 + 16 * k + lane as usize;
+                r = 16 + 16 * k + lane as usize;
                 break;
             }
             shifted.store_slice(chunk);
             prev = cur;
         }
+        self.head1 = (self.head1 << 8) | (self.head >> 56);
         self.head = (self.head << 8) | u64::from(c);
         r
     }
+}
+
+/// 0x80 in the lowest zero byte of `x`, and perhaps in bytes above it, where
+/// the borrow reaches.
+#[inline(always)]
+fn borrow_zero_bytes(x: u64) -> u64 {
+    x.wrapping_sub(0x0101_0101_0101_0101) & !x & 0x8080_8080_8080_8080
 }
 
 /// Bit `k` set iff `l[i + k] != l[i + k - 1]`, for `k` in `0..64`; reads
@@ -145,7 +159,7 @@ pub(crate) fn mtf<S: Simd>(
     mtfv: &mut [u16],
     freq: &mut [i32; MAX_ALPHA],
 ) -> usize {
-    let mut list = [0u8; 256 + 8];
+    let mut list = [0u8; 256 + 16];
     let mut n_in_use = 0;
     for c in 0..=255u8 {
         list[n_in_use] = c;
@@ -155,12 +169,12 @@ pub(crate) fn mtf<S: Simd>(
     // (there is one whenever there are unused slots).
     let filler = (0..=255u8).find(|&c| !in_use[usize::from(c)]).unwrap_or(0);
     list[n_in_use..].fill(filler);
-    let mut head = [0; 8];
-    head.copy_from_slice(&list[..8]);
+    let word = |at: usize| u64::from_le_bytes(*list[at..].first_chunk::<8>().unwrap_or(&[0; 8]));
     let mut tail = [0; 256];
-    tail.copy_from_slice(&list[8..]);
+    tail.copy_from_slice(&list[16..]);
     let mut lst = List {
-        head: u64::from_le_bytes(head),
+        head: word(0),
+        head1: word(8),
         tail,
     };
 
