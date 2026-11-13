@@ -94,7 +94,31 @@ fn build_t(tt: &mut [u32; ROWS], ll: &[u8; BYTES], n: u32) {
     let at = |k: usize, i: usize| usize::from(ll[(k * q + i) & ROW_MASK]);
 
     let mut h = [[0u32; 256]; PARTS];
-    for i in 0..q {
+    // On aarch64 a part's 16 equal bytes are counted at once (see
+    // `scatter_runs`).
+    #[cfg(target_arch = "aarch64")]
+    let runs = runny(ll, n);
+    #[cfg(target_arch = "aarch64")]
+    let i0 = {
+        let mut i = 0;
+        while runs && i + RUN <= q {
+            for (k, h) in h.iter_mut().enumerate() {
+                let at16 = k * q + i;
+                if mixed16(ll, at16) == 0 {
+                    h[at(k, i)] += RUN as u32;
+                } else {
+                    for r in i..i + RUN {
+                        h[at(k, r)] += 1;
+                    }
+                }
+            }
+            i += RUN;
+        }
+        i
+    };
+    #[cfg(not(target_arch = "aarch64"))]
+    let i0 = 0;
+    for i in i0..q {
         for (k, h) in h.iter_mut().enumerate() {
             h[at(k, i)] += 1;
         }
@@ -144,6 +168,32 @@ fn build_t(tt: &mut [u32; ROWS], ll: &[u8; BYTES], n: u32) {
 #[cfg(target_arch = "aarch64")]
 const RUN: usize = 16;
 
+/// Whether L is mostly runs: at least `RUNNY` of 64 evenly spaced groups of
+/// 16 bytes are one byte repeated. Counting by runs costs mixed data (XA)
+/// more than it gains there.
+#[cfg(target_arch = "aarch64")]
+fn runny(ll: &[u8; BYTES], n: usize) -> bool {
+    if n < 64 * RUN {
+        return false;
+    }
+    let step = (n - RUN) / 63;
+    (0..64).filter(|&j| mixed16(ll, j * step) == 0).count() >= RUNNY
+}
+
+/// See [`runny`].
+#[cfg(target_arch = "aarch64")]
+const RUNNY: usize = 40;
+
+/// Nonzero unless the 16 bytes of L at `p` are all equal.
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+fn mixed16(ll: &[u8; BYTES], p: usize) -> u64 {
+    let word =
+        |p: usize| u64::from_le_bytes(*ll[p & ROW_MASK..].first_chunk::<8>().unwrap_or(&[0; 8]));
+    let (a, b) = (word(p), word(p + 8));
+    (a ^ b) | (a ^ a.rotate_right(8))
+}
+
 /// [`build_t`]'s scatter of parts `g..g + 4`, `RUN` rows at a time: when a
 /// part's `RUN` symbols are all `c`, their entries go to the `RUN`
 /// consecutive rows at its cursor for `c` with consecutive row numbers, one
@@ -161,18 +211,11 @@ fn scatter_runs(
     g: usize,
     q: usize,
 ) -> usize {
-    let word =
-        |p: usize| u64::from_le_bytes(*ll[p & ROW_MASK..].first_chunk::<8>().unwrap_or(&[0; 8]));
-    // Nonzero unless the 16 bytes at `p` are all equal.
-    let mixed16 = |p: usize| {
-        let (a, b) = (word(p), word(p + 8));
-        (a ^ b) | (a ^ a.rotate_right(8))
-    };
     let mut i = 0;
     while i + RUN <= q {
         let mut mixed = 0u32;
         for k in 0..4 {
-            mixed |= u32::from(mixed16((g + k) * q + i) != 0) << k;
+            mixed |= u32::from(mixed16(ll, (g + k) * q + i) != 0) << k;
         }
         for k in 0..4 {
             if mixed & (1 << k) == 0 {
