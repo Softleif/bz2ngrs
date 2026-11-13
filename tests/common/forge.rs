@@ -84,10 +84,12 @@ pub enum Defect {
     SelectorBeyondTables,
     /// A first code length of 0 or 21 to 31.
     CodeStart(u8),
-    /// A code length stepped down from 1 to 0.
-    CodeBelow,
-    /// A code length stepped up from 20 to 21.
-    CodeAbove,
+    /// A code length stepped down from 1 to 0 after `at` symbols of length
+    /// 1, in table `table` (modulo the tables).
+    CodeBelow { table: u8, at: u16 },
+    /// A code length stepped up from 20 to 21 after `at` symbols of length
+    /// 20, in table `table` (modulo the tables).
+    CodeAbove { table: u8, at: u16 },
     /// A symbol coded with a bit pattern no code of its table has.
     UnassignedCode,
     /// The end-of-block symbol left out, and the symbols padded to fill the
@@ -545,17 +547,26 @@ fn write_block(bits: &mut Bits, r: &Recipe, l: &[u8], crc: u32) -> Written {
     for (t, tl) in lens.iter().enumerate() {
         let at = bits.pos();
         let bad = match (t, r.defect) {
-            (0, Some(Defect::CodeStart(v))) => Some((u32::from(v), 5, None)),
-            (0, Some(Defect::CodeBelow)) => Some((1, 5, Some(0b11))),
-            (0, Some(Defect::CodeAbove)) => Some((20, 5, Some(0b10))),
+            (0, Some(Defect::CodeStart(v))) => Some((u32::from(v), None)),
+            (t, Some(Defect::CodeBelow { table, at })) if t as u32 == u32::from(table) % tables => {
+                Some((1, Some((at, 0b11))))
+            }
+            (t, Some(Defect::CodeAbove { table, at })) if t as u32 == u32::from(table) % tables => {
+                Some((20, Some((at, 0b10))))
+            }
             _ => None,
         };
-        if let Some((start, width, step)) = bad {
-            bits.put(start, width);
-            if let Some(step) = step {
+        if let Some((start, step)) = bad {
+            bits.put(start, 5);
+            // The symbols before the step end at `start`, a run of 0 bits.
+            let before = step.map_or(0, |(at, _)| u32::from(at) % alpha);
+            for _ in 0..before {
+                bits.put(0, 1);
+            }
+            if let Some((_, step)) = step {
                 bits.put(step, 2);
             }
-            for _ in 0..alpha {
+            for _ in before..alpha {
                 bits.put(0, 1);
             }
             field = Some((at, bits.pos()));
@@ -910,7 +921,15 @@ pub fn defective(tc: &TestCase, rule: Rule) -> Broken {
         Rule::CodeLength => match tc.draw(gs::integers::<u8>().max_value(2)) {
             0 => Defect::CodeStart(0),
             1 => Defect::CodeStart(21 + below(tc, 11) as u8),
-            _ => tc.draw(gs::sampled_from(vec![Defect::CodeBelow, Defect::CodeAbove])),
+            _ => {
+                let table = tc.draw(gs::integers::<u8>().max_value(5));
+                let at = tc.draw(gs::integers::<u16>().max_value(257));
+                if tc.draw(gs::booleans()) {
+                    Defect::CodeBelow { table, at }
+                } else {
+                    Defect::CodeAbove { table, at }
+                }
+            }
         },
         Rule::HuffmanCode => Defect::UnassignedCode,
         Rule::NoEndOfBlock => Defect::NoEndOfBlock,

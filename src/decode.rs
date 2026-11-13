@@ -426,6 +426,7 @@ fn block_tables<S: Simd>(simd: S, br: &mut Bits, sc: &mut Scratch) -> Result<(u3
     // Selector MTF values are undone as they arrive. A unary code is a count
     // of leading ones.
     let mut pos = [0u8, 1, 2, 3, 4, 5];
+    let mut used = 0u8;
     for i in 0..n_selectors {
         if br.cnt < 8 {
             br.refill();
@@ -441,35 +442,43 @@ fn block_tables<S: Simd>(simd: S, br: &mut Bits, sc: &mut Scratch) -> Result<(u3
             pos.copy_within(0..j % 6, 1);
             pos[0] = v;
             sc.small.selectors[i % (1 << 15)] = v;
+            used |= 1 << v;
         }
     }
     let n_selectors = n_selectors.min(MAX_SELECTORS);
 
     // Code lengths: a 5-bit start, then per symbol steps of 10 (+1) or 11
-    // (-1) ended by 0, the range checked before every step.
+    // (-1) ended by 0, the range checked before every step. A run of 0 bits
+    // ends that many symbols at the same length.
     for t in 0..n_groups {
+        let lens = &mut sc.small.lens[t % 6];
         let mut curr = br.get(5) as i32;
-        for i in 0..alpha_size {
-            loop {
-                if !(1..=20).contains(&curr) {
-                    return Err(corrupt(br, Corruption::CodeLength));
-                }
-                if br.cnt < 2 {
-                    br.refill();
-                }
-                let two = br.buf >> 62;
-                if two < 2 {
-                    br.consume(1);
-                    break;
-                }
-                br.consume(2);
-                curr += if two == 2 { 1 } else { -1 };
+        let mut i = 0;
+        while i < alpha_size {
+            if !(1..=20).contains(&curr) {
+                return Err(corrupt(br, Corruption::CodeLength));
             }
-            sc.small.lens[t % 6][i % MAX_ALPHA] = curr as u8;
+            if br.cnt < 32 {
+                br.refill();
+            }
+            // Bits past `cnt` may be zero without being the stream's.
+            let z = br.buf.leading_zeros().min(br.cnt) as usize;
+            if z > 0 {
+                let z = z.min(alpha_size - i);
+                lens[i..i + z].fill(curr as u8);
+                br.consume(z as u32);
+                i += z;
+                continue;
+            }
+            curr += if br.buf >> 62 == 2 { 1 } else { -1 };
+            br.consume(2);
         }
     }
+    // libbz2's encoder can send lengths for a group no selector names.
     for t in 0..n_groups {
-        sc.small.tables[t % 8].build(simd, &sc.small.lens[t % 6][..alpha_size.min(MAX_ALPHA)]);
+        if used & (1 << t) != 0 {
+            sc.small.tables[t % 8].build(simd, &sc.small.lens[t % 6][..alpha_size.min(MAX_ALPHA)]);
+        }
     }
     Ok((n_in_use as u32 + 1, n_selectors))
 }
