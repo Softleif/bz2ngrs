@@ -660,7 +660,9 @@ fn step<S: Simd>(
     if idx < 16 {
         st.head = st.head.swizzle_dyn(u8x16::simd_from(simd, PERM[idx]));
     } else {
-        st.head = tail_move(simd, mtf, st.head, idx & 255);
+        // Symbols < eob, so idx < n_in_use = eob - 1 <= end.
+        let end = (eob as usize + 14) & !15;
+        st.head = tail_move(simd, mtf, st.head, idx & 255, end);
     }
     // The new head's first byte is the literal; the other 15 are overwritten
     // later or land in L's slack.
@@ -681,26 +683,54 @@ fn step<S: Simd>(
 /// entries are `head` and the rest `mtf[16..]` (`kern_template.h`
 /// mtf_tail_move): the tail shifts up one entry, 16 at a time, each vector
 /// taking the previous one's last byte, the last one merged up to `idx`.
-/// Returns the new head.
+/// `end` (> `idx`) is the symbols in use rounded up to 16. Returns the new
+/// head.
 #[inline(always)]
-fn tail_move<S: Simd>(simd: S, mtf: &mut [u8; 272], head: u8x16<S>, idx: usize) -> u8x16<S> {
+fn tail_move<S: Simd>(
+    simd: S,
+    mtf: &mut [u8; 272],
+    head: u8x16<S>,
+    idx: usize,
+    end: usize,
+) -> u8x16<S> {
     let c = mtf[idx];
     let mut prev = head;
     let mut j = 16;
-    while j + 16 <= idx {
+    if end <= WHOLE_TAIL {
+        // An exit at idx's vector mispredicts when ranks spread over several
+        // vectors (QUAL); with few symbols in use, rewriting up to `end` with
+        // a per-lane select is cheaper. Many deep moves (binary data) are not.
+        let lim = u8x16::splat(simd, idx as u8);
+        let mut at = u8x16::simd_from(simd, IOTA) + u8x16::splat(simd, 16);
+        while j < end {
+            let v = load16(simd, mtf, j);
+            at.simd_le(lim)
+                .select(prev.slide::<15>(v), v)
+                .store_slice(&mut mtf[j..j + 16]);
+            prev = v;
+            at += u8x16::splat(simd, 16);
+            j += 16;
+        }
+    } else {
+        while j + 16 <= idx {
+            let v = load16(simd, mtf, j);
+            prev.slide::<15>(v).store_slice(&mut mtf[j..j + 16]);
+            prev = v;
+            j += 16;
+        }
         let v = load16(simd, mtf, j);
-        prev.slide::<15>(v).store_slice(&mut mtf[j..j + 16]);
-        prev = v;
-        j += 16;
+        let keep = u8x16::simd_from(simd, IOTA).simd_le(u8x16::splat(simd, (idx - j) as u8));
+        keep.select(prev.slide::<15>(v), v)
+            .store_slice(&mut mtf[j..j + 16]);
     }
-    let v = load16(simd, mtf, j);
-    let keep = u8x16::simd_from(simd, IOTA).simd_le(u8x16::splat(simd, (idx - j) as u8));
-    keep.select(prev.slide::<15>(v), v)
-        .store_slice(&mut mtf[j..j + 16]);
     // black_box: `c` is a scalar, and an LLVM that sees lane 0 as one splits
     // the head into a vector and a scalar lane on the hot path too.
     core::hint::black_box(u8x16::splat(simd, c).slide::<15>(head))
 }
+
+/// The most symbols in use (rounded up to 16) for which [`tail_move`]
+/// rewrites the whole tail (`kern_template.h`'s 160).
+const WHOLE_TAIL: usize = 160;
 
 /// `mtf[j..j + 16]` (`j <= 255`, and the list has 16 bytes of slack).
 #[inline(always)]
@@ -744,11 +774,14 @@ mod tests {
     }
 
     /// The vector tail move against a plain move-to-front of the whole list,
-    /// for every index past the head, at every level.
+    /// for every index past the head and every symbol count past it, at every
+    /// level.
     #[test]
     fn tail_move_is_move_to_front() {
         for level in crate::tests::levels() {
-            for idx in 16..=255usize {
+            for (idx, end) in (16..=255usize)
+                .flat_map(|idx| ((idx + 16) & !15..=256).step_by(16).map(move |e| (idx, e)))
+            {
                 let list: [u8; 256] =
                     core::array::from_fn(|i| (i as u8).wrapping_mul(37).wrapping_add(5));
                 let mut want = list;
@@ -758,13 +791,13 @@ mod tests {
                 mtf[..256].copy_from_slice(&list);
                 let head: [u8; 16] = dispatch!(level, simd => {
                     let head = u8x16::simd_from(simd, *list.first_chunk::<16>().unwrap_or(&[0; 16]));
-                    super::tail_move(simd, &mut mtf, head, idx).into()
+                    super::tail_move(simd, &mut mtf, head, idx, end).into()
                 });
-                assert_eq!(head[..], want[..16], "{level:?} idx {idx}");
-                assert_eq!(mtf[16..256], want[16..], "{level:?} idx {idx}");
+                assert_eq!(head[..], want[..16], "{level:?} idx {idx} end {end}");
+                assert_eq!(mtf[16..256], want[16..], "{level:?} idx {idx} end {end}");
                 assert!(
                     mtf[256..].iter().all(|&b| b == 0xEE),
-                    "{level:?} idx {idx}: slack written"
+                    "{level:?} idx {idx} end {end}: slack written"
                 );
             }
         }
