@@ -396,7 +396,7 @@ fn renumber_and_mark_distinct_4k(sa: &mut [i32], n: usize, m: usize) -> usize {
         name += i32::from(p < 0);
         prev = p;
     }
-    let names = (name - 1) as usize;
+    let names = super::nonunique::resolve(sa, n, m, (name - 1) as usize, false);
     if names < m {
         let mut prev = 0;
         for x in &mut sa[m..m + n / 2] {

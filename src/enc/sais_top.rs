@@ -248,7 +248,7 @@ pub(super) fn renumber_and_gather(sa: &mut [i32], n: usize, m: usize, fs: usize)
         sa[m + ((p & MAX) >> 1) as usize] = name | MIN;
         name += i32::from(p < 0);
     }
-    let name = name as usize;
+    let name = super::nonunique::resolve(sa, n, m, name as usize, true);
     if name < m {
         let mut l = n + fs - 1;
         for i in (m..m + n / 2).rev() {

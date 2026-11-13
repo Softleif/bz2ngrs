@@ -7,7 +7,7 @@
 use hegel::TestCase;
 use hegel::generators as gs;
 
-use super::{BitWriter, huff, mtf, rle, rotate, sais32, sort};
+use super::{BitWriter, huff, mtf, nonunique, rle, rotate, sais32, sort};
 
 /// SplitMix64, for the large inputs.
 struct Rng(u64);
@@ -232,12 +232,20 @@ fn bwt_matches_divsufsort_on_drawn_bytes(tc: TestCase) {
     tc.assume(!text.is_empty());
     let t = lyndon(&text);
     let n = t.len();
+    draw_tie_budget(&tc);
     let (l, _, row) = run_bwt(&t, n - 1, dirty_work(&tc, n));
     let mut sa = vec![0; n];
     divsufsort::sort_in_place(&t, &mut sa);
     let want: Vec<u8> = sa.iter().map(|&s| t[(s as usize + n - 1) % n]).collect();
     assert!(l == want, "BWT differs from divsufsort's (n = {n})");
     assert_eq!(row, sa.iter().position(|&s| s as usize == n - 1).unwrap());
+}
+
+/// The budget for breaking ties between LMS names, on this thread: small
+/// ones reach the deferred groups and the paths that give up.
+fn draw_tie_budget(tc: &TestCase) {
+    let steps = tc.draw(gs::sampled_from(vec![0isize, 1, 2, 3, 4, 8, 1000]));
+    nonunique::BUDGET.set(steps);
 }
 
 /// The suffix array of `t` by direct comparison (a proper prefix sorts
@@ -298,6 +306,7 @@ fn recursion_matches_naive_suffix_sort(tc: TestCase) {
         t[i] = (rng.next() % k as u64) as i32;
     }
     let fs = n + tc.draw(gs::integers::<usize>().max_value(8 * k + 64));
+    draw_tie_budget(&tc);
     let mut work = vec![0x5A5A_5A5A; n + fs];
     let want = naive_suffix_array(&t);
     let orig = t.clone();

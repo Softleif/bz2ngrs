@@ -29,7 +29,7 @@ bz2ngrs is a general-purpose bzip2 decoder and encoder, ported from the C librar
 - **Sources.**
   - The crate is Apache-2.0 WITH LLVM-exception (`LICENSE`). Ported code keeps its origin's notice, and an altered bzip2 file says so.
   - bz2-ng (MIT, its history included), sais-lite (MIT) and libbz2 or libbz2-rs-sys (BSD-style) may be read and ported.
-  - libsais may be read and ported only from the copy bz2-ng vendors (commit 1a696e6, Apache-2.0 WITH LLVM-exception) (`src/enc/sais_top.rs`, `LICENSE-libsais`). Its earlier releases are plain Apache-2.0: take nothing from them, nor from translations of them such as libsais-rs.
+  - libsais may be read and ported only from the copies bz2-ng vendors: commit 1a696e6 and release 2.12.0, both Apache-2.0 WITH LLVM-exception (`src/enc/sais_top.rs`, `src/enc/nonunique.rs`, `LICENSE-libsais`). Its releases up to 2.10.4 are plain Apache-2.0: take nothing from them, nor from translations of them such as libsais-rs.
   - Never read GPL code (lbzip2, 7-Zip).
 
 ## Comments

@@ -11,6 +11,7 @@
 
 mod huff;
 mod mtf;
+mod nonunique;
 mod rle;
 mod rotate;
 mod sais32;
