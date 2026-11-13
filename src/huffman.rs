@@ -43,33 +43,57 @@ impl HTable {
     /// Builds the table for `lengths` (each 1..=20, at most 258 of them).
     #[inline(always)]
     pub(crate) fn build<S: Simd>(&mut self, simd: S, lengths: &[u8]) {
-        let mut count = [0u32; MAX_CODE as usize + 2];
-        for &l in lengths {
-            count[usize::from(l).min(MAX_CODE as usize + 1)] += 1;
+        const L: usize = MAX_CODE as usize + 2;
+        // Lengths are mostly equal to their neighbours', so counting (and
+        // placing) in four parts of the alphabet keeps four chains through
+        // the counters instead of one. Part k's symbols of a length follow
+        // those of the parts before it, so `perm` is by length, then symbol.
+        let q = lengths.len() / 4;
+        let len_at = |i: usize| usize::from(lengths.get(i).copied().unwrap_or(0)).min(L - 1);
+        let mut part = [[0u32; L]; 4];
+        for i in 0..q {
+            for (k, p) in part.iter_mut().enumerate() {
+                p[len_at(k * q + i)] += 1;
+            }
         }
-        self.maxlen = (1..=MAX_CODE)
-            .rev()
-            .find(|&l| count[l as usize] != 0)
-            .unwrap_or(0);
-        let mut offs = [0i32; MAX_CODE as usize + 2];
+        for i in 4 * q..lengths.len() {
+            part[3][len_at(i)] += 1;
+        }
+        let mut count = [0u32; L];
+        let mut offs = [[0i32; L]; 4];
         let (mut code, mut idx) = (0i32, 0i32);
+        self.maxlen = 0;
         for l in 1..=MAX_CODE as usize {
             self.first_code[l] = code;
             self.first_idx[l] = idx;
-            offs[l] = idx;
+            for k in 0..4 {
+                offs[k][l] = idx;
+                idx += part[k][l] as i32;
+            }
+            count[l] = (idx - self.first_idx[l]) as u32;
+            if count[l] != 0 {
+                self.maxlen = l as u32;
+            }
             code += count[l] as i32;
-            idx += count[l] as i32;
             // code <= 258 * 2^(l-1), so the shifted value stays below 2^28.
             self.limit_lj[l] = (code as u32) << (MAX_CODE as usize - l);
             code <<= 1;
         }
         self.limit_lj[MAX_CODE as usize + 1] = 0;
-        for (i, &l) in lengths.iter().enumerate() {
-            let o = &mut offs[usize::from(l).min(MAX_CODE as usize + 1)];
+        let mut place = |k: usize, i: usize| {
+            let o = &mut offs[k][len_at(i)];
             if let Some(p) = self.perm.get_mut(*o as usize) {
                 *p = i as u16;
             }
             *o += 1;
+        };
+        for i in 0..q {
+            for k in 0..4 {
+                place(k, k * q + i);
+            }
+        }
+        for i in 4 * q..lengths.len() {
+            place(3, i);
         }
 
         // Codes of length <= K fill the primary table in canonical order; a
