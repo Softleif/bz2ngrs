@@ -24,6 +24,9 @@ use crate::crc;
 const GUARD: usize = 8;
 /// Calls with fewer input bytes than this take libbz2's byte loop.
 const SMALL: usize = 16;
+/// Windows a run may span before its end is found by [`run_length`] instead
+/// of by the windows' masks.
+const MASKED_RUN: usize = 4;
 /// Bytes the bulk phase needs from the start of a 64-byte window: the
 /// window, the next window's mask and the byte after it.
 const LOOKAHEAD: usize = 130;
@@ -109,6 +112,19 @@ fn run_length<S: Simd>(simd: S, p: &[u8], avail: usize, c: u8) -> usize {
     l
 }
 
+/// Copies the literal bytes `input[lit..j]` to `blk[nb..]`; returns the new
+/// block length. A short span is one fixed-size copy, which may write past
+/// the bytes that count (`SLACK`).
+#[inline(always)]
+fn copy_literals(blk: &mut [u8], nb: usize, input: &[u8], lit: usize, j: usize) -> usize {
+    if j - lit <= 16 {
+        blk[nb..nb + 16].copy_from_slice(&input[lit..lit + 16]);
+    } else {
+        blk[nb..nb + j - lit].copy_from_slice(&input[lit..j]);
+    }
+    nb + (j - lit)
+}
+
 /// The bulk phase of [`fill`]: from the unit boundary `p`, whole 64-byte
 /// windows of `input` while the block has room (output at most `limit`).
 /// Returns the unit boundary it stopped at and the block length.
@@ -116,9 +132,12 @@ fn run_length<S: Simd>(simd: S, p: &[u8], avail: usize, c: u8) -> usize {
 /// A window's mask of positions that differ from their successor gives the
 /// runs: a run of 4 or more starts where three successive bits are clear, and
 /// ends at the next set bit. The bytes between runs are literal units and
-/// are copied, in one piece, when the next run or the end comes. It stops at
-/// a unit boundary, or inside a literal unit of at most 3 bytes that ends
-/// within the input (which writes the same bytes however it is split).
+/// are copied, in one piece, when the next run or the end comes. A run that
+/// goes on past its window is measured with [`run_length`] instead, at most as
+/// far as the block has room for its units, so a long run is read once and
+/// only until the block is full. It stops at a unit boundary, or inside a
+/// literal unit of at most 3 bytes that ends within the input (which writes
+/// the same bytes however it is split).
 #[inline(always)]
 fn bulk<S: Simd>(
     simd: S,
@@ -133,18 +152,19 @@ fn bulk<S: Simd>(
     if p + LOOKAHEAD > avail {
         return (p, nb);
     }
-    // `lit`: start of the literal bytes not yet copied; `run`: start of a run
-    // whose end is in a later window.
-    let (mut lit, mut base, mut run) = (p, p, NONE);
+    // `lit`: start of the literal bytes not yet copied.
+    let (mut lit, mut base) = (p, p);
     // `dn`: the mask of the window at `dn_at`, if it was computed.
     let (mut dn, mut dn_at) = (0, NONE);
+    // Bits of the next window before `skip` belong to a run already written.
+    let mut skip = 0;
     let stop = 'win: {
-        while base + LOOKAHEAD <= avail {
-            let end = if run == NONE { base + 64 } else { run };
-            if nb + (end - lit) > limit {
-                break 'win end.min(base);
+        'next: while base + LOOKAHEAD <= avail {
+            if nb + (base + 64 - lit) > limit {
+                break 'win base;
             }
-            if run == NONE && !has_run4(simd, input, base) {
+            let from_skip = core::mem::take(&mut skip);
+            if !has_run4(simd, input, base) {
                 base += 64;
                 continue;
             }
@@ -156,47 +176,72 @@ fn bulk<S: Simd>(
             dn = diff_mask64(simd, input, base + 64);
             dn_at = base + 64;
             let r4 = !(dw | (dw >> 1 | dn << 63) | (dw >> 2 | dn << 62));
-            let mut from = 0;
+            let mut from = from_skip;
             loop {
-                let (j, k) = if run == NONE {
-                    let m = r4 & (!0u64 << from);
-                    if m == 0 {
-                        break;
-                    }
-                    let k = m.trailing_zeros();
-                    (base + k as usize, k)
-                } else {
-                    (run, 0)
-                };
+                let m = r4 & (!0u64 << from);
+                if m == 0 {
+                    break;
+                }
+                let k = m.trailing_zeros();
+                let j = base + k as usize;
+                let c = input[j];
                 let ends = dw & (!0u64 << k);
                 if ends == 0 {
-                    run = j;
-                    break;
+                    // The run goes on past this window. If it ends in one of
+                    // the next few, their masks find it, and the window it
+                    // ends in is scanned next with its mask at hand.
+                    let (mut w, mut d) = (base + 64, dn);
+                    while d == 0 && w < base + 64 * MASKED_RUN && w + 64 + LOOKAHEAD <= avail {
+                        w += 64;
+                        d = diff_mask64(simd, input, w);
+                    }
+                    if d != 0 {
+                        let last = d.trailing_zeros() as usize;
+                        let len = w + last + 1 - j;
+                        if nb + (j - lit) + 5 * (len / 255 + 1) > limit {
+                            break 'win lit;
+                        }
+                        nb = copy_literals(blk, nb, input, lit, j);
+                        nb = put_units(blk, nb, c, len);
+                        lit = j + len;
+                        (base, dn, dn_at) = (w, d, w);
+                        if last == 63 {
+                            base += 64;
+                        } else {
+                            skip = last as u32 + 1;
+                        }
+                        continue 'next;
+                    }
+                    // A longer run is measured directly. The room check above
+                    // leaves nb + (j - lit) <= limit; `room` units fit after
+                    // the literals, and a 255-byte unit is complete once a
+                    // byte of the run follows it.
+                    let room = (limit - nb - (j - lit)) / 5;
+                    let max = (avail - j).min(room * 255 + 1);
+                    let len = run_length(simd, &input[j..], max, c);
+                    nb = copy_literals(blk, nb, input, lit, j);
+                    if len < max {
+                        // It ends before `max`: all its units fit.
+                        nb = put_units(blk, nb, c, len);
+                        lit = j + len;
+                        base = lit;
+                        continue 'next;
+                    }
+                    // It reaches the room or the input's end: its complete
+                    // units, and the rest is the tail's.
+                    let units = (len - 1) / 255;
+                    nb = put_units(blk, nb, c, units * 255);
+                    lit = j + units * 255;
+                    break 'win lit;
                 }
                 let last = ends.trailing_zeros();
                 let len = base + last as usize + 1 - j;
                 if nb + (j - lit) + 5 * (len / 255 + 1) > limit {
                     break 'win lit;
                 }
-                if j - lit <= 16 {
-                    // One fixed-size copy, which may write past the bytes
-                    // that count (`SLACK`).
-                    blk[nb..nb + 16].copy_from_slice(&input[lit..lit + 16]);
-                } else {
-                    blk[nb..nb + j - lit].copy_from_slice(&input[lit..j]);
-                }
-                nb += j - lit;
-                let c = input[j];
-                let mut l = len;
-                while l >= 255 {
-                    nb = put_unit(blk, nb, c, 255);
-                    l -= 255;
-                }
-                if l > 0 {
-                    nb = put_unit(blk, nb, c, l);
-                }
+                nb = copy_literals(blk, nb, input, lit, j);
+                nb = put_units(blk, nb, c, len);
                 lit = j + len;
-                run = NONE;
                 from = last + 1;
                 if from == 64 {
                     break;
@@ -204,7 +249,7 @@ fn bulk<S: Simd>(
             }
             base += 64;
         }
-        if run == NONE { base } else { run }
+        base
     };
     if stop > lit && nb + (stop - lit) <= limit {
         blk[nb..nb + stop - lit].copy_from_slice(&input[lit..stop]);
@@ -212,6 +257,20 @@ fn bulk<S: Simd>(
         lit = stop;
     }
     (lit, nb)
+}
+
+/// Writes `len` copies of `c` as units of 255 and a last shorter one;
+/// returns the new block length.
+#[inline(always)]
+fn put_units(blk: &mut [u8], mut nb: usize, c: u8, mut len: usize) -> usize {
+    while len >= 255 {
+        nb = put_unit(blk, nb, c, 255);
+        len -= 255;
+    }
+    if len > 0 {
+        nb = put_unit(blk, nb, c, len);
+    }
+    nb
 }
 
 /// Feeds `input` to the block `blk` until it runs out or the block is full;

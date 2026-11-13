@@ -648,6 +648,32 @@ fn rle_fill_matches_byte_loop(tc: TestCase) {
     }
 }
 
+/// A long run that fills the block: literals ending 0 to 300 bytes short of
+/// its capacity, then 20 000 bytes of one value (78 units, more than the
+/// room left), then more literals; whole and cut inside the run.
+#[test]
+fn rle_fill_long_run_at_capacity() {
+    let nblock_max = 3000;
+    let lit = |n: usize, k: usize| (0..n).map(move |i| ((i + k) * 7 % 256) as u8);
+    for short in 0..=300 {
+        let mut data: Vec<u8> = lit(nblock_max - short, 0).collect();
+        let run_at = data.len();
+        data.resize(run_at + 20_000, 0xAA);
+        data.extend(lit(500, 3));
+        let want = naive_rle(&data, nblock_max);
+        for cut in [0, 1, 255, 256, 700, 5000, 19_999] {
+            let chunks = if cut == 0 { vec![] } else { vec![run_at + cut] };
+            for level in crate::tests::levels() {
+                assert_eq!(
+                    bulk_rle(level, &data, &chunks, nblock_max),
+                    want,
+                    "short {short} cut {cut} at {level:?}"
+                );
+            }
+        }
+    }
+}
+
 /// The cost of an optimal prefix code for `w` (Huffman's merge).
 fn huffman_cost(w: &[u64]) -> u64 {
     let mut heap: std::collections::BinaryHeap<std::cmp::Reverse<u64>> =
