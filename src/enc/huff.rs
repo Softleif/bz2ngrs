@@ -88,54 +88,106 @@ fn upheap(h: &mut [u64; HEAP_LEN], n: usize, tmp: u64) {
     h[zz] = tmp;
 }
 
+/// [`upheap`] for a leaf, with the first two levels of the climb as selects:
+/// leaf weights rise and fall without a pattern a branch predictor learns.
+/// Slot 0 weighs less than any entry, so the climb ends at the root.
+#[inline(always)]
+fn upheap_leaf(h: &mut [u64; HEAP_LEN], n: usize, e: u64) {
+    use core::hint::select_unpredictable as sel;
+    let (p1, p2) = (n >> 1, n >> 2);
+    let (a1, a2) = (h[p1], h[p2]);
+    let up1 = e < a1 & HI;
+    // a2 weighs no more than a1, so up2 implies up1.
+    let up2 = e < a2 & HI;
+    h[n] = sel(up1, a1, e);
+    h[p1] = sel(up2, a2, sel(up1, e, a1));
+    if up2 {
+        upheap(h, p2, e);
+    }
+}
+
+/// One level of [`pop`]'s walk: from slot `zz`, whose entry was `cur`, to
+/// its lighter child (the left on a tie) among `h[y]` and `h[y + 1]`.
+#[inline(always)]
+fn pop_step(
+    h: &mut [u64; HEAP_LEN],
+    y: usize,
+    last: u64,
+    zz: &mut usize,
+    cur: &mut u64,
+    open: &mut bool,
+) {
+    use core::hint::select_unpredictable as sel;
+    let y = y + usize::from(h[y + 1] & HI < h[y] & HI);
+    let child = h[y];
+    // The child weighs no more than the last entry: it moves up.
+    let up = child & HI <= last;
+    h[*zz] = sel(up, child, sel(*open, last, *cur));
+    *open = up;
+    *cur = child;
+    *zz = y;
+}
+
 /// Takes the smallest entry off each heap of `m + 1` entries. Each heap's
 /// last entry is cut off and refills it from the root, as libbz2's
 /// `heap[1] = heap[nHeap]; nHeap--; DOWNHEAP(1)`; `m` is the size after.
 ///
-/// A sift-down walks down the smaller children to a leaf and the displaced
-/// entry climbs back from there: it ends where libbz2's top-down walk stops,
-/// below every entry of at most its weight. The walk takes the same number
-/// of steps in every heap, so the heaps advance side by side, which hides
-/// the latency of each one's chain of loads. `heap[m + 1]` is an entry no
-/// weight is below, so a missing right child never wins.
+/// DOWNHEAP moves the lighter child up (the left on a tie) until the child
+/// weighs more than the displaced last entry, which takes the slot left
+/// open. The weights along that path never decrease, so the walk here goes
+/// on to the bottom with selects in place of DOWNHEAP's data-dependent exit:
+/// the children up to the first heavier than the last entry move up, the
+/// slot the last of them leaves takes the last entry, and the rest of the
+/// path is written back unchanged. The walk takes the same number of steps
+/// in every heap, so the heaps advance side by side, which hides the latency
+/// of each one's chain of loads. `heap[m + 1]` and `heap[m + 2]` are entries
+/// no weight is above, the missing children of the last parents.
 #[inline(always)]
 fn pop<const L: usize>(heap: &mut [[u64; HEAP_LEN]; N_GROUPS], m: usize) -> [u64; L] {
+    use core::hint::select_unpredictable as sel;
     let mut top = [0; L];
     let mut last = [0; L];
+    let mut cur = [0; L];
+    let mut open = [true; L];
     let mut zz = [1usize; L];
     for l in 0..L {
         top[l] = heap[l][1];
         last[l] = heap[l][m + 1];
         heap[l][m + 1] = u64::MAX;
+        heap[l][m + 2] = u64::MAX;
     }
-    // Every node above the last level of the heap has two children.
-    for _ in 1..m.checked_ilog2().unwrap_or(0) {
+    // Levels below the root; all but the last are complete.
+    let depth = m.checked_ilog2().unwrap_or(0);
+    for _ in 1..depth {
         for l in 0..L {
-            let h = &mut heap[l];
-            let y = zz[l] * 2;
-            let y = y + usize::from(h[y + 1] & HI < h[y] & HI);
-            h[zz[l]] = h[y];
-            zz[l] = y;
+            let y = 2 * zz[l];
+            pop_step(
+                &mut heap[l],
+                y,
+                last[l],
+                &mut zz[l],
+                &mut cur[l],
+                &mut open[l],
+            );
+        }
+    }
+    if depth > 0 {
+        for l in 0..L {
+            // A slot without children reads the two empty entries.
+            let y = 2 * zz[l];
+            let y = sel(y > m, m + 1, y);
+            pop_step(
+                &mut heap[l],
+                y,
+                last[l],
+                &mut zz[l],
+                &mut cur[l],
+                &mut open[l],
+            );
         }
     }
     for l in 0..L {
-        let h = &mut heap[l];
-        let a = zz[l] * 2;
-        let has = a <= m;
-        let a = if has { a } else { 0 };
-        let y = a + usize::from(h[a + 1] & HI < h[a] & HI);
-        let y = if has { y } else { zz[l] };
-        h[zz[l]] = h[y];
-        zz[l] = y;
-    }
-    for l in 0..L {
-        let h = &mut heap[l];
-        let mut z = zz[l];
-        while last[l] < h[z >> 1] & HI {
-            h[z] = h[z >> 1];
-            z >>= 1;
-        }
-        h[z] = last[l];
+        heap[l][zz[l]] = sel(open[l], last[l], cur[l]);
     }
     top
 }
@@ -155,7 +207,7 @@ fn build<const L: usize>(
     for i in 1..=alpha {
         n += 1;
         for (h, &t) in w.heap.iter_mut().zip(&ts) {
-            upheap(h, n, u64::from(w.leaf[t][i]) << 16 | i as u64);
+            upheap_leaf(h, n, u64::from(w.leaf[t][i]) << 16 | i as u64);
         }
     }
     let mut n_nodes = alpha;
